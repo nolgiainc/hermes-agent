@@ -19,6 +19,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
+- POST /v1/runs/{run_id}/steer      — inject a mid-run user message without interrupting
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -1659,6 +1660,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
+                "run_steer": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -1687,6 +1689,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -4597,20 +4600,32 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                    _put_event_if_active({
+                    completed_event = {
+
                         "event": "run.completed",
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "output": final_response,
                         "usage": usage,
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "completed",
-                        output=final_response,
-                        usage=usage,
-                        last_event="run.completed",
+                    }
+                    completed_fields: Dict[str, Any] = {
+                        "output": final_response,
+                        "usage": usage,
+                        "last_event": "run.completed",
+                    }
+                    # A /steer that landed after the run's last tool batch was
+                    # never seen by the model (the agent drains it at end of
+                    # turn). Surface it so callers can detect the unanswered
+                    # steer and re-send it as a follow-up turn.
+                    pending_steer = (
+                        result.get("pending_steer") if isinstance(result, dict) else None
                     )
+                    if pending_steer:
+                        completed_event["pending_steer"] = pending_steer
+                        completed_fields["pending_steer"] = pending_steer
+                    _put_event_if_active(completed_event)
+
+                    self._set_run_status(run_id, "completed", **completed_fields)
             except asyncio.CancelledError:
                 self._set_run_status(
                     run_id,
@@ -4863,6 +4878,87 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
 
+    async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/steer — inject a mid-run user message.
+
+        Calls ``AIAgent.steer(text)``: the text is stashed and appended to the
+        LAST tool result of the current tool batch once the batch finishes,
+        without interrupting the run or starting a new turn. The agent loop
+        wraps the text in the out-of-band user-message marker
+        (``agent.prompt_builder.format_steer_marker``) at splice time, which
+        attributes it to the real user — callers should send the raw text and
+        NOT add their own attribution prefix. Multiple steers before the next
+        tool batch concatenate; a hard interrupt (``/stop``) drops pending
+        steers by design.
+
+        Delivery is best-effort: a steer that lands after the run's final
+        tool batch — or on a run that never calls tools — is never seen by
+        the model. The agent drains it at end of turn and it is reported as
+        ``pending_steer`` on the run's ``run.completed`` event and pollable
+        status. Callers that need guaranteed delivery must reconcile on run
+        completion: if ``pending_steer`` is present, re-send that text as a
+        normal follow-up turn.
+
+        Returns 202 ``{"status": "steering"}`` when accepted, 404 when the
+        run is not active (unknown, completed, or stopped — the caller should
+        fall back to queueing the text as a new turn), 400 on missing/empty
+        ``text``.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        agent = self._active_run_agents.get(run_id)
+        if agent is None:
+            return web.json_response(
+                _openai_error(f"Run not active: {run_id}", code="run_not_found"),
+                status=404,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return web.json_response(
+                _openai_error(
+                    "Missing or empty 'text'",
+                    code="invalid_steer_text",
+                ),
+                status=400,
+            )
+
+        try:
+            accepted = agent.steer(text)
+        except Exception as exc:
+            logger.exception("[api_server] steer failed for run %s", run_id)
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        if not accepted:
+            return web.json_response(
+                _openai_error(
+                    "Steer text was empty after trimming",
+                    code="invalid_steer_text",
+                ),
+                status=400,
+            )
+
+        q = self._run_streams.get(run_id)
+        if q is not None:
+            try:
+                q.put_nowait({
+                    "event": "run.steering",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                })
+            except Exception:
+                pass
+
+        return web.json_response({"run_id": run_id, "status": "steering"}, status=202)
+
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically expire transport buffers and terminal status records."""
         while True:
@@ -5014,6 +5110,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            self._app.router.add_post("/v1/runs/{run_id}/steer", self._handle_steer_run)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the
