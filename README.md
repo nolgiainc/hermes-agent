@@ -16,6 +16,10 @@
   <a href="README.es.md"><img src="https://img.shields.io/badge/Lang-Español-orange?style=for-the-badge" alt="Español"></a>
 </p>
 
+> **Nolgia fork:** This repository is maintained as [`nolgiainc/hermes-agent`](https://github.com/nolgiainc/hermes-agent), while the Nous installers above clone [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent). Those installers therefore install upstream Hermes rather than this fork; fork development should clone the Nolgia repository directly.
+>
+> The fork adds an authenticated `POST /v1/runs/{run_id}/steer` endpoint for sending raw `{"text":"..."}` guidance to an active run without interrupting it. It returns `202` with `status: "steering"`, rejects inactive runs or invalid text, and reports late best-effort delivery as `pending_steer`. The source contract and tests are [`gateway/platforms/api_server.py`](gateway/platforms/api_server.py) and [`tests/gateway/test_api_server_runs.py`](tests/gateway/test_api_server_runs.py); this fork-only API is separate from the upstream docs and installers.
+
 **The self-improving AI agent built by [Nous Research](https://nousresearch.com).** It's the only agent with a built-in learning loop — it creates skills from experience, improves them during use, nudges itself to persist knowledge, searches its own past conversations, and builds a deepening model of who you are across sessions. Run it on a $5 VPS, a GPU cluster, or serverless infrastructure that costs nearly nothing when idle. It's not tied to your laptop — talk to it from Telegram while it works on a cloud VM.
 
 Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenRouter, OpenAI, your own endpoint, and [many others](https://hermes-agent.nousresearch.com/docs/integrations/providers). Switch with `hermes model` — no code changes, no lock-in.
@@ -54,7 +58,7 @@ The installer handles everything: uv, Python 3.11, Node.js, ripgrep, ffmpeg, **a
 
 If you already have Git installed, the installer detects it and uses that instead. Otherwise a ~45MB MinGit download is all you need — it won't touch or interfere with any system Git.
 
-> **Android / Termux:** The tested manual path is documented in the [Termux guide](https://hermes-agent.nousresearch.com/docs/getting-started/termux). On Termux, Hermes installs a curated `.[termux]` extra because the full `.[all]` extra currently pulls Android-incompatible voice dependencies.
+> **Android / Termux:** Termux is a supported Tier 2 platform on a best-effort basis; follow the [Termux guide](https://hermes-agent.nousresearch.com/docs/getting-started/termux). The installer tries `.[termux-all]` and falls back to the tested `.[termux]` extra because `.[all]` is not supported on Android. The tested path skips browser/Playwright bootstrap and Docker, and Android may suspend background gateway jobs.
 >
 > **Windows:** Native Windows is fully supported — the PowerShell one-liner above installs everything. If you'd rather use WSL2, the Linux command works there too. Native Windows install lives under `%LOCALAPPDATA%\hermes`; WSL2 installs under `~/.hermes` as on Linux.
 
@@ -106,9 +110,10 @@ For more context, see the upstream Astral reports: [astral-sh/uv#13553](https://
 
 ```bash
 hermes              # Interactive CLI — start a conversation
+hermes --tui         # Launch the modern terminal UI
 hermes model        # Choose your LLM provider and model
 hermes tools        # Configure which tools are enabled
-hermes config set   # Set individual config values
+hermes config set model gpt-4  # Set a config value (key + value)
 hermes gateway      # Start the messaging gateway (Telegram, Discord, etc.)
 hermes setup        # Run the full setup wizard (configures everything at once)
 hermes claw migrate # Migrate from OpenClaw (if coming from OpenClaw)
@@ -234,12 +239,13 @@ want the managed install layout):
 
 Create the venv outside the cloned source tree — a venv inside the directory
 the agent operates from can be wiped by a relative-path command the agent runs
-against its own checkout, destroying the running runtime mid-session.
+against its own checkout, destroying the running runtime mid-session. The path
+below is also one of the locations that `scripts/run_tests.sh` probes.
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-uv venv ~/.hermes/venvs/hermes-dev --python 3.11
-source ~/.hermes/venvs/hermes-dev/bin/activate
+uv venv ~/.hermes/hermes-agent/venv --python 3.11
+source ~/.hermes/hermes-agent/venv/bin/activate
 uv pip install -e ".[all,dev]"
 scripts/run_tests.sh
 ```
