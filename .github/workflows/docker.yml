@@ -4,6 +4,11 @@ on:
   release:
     types: [published]
   workflow_call:
+  # Nightly full run of the slow docker integration suite (off-peak).
+  schedule:
+    - cron: "23 4 * * *"
+  # On-demand full run (e.g. to validate docker changes before merge).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -106,6 +111,31 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      # ---------------------------------------------------------------------
+      # Docker integration tests (SLOW — 5-6 min).
+      #
+      # These are non-gating and take too long to run on every PR, so they
+      # are moved OFF the default PR path.  The build/load/push steps above
+      # still run on every PR (fast build-smoke); only the steps below are
+      # gated.  They run on:
+      #   - the nightly ``schedule`` (off-peak cron),
+      #   - manual ``workflow_dispatch``, and
+      #   - PRs that carry the ``docker-integration`` label.
+      #
+      # The ``gate`` step computes a single boolean the test steps share so
+      # the condition lives in exactly one place.
+      # ---------------------------------------------------------------------
+      - name: Decide whether to run docker integration tests
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || \
+             [ "${{ github.event_name }}" = "workflow_dispatch" ] || \
+             [ "${{ contains(github.event.pull_request.labels.*.name, 'docker-integration') }}" = "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # Run the docker-integration test suite against the freshly-built
       # image already loaded into the local daemon (`:test`).
       #
@@ -121,12 +151,15 @@ jobs:
       # cheapest path to coverage on every PR that touches docker code.
       # ---------------------------------------------------------------------
       - name: Install uv (for docker tests)
+        if: steps.gate.outputs.run == 'true'
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
 
       - name: Set up Python 3.11 (for docker tests)
+        if: steps.gate.outputs.run == 'true'
         run: uv python install 3.11
 
       - name: Install Python dependencies (for docker tests)
+        if: steps.gate.outputs.run == 'true'
         run: |
           # ``dev`` extra pulls in pytest, pytest-asyncio —
           # everything tests/docker/ needs.  We deliberately avoid ``all``
@@ -135,6 +168,7 @@ jobs:
           uv sync --locked --python 3.11 --extra dev
 
       - name: Run docker integration tests
+        if: steps.gate.outputs.run == 'true'
         env:
           # Skip rebuild; use the image already loaded by the build step.
           HERMES_TEST_IMAGE: ${{ env.IMAGE_NAME }}:test
