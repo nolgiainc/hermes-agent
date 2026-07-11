@@ -174,7 +174,12 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   ci-timings:
     name: CI timing report
-    needs: [all-checks-pass, docker]
+    # ``docker`` is intentionally NOT a dependency here: the docker
+    # build+test workflow is non-gating and (with the slow integration
+    # tests moved off the PR path) should never block or delay the timing
+    # report. The report collects durations from the GitHub API after the
+    # fact, so it doesn't need docker to have finished.
+    needs: [all-checks-pass]
     if: always()
     runs-on: ubuntu-latest
     steps:
