@@ -37,7 +37,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import BinaryIO, Dict, Optional, Tuple
 
 from gateway.platforms.base import (
     MEDIA_DELIVERY_EXTS,
@@ -82,7 +82,12 @@ _COMPLETE_TIMEOUT_SECONDS = 300.0
 
 # Per-message guards: a reply stuffed with tags must not turn one egress
 # into an unbounded upload storm. Beyond either limit, remaining tags
-# degrade to the bare filename (still never a local path).
+# degrade to the bare filename (still never a local path). The wall budget
+# is enforced both BETWEEN uploads (none starts past the deadline) and
+# WITHIN the signed PUT (see _DeadlineFile): the PUT timeout is
+# socket-inactivity only, so a huge-but-under-cap file streaming steadily
+# would otherwise hold the egress — and the run.completed event built from
+# it — far past the platform relay's turn budget.
 _MAX_UPLOADS_PER_MESSAGE = 6
 _UPLOAD_WALL_BUDGET_SECONDS = 120.0
 
@@ -136,11 +141,41 @@ def _http_json(method: str, path: str, payload: Optional[dict], timeout: float) 
     return json.loads(raw) if raw else {}
 
 
-def _upload_asset(path: Path, content_type: str, size_bytes: int) -> Optional[str]:
+class _UploadDeadlineExceeded(Exception):
+    """Raised mid-PUT when the per-message upload wall budget expires."""
+
+
+class _DeadlineFile:
+    """File-like PUT body that aborts ``read()`` once a monotonic deadline passes.
+
+    ``http.client`` streams a file body in fixed-size chunks via ``read()``,
+    so checking the deadline here bounds the whole signed PUT by wall clock.
+    The PUT's ``timeout`` alone cannot: it is a socket-inactivity timeout,
+    and a large file trickling steadily never trips it — one near-cap video
+    could otherwise stream for tens of minutes while the run stays
+    "running" past the relay's turn budget.
+    """
+
+    def __init__(self, handle: BinaryIO, deadline: float) -> None:
+        self._handle = handle
+        self._deadline = deadline
+
+    def read(self, size: int = -1) -> bytes:
+        if time.monotonic() >= self._deadline:
+            raise _UploadDeadlineExceeded(
+                f"per-message upload wall budget ({_UPLOAD_WALL_BUDGET_SECONDS:.0f}s) "
+                "expired mid-transfer"
+            )
+        return self._handle.read(size)
+
+
+def _upload_asset(path: Path, content_type: str, size_bytes: int, deadline: float) -> Optional[str]:
     """Run the platform's signed upload flow for one file; return the asset id.
 
-    Any failure logs a warning and returns None — the caller degrades the
-    tag to a bare filename. Never raises.
+    ``deadline`` is the caller's per-message wall budget (monotonic); the
+    streamed PUT aborts as soon as it passes. Any failure logs a warning
+    and returns None — the caller degrades the tag to a bare filename.
+    Never raises.
     """
     try:
         slot = _http_json(
@@ -163,7 +198,7 @@ def _upload_asset(path: Path, content_type: str, size_bytes: int) -> Optional[st
         with open(path, "rb") as file_handle:
             put_request = urllib.request.Request(
                 upload_url,
-                data=file_handle,
+                data=_DeadlineFile(file_handle, deadline),
                 method="PUT",
                 headers={"Content-Type": content_type, "Content-Length": str(size_bytes)},
             )
@@ -183,7 +218,12 @@ def _upload_asset(path: Path, content_type: str, size_bytes: int) -> Optional[st
 
 
 class _MessageBudget:
-    """Per-message upload counters (count + wall clock)."""
+    """Per-message upload counters (count + wall clock).
+
+    ``exhausted()`` gates STARTING an upload; the same ``deadline`` is
+    threaded into the PUT body stream (``_DeadlineFile``) so an in-flight
+    upload cannot outlive the budget either.
+    """
 
     def __init__(self) -> None:
         self.uploads = 0
@@ -244,7 +284,7 @@ def _resolve_tag(raw_path: str, budget: _MessageBudget) -> str:
         return fallback
 
     budget.uploads += 1
-    asset_id = _upload_asset(resolved, content_type, stat.st_size)
+    asset_id = _upload_asset(resolved, content_type, stat.st_size, budget.deadline)
     if not asset_id:
         return fallback
     with _asset_cache_lock:
@@ -288,7 +328,10 @@ def _replace_known_ext_tag(match: "re.Match[str]", budget: _MessageBudget) -> st
 
 def _resolve_text(text: str, budget: _MessageBudget) -> str:
     """Run both shared tag matchers over ``text`` under one message budget."""
-    if not text or "MEDIA:" not in text:
+    # Case-insensitive fast path: the shared matchers are IGNORECASE
+    # (models hand-write ``media:`` variants and connector delivery honors
+    # them), so this guard must never skip a tag the matchers would rewrite.
+    if not text or "media:" not in text.lower():
         return text
 
     def _replace_known_ext(match: "re.Match[str]") -> str:
@@ -315,7 +358,11 @@ def resolve_media_tags_to_assets(text: str) -> str:
     the bare filename otherwise — the result never contains a pod-local
     path. Blocking (network + disk I/O): call it off the event loop.
     """
-    if not text or "MEDIA:" not in text:
+    # Must stay case-insensitive like the IGNORECASE matchers (hermes tools
+    # emit uppercase ``MEDIA:``, models hand-write lowercase). Upstream's
+    # _resolve_media_to_data_urls keeps its case-sensitive guard for parity;
+    # this platform-only path deliberately does not mirror it.
+    if not text or "media:" not in text.lower():
         return text
     try:
         return _resolve_text(text, _MessageBudget())

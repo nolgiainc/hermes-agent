@@ -664,7 +664,11 @@ async def _resolve_media_tags_to_platform_assets(text: str) -> str:
     bare filename. Uploads are blocking network I/O (a video PUT can take
     minutes), so the resolution runs off the event loop.
     """
-    if not text or "MEDIA:" not in text:
+    # Case-insensitive like the shared IGNORECASE tag matchers — a
+    # hand-written ``media:`` tag must not skip resolution here when the
+    # resolver would rewrite it. (_resolve_media_to_data_urls above keeps
+    # its case-sensitive guard untouched: exact upstream parity.)
+    if not text or "media:" not in text.lower():
         return text
     from gateway.platforms import nolgia_assets
 

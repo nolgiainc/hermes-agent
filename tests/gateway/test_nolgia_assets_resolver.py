@@ -12,6 +12,9 @@ Without the platform env every path keeps its exact upstream behavior.
 
 import asyncio
 import base64
+import io
+import json
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -61,7 +64,7 @@ def upload_calls(monkeypatch):
     """Stub the network upload; record (path, content_type, size) per call."""
     calls = []
 
-    def _fake_upload(path, content_type, size_bytes):
+    def _fake_upload(path, content_type, size_bytes, deadline):
         calls.append((str(path), content_type, size_bytes))
         return _ASSET_ID
 
@@ -223,7 +226,7 @@ class TestResolveMediaTagsToAssets:
     def test_per_message_upload_cap(self, platform_env, monkeypatch, tmp_path):
         calls = []
 
-        def _fake_upload(path, content_type, size_bytes):
+        def _fake_upload(path, content_type, size_bytes, deadline):
             calls.append(str(path))
             # Distinct ids so the cache can't mask the cap.
             return f"00000000-0000-0000-0000-{len(calls):012d}"
@@ -241,11 +244,27 @@ class TestResolveMediaTagsToAssets:
         assert all(line.startswith("asset:") for line in lines[:-1])
         assert lines[-1] == f"m{nolgia_assets._MAX_UPLOADS_PER_MESSAGE}.jpg"
 
+    def test_lowercase_and_mixed_case_tags_resolve(self, platform_env, upload_calls, tmp_path):
+        # hermes tools emit uppercase MEDIA:, but the shared matchers are
+        # IGNORECASE because models hand-write lowercase variants — and
+        # connector delivery honors those. The fast-path guard must not
+        # skip them (a case-sensitive `"MEDIA:" not in text` check would
+        # hand the raw pod-local path to the relay).
+        p = _write_png(tmp_path)
+        assert nolgia_assets.resolve_media_tags_to_assets(f"a media:{p} b") == f"a {_ASSET_REF} b"
+        assert nolgia_assets.resolve_media_tags_to_assets(f"c Media:{p} d") == f"c {_ASSET_REF} d"
+        assert len(upload_calls) == 1  # second hit served from the asset cache
+        # Extension-less lowercase variant still degrades to the filename.
+        out = nolgia_assets.resolve_media_tags_to_assets("e media:/no/such/binfile f")
+        assert out == "e binfile f"
+
     def test_text_without_tags_passthrough(self, platform_env, upload_calls):
         assert nolgia_assets.resolve_media_tags_to_assets("plain text") == "plain text"
         assert nolgia_assets.resolve_media_tags_to_assets("") == ""
         prose = "Our SOCIAL MEDIA: strategy is fine"
         assert nolgia_assets.resolve_media_tags_to_assets(prose) == prose
+        lowercase_prose = "our social media: strategy is fine"
+        assert nolgia_assets.resolve_media_tags_to_assets(lowercase_prose) == lowercase_prose
         assert upload_calls == []
 
     def test_credential_shaped_path_never_uploaded(self, platform_env, upload_calls):
@@ -254,6 +273,86 @@ class TestResolveMediaTagsToAssets:
         out = nolgia_assets.resolve_media_tags_to_assets("MEDIA:~/.ssh/id_rsa.png")
         assert out == "id_rsa.png"
         assert upload_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Upload wall budget (in-flight PUT enforcement)
+# ---------------------------------------------------------------------------
+
+
+class _FakeHTTPResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def _fake_signed_flow(monkeypatch):
+    """Stub urllib's urlopen with the create → PUT → complete upload flow.
+
+    The PUT branch drains the streamed request body exactly like real
+    storage would — which is where the deadline wrapper fires.
+    """
+    calls = []
+
+    def fake_urlopen(request, timeout=None):
+        method = request.get_method()
+        url = request.full_url
+        calls.append((method, url))
+        if method == "POST" and url.endswith("/assets/uploads"):
+            body = {"upload_url": "https://signed.example/put", "upload_id": "u1"}
+            return _FakeHTTPResponse(json.dumps(body).encode())
+        if method == "PUT":
+            while request.data.read(8192):
+                pass
+            return _FakeHTTPResponse(b"")
+        if method == "POST" and url.endswith("/complete"):
+            return _FakeHTTPResponse(json.dumps({"id": _ASSET_ID}).encode())
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    return calls
+
+
+class TestUploadWallBudget:
+    def test_deadline_file_reads_until_deadline_then_aborts(self):
+        handle = io.BytesIO(b"abcdef")
+        alive = nolgia_assets._DeadlineFile(handle, time.monotonic() + 60)
+        assert alive.read(3) == b"abc"
+        expired = nolgia_assets._DeadlineFile(handle, time.monotonic() - 0.001)
+        with pytest.raises(nolgia_assets._UploadDeadlineExceeded):
+            expired.read(3)
+
+    def test_put_within_budget_completes(self, platform_env, monkeypatch, tmp_path):
+        calls = _fake_signed_flow(monkeypatch)
+        p = _write_png(tmp_path)
+        asset_id = nolgia_assets._upload_asset(
+            p, "image/png", len(_PNG_BYTES), time.monotonic() + 60
+        )
+        assert asset_id == _ASSET_ID
+        assert [method for method, _ in calls] == ["POST", "PUT", "POST"]
+
+    def test_put_outliving_budget_aborts_and_degrades(self, platform_env, monkeypatch, tmp_path):
+        # _PUT_TIMEOUT_SECONDS is a socket-INACTIVITY timeout: a large file
+        # streaming steadily never trips it, so without the deadline wrapper
+        # one under-cap video could hold run.completed hostage far past the
+        # relay's turn budget. Simulate "budget expired mid-PUT" with an
+        # already-passed deadline: the body stream aborts, complete never
+        # runs, and the caller degrades the tag to a bare filename.
+        calls = _fake_signed_flow(monkeypatch)
+        p = _write_png(tmp_path)
+        asset_id = nolgia_assets._upload_asset(
+            p, "image/png", len(_PNG_BYTES), time.monotonic() - 1
+        )
+        assert asset_id is None
+        assert [method for method, _ in calls] == ["POST", "PUT"]  # no complete call
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +426,29 @@ class TestRunsPathPlatformAssetEgress:
                 assert "run.completed" in events_body
                 assert _ASSET_REF in events_body
                 assert "MEDIA:" not in events_body
+        assert len(upload_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_lowercase_tag_resolves_on_runs_egress(
+        self, platform_env, upload_calls, tmp_path
+    ):
+        """The egress fast-path guard in api_server must be case-insensitive
+        like the shared matchers — a hand-written ``media:`` tag delivers on
+        connectors, so platform mode must resolve it too."""
+        png = _write_png(tmp_path)
+        adapter = _make_adapter()
+        app = _create_api_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_create.return_value = _mock_agent(f"done media:{png}")
+
+                resp = await cli.post("/v1/runs", json={"input": "screenshot please"})
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                status = await _poll_run_until_completed(cli, run_id)
+
+        assert status["output"] == f"done {_ASSET_REF}"
+        assert str(tmp_path) not in status["output"]
         assert len(upload_calls) == 1
 
     @pytest.mark.asyncio
