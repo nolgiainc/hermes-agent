@@ -639,6 +639,42 @@ def _resolve_media_to_data_urls(text: str) -> str:
         return text
 
 
+def _platform_asset_resolver_enabled() -> bool:
+    """True when Nolgia platform-relay mode is active (env-gated).
+
+    See ``gateway.platforms.nolgia_assets.resolver_enabled``: the platform
+    deployment injects ``NOLGIA_API_URL`` + ``NOLGIA_TOKEN`` into the
+    gateway container, so their presence is the platform-mode signal.
+    Without them every egress path keeps its exact upstream behavior.
+    """
+    from gateway.platforms import nolgia_assets
+
+    return nolgia_assets.resolver_enabled()
+
+
+async def _resolve_media_tags_to_platform_assets(text: str) -> str:
+    """Rewrite ``MEDIA:<path>`` tags to platform ``asset:<uuid>`` references.
+
+    Platform-relay egress must not hand out pod-local paths (dead text for
+    web users — no shared filesystem) and must not fall back to
+    ``_resolve_media_to_data_urls`` (which would inline multi-MB base64
+    blobs into relay transcripts). Instead the file is uploaded to the
+    platform asset library and the tag becomes ``asset:<uuid>``, which the
+    web chat renders as a media card; non-uploadable tags degrade to the
+    bare filename. Uploads are blocking network I/O (a video PUT can take
+    minutes), so the resolution runs off the event loop.
+    """
+    # Case-insensitive like the shared IGNORECASE tag matchers — a
+    # hand-written ``media:`` tag must not skip resolution here when the
+    # resolver would rewrite it. (_resolve_media_to_data_urls above keeps
+    # its case-sensitive guard untouched: exact upstream parity.)
+    if not text or "media:" not in text.lower():
+        return text
+    from gateway.platforms import nolgia_assets
+
+    return await asyncio.to_thread(nolgia_assets.resolve_media_tags_to_assets, text)
+
+
 def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
     """Redact API-bound error text before it crosses the HTTP boundary."""
     redacted = redact_sensitive_text(str(value), force=True)
@@ -2360,7 +2396,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        raw_final_response = result.get("final_response") or ""
+        if _platform_asset_resolver_enabled():
+            # Platform-relay mode (this endpoint is the relay's legacy
+            # fallback): upload MEDIA:-tagged files as platform assets
+            # instead of inlining 5MB base64 blobs into the transcript.
+            final_response = await _resolve_media_tags_to_platform_assets(raw_final_response)
+        else:
+            final_response = _resolve_media_to_data_urls(raw_final_response)
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
@@ -4429,6 +4472,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                    if _platform_asset_resolver_enabled():
+                        # The /v1/runs egress is the one the Nolgia platform
+                        # relay consumes (run.completed event + pollable GET
+                        # /v1/runs/{id} status, both built from this value) —
+                        # resolve MEDIA: tags into asset:<uuid> references
+                        # before either is assembled. A late /steer surfaces
+                        # as pending_steer on this same completion and the
+                        # caller re-sends it as a new run, so this single
+                        # hook covers steer continuations too.
+                        final_response = await _resolve_media_tags_to_platform_assets(final_response)
                     completed_event = {
                         "event": "run.completed",
                         "run_id": run_id,

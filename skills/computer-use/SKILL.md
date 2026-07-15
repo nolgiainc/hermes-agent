@@ -169,11 +169,21 @@ automatically.
 
 ## Delivering screenshots to the user
 
-When the user is on a messaging platform (Telegram, Discord, etc.) and
-you took a screenshot they should see, save it somewhere durable and
-use `MEDIA:/absolute/path.png` in your reply. cua-driver's screenshots
-are PNG or JPEG bytes (mimeType is on the response); write them out
-with `write_file` or the terminal (`base64 -d`).
+`MEDIA:<path>` tags are connector-only (Telegram, Discord, Slack, …):
+those platforms intercept the tag and upload the file themselves. Local
+paths NEVER reach web/API users — there is no shared filesystem, so a
+`MEDIA:/absolute/path.png` in a reply to them is dead text.
+
+- On a chat connector (Telegram, Discord, etc.): save the screenshot
+  somewhere durable and use `MEDIA:/absolute/path.png` in your reply.
+- On the Nolgia platform (web chat / API): upload the file to the
+  platform asset library first (`nolgia assets upload <path>`) and
+  reference it as `asset:<uuid>` in your reply instead — the web chat
+  renders that as an inline media card.
+
+cua-driver's screenshots are PNG or JPEG bytes (mimeType is on the
+response); write them out with `write_file` or the terminal
+(`base64 -d`).
 
 On CLI, you can just describe what you see — the screenshot data stays
 in your conversation context.
