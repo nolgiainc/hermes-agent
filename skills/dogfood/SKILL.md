@@ -129,7 +129,11 @@ The report must include:
    - Description of the issue
    - Steps to reproduce
    - Expected vs actual behavior
-   - Screenshot references (use `MEDIA:<screenshot_path>` for inline images)
+   - Screenshot references — on a chat connector (Telegram/Discord/Slack) use
+     `MEDIA:<screenshot_path>` for inline images; on the Nolgia platform
+     (web chat / API) upload each screenshot first (`nolgia assets upload
+     <path>`) and reference it as `asset:<uuid>` instead — local paths never
+     reach web users
    - Console errors if relevant
 3. **Summary table** of all issues
 4. **Testing notes** — what was tested, what was not, any blockers
@@ -159,4 +163,4 @@ Save the report to `{output_dir}/report.md`.
 - **Test navigation flows** — click through multi-step processes end-to-end.
 - **Check responsive behavior** by noting any layout issues visible in screenshots.
 - **Don't forget edge cases**: empty states, very long text, special characters, rapid clicking.
-- When reporting screenshots to the user, include `MEDIA:<screenshot_path>` so they can see the evidence inline.
+- When reporting screenshots to the user on a chat connector (Telegram/Discord/Slack), include `MEDIA:<screenshot_path>` so they can see the evidence inline. `MEDIA:` is connector-only: on the Nolgia platform (web chat / API) a local path never reaches the user — upload the screenshot (`nolgia assets upload <path>`) and reference `asset:<uuid>` instead.
