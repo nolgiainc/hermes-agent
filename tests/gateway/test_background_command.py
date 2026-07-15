@@ -298,11 +298,12 @@ class TestRunBackgroundTask:
         # (default mode requires the file to exist as a regular file).
         import os as _os
         import tempfile as _tempfile
-        _tmpdir = _tempfile.mkdtemp(prefix="bg_media_")
-        _ogg = _os.path.join(_tmpdir, "clip.ogg")
-        _mp4 = _os.path.join(_tmpdir, "render.mp4")
-        _png = _os.path.join(_tmpdir, "chart.png")
-        _pdf = _os.path.join(_tmpdir, "report.pdf")
+        _tmpdir = _os.path.realpath(_tempfile.mkdtemp(prefix="bg_media_"))
+        _ogg = _os.path.realpath(_os.path.join(_tmpdir, "clip.ogg"))
+        _mp4 = _os.path.realpath(_os.path.join(_tmpdir, "render.mp4"))
+        _png = _os.path.realpath(_os.path.join(_tmpdir, "chart.png"))
+        _pdf = _os.path.realpath(_os.path.join(_tmpdir, "report.pdf"))
+
         for _p in (_ogg, _mp4, _png, _pdf):
             with open(_p, "wb") as _fh:
                 _fh.write(b"x")
