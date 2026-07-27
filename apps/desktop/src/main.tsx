@@ -1,6 +1,13 @@
 import './styles.css'
 // Side-effect: applies the persisted window translucency on load.
 import './store/translucency'
+// Dev-only render/state churn counters. MUST precede the `react-dom` import
+// below: react-dom captures the devtools hook at module init, so bippy has to
+// install during THIS import's evaluation or every commit goes unseen
+// (verified — a late install reports renderers=0, commits=0). `vite.config.ts`
+// aliases this specifier to a no-op module for non-dev builds, so neither the
+// counters nor bippy reach a shipped renderer.
+import '@/debug/dev-only'
 
 import { QueryClientProvider } from '@tanstack/react-query'
 import { StrictMode } from 'react'
@@ -25,8 +32,12 @@ if (import.meta.env.MODE !== 'production' || import.meta.env.VITE_PERF_PROBE ===
   import('./app/chat/perf-probe')
 }
 
-if (new URLSearchParams(window.location.search).get('win') === 'overlay') {
+const winParam = new URLSearchParams(window.location.search).get('win')
+
+if (winParam === 'overlay') {
   void import('./app/pet-overlay/overlay-root').then(({ mountPetOverlay }) => mountPetOverlay())
+} else if (winParam === 'quick') {
+  void import('./app/quick-entry/quick-entry-root').then(({ mountQuickEntry }) => mountQuickEntry())
 } else {
   createRoot(document.getElementById('root')!).render(
     <StrictMode>
