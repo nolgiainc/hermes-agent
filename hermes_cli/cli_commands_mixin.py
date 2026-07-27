@@ -286,15 +286,44 @@ class CLICommandsMixin:
             delegations = list_async_delegations()
         except Exception:
             delegations = []
-        running_d = [d for d in delegations if d.get("status") == "running"]
+        running_d = [
+            d for d in delegations
+            if d.get("status") in ("running", "stalling")
+        ]
         if delegations:
             _cprint(f"  Background delegations: {len(running_d)} running")
             for d in delegations:
                 goal = (d.get("goal") or "")[:60]
-                _cprint(
+                status = d.get("status", "?")
+                line = (
                     f"    {d.get('delegation_id', '?')} · "
-                    f"{d.get('status', '?')} · {goal}"
+                    f"{status} · {goal}"
                 )
+                # Live-status detail for in-flight delegations (#51690).
+                if status == "stalling":
+                    quiet = d.get("stalled_after_quiet_seconds")
+                    if quiet is not None:
+                        line += (
+                            f" · no progress {quiet:.0f}s — interrupting"
+                        )
+                elif status in ("running",):
+                    quiet = d.get("seconds_since_progress")
+                    if quiet is not None and quiet >= 60:
+                        line += f" · quiet {quiet:.0f}s"
+                _cprint(line)
+                for i, child in enumerate(d.get("children_activity") or []):
+                    if not isinstance(child, dict):
+                        continue
+                    tool = child.get("current_tool")
+                    doing = f"in {tool}" if tool else "between turns"
+                    part = (
+                        f"      └ child {i + 1}: "
+                        f"{child.get('api_calls', '?')} api calls · {doing}"
+                    )
+                    idle = child.get("seconds_since_activity")
+                    if idle is not None:
+                        part += f" · last activity {idle:.0f}s ago"
+                    _cprint(part)
 
         agent_running = getattr(self, "_agent_running", False)
         _cprint(f"  Agent: {'running' if agent_running else 'idle'}")
@@ -569,8 +598,26 @@ class CLICommandsMixin:
 
         pcfg = gw_config.platforms.get(platform)
         if not pcfg or not pcfg.enabled:
-            _cprint(f"  Platform '{platform_name}' is not configured/enabled in the gateway.")
-            return True
+            # Relay aliasing: a relay-fronted gateway has no per-platform
+            # config block for the logical platform ("discord" etc.) — only a
+            # RELAY entry — yet /handoff discord is deliverable when the relay
+            # fronts it. The fronted set is deploy config
+            # (GATEWAY_RELAY_PLATFORMS), readable here without the live
+            # adapter; the gateway watcher re-checks against the authenticated
+            # transport (resolve_delivery_transport) before dispatch, so this
+            # is a UX pre-check, not the security gate.
+            relay_fronts = False
+            try:
+                from gateway.relay import relay_platform_identities
+                relay_cfg = gw_config.platforms.get(Platform.RELAY)
+                if relay_cfg and relay_cfg.enabled:
+                    fronted = {p for p, _ in relay_platform_identities()}
+                    relay_fronts = platform_name in fronted
+            except Exception:
+                relay_fronts = False
+            if not relay_fronts:
+                _cprint(f"  Platform '{platform_name}' is not configured/enabled in the gateway.")
+                return True
 
         home = gw_config.get_home_channel(platform)
         if not home or not home.chat_id:
@@ -758,7 +805,8 @@ class CLICommandsMixin:
         if self.agent:
             try:
                 self.agent._flush_messages_to_session_db(
-                    self.conversation_history
+                    self.conversation_history,
+                    conversation_history=self.conversation_history,
                 )
             except Exception:
                 pass
@@ -779,11 +827,20 @@ class CLICommandsMixin:
         # becomes ``self.conversation_history`` for subsequent turns. Heal a
         # durable ``user;user`` violation once here instead of re-firing the
         # pre-request repair on every request for the rest of the session.
-        restored = self._session_db.get_messages_as_conversation(
-            target_id, repair_alternation=True
+        #
+        # Both projections come from one lineage SELECT: model_history is
+        # alternation-repaired for live replay; display_history is the full
+        # lineage verbatim, used by _display_resumed_history() so timeline
+        # events and ancestor rows render correctly (matching the startup
+        # --resume path in _preload_resumed_session).
+        model_history, display_history = self._session_db.get_resume_conversations(
+            target_id
         )
-        restored = [m for m in (restored or []) if m.get("role") != "session_meta"]
+        restored = [m for m in (model_history or []) if m.get("role") != "session_meta"]
         self.conversation_history = restored
+        self._resume_display_history = [
+            m for m in (display_history or []) if m.get("role") != "session_meta"
+        ]
 
         # Re-open the target session so it's not marked as ended
         try:
@@ -823,7 +880,7 @@ class CLICommandsMixin:
                 pass
 
         title_part = f" \"{session_meta['title']}\"" if session_meta.get("title") else ""
-        msg_count = len([m for m in self.conversation_history if m.get("role") == "user"])
+        msg_count = len([m for m in self._resume_display_history if m.get("role") == "user" and not m.get("display_kind")])
         if self.conversation_history:
             _cprint(
                 f"  ↻ Resumed session {target_id}{title_part}"
@@ -919,7 +976,8 @@ class CLICommandsMixin:
         if self.agent:
             try:
                 self.agent._flush_messages_to_session_db(
-                    self.conversation_history
+                    self.conversation_history,
+                    conversation_history=self.conversation_history,
                 )
             except Exception:
                 pass
@@ -966,6 +1024,7 @@ class CLICommandsMixin:
                     # replays the parent's exact wire bytes (warm provider
                     # prompt cache) instead of a full cold prefill.
                     api_content=extract_api_content_sidecar(msg),
+                    timestamp=msg.get("timestamp"),
                 )
             except Exception:
                 pass  # Best-effort copy
@@ -1582,6 +1641,32 @@ class CLICommandsMixin:
             self._pending_input.put(msg)
         else:  # pragma: no cover - defensive (no live input loop)
             print("  /learn needs an active chat session to run.")
+
+    def _handle_init_command(self, cmd: str):
+        """Handle /init — generate or update AGENTS.md from a project scan.
+
+        Mirrors /learn: build a guidance-laden prompt and inject it onto the
+        agent's input queue as a normal user turn. The live agent scans the
+        project with its own read-only tools and writes/updates AGENTS.md via
+        ``write_file``. No engine, no model-tool footprint, works on any
+        terminal backend, and preserves prompt-cache invariants (no system
+        prompt or history mutation).
+        """
+        from hermes_cli.init_command import build_init_prompt_for_cwd
+
+        # Everything after the command word is optional user emphasis.
+        parts = cmd.strip().split(None, 1)
+        extra = parts[1].strip() if len(parts) > 1 else ""
+
+        msg = build_init_prompt_for_cwd(extra=extra)
+        if "UPDATE the existing AGENTS.md" in msg:
+            print("\n⚡ Updating AGENTS.md from a project scan...")
+        else:
+            print("\n⚡ Generating AGENTS.md from a project scan...")
+        if hasattr(self, "_pending_input"):
+            self._pending_input.put(msg)
+        else:  # pragma: no cover - defensive (no live input loop)
+            print("  /init needs an active chat session to run.")
 
     def _handle_memory_command(self, cmd: str):
         """Handle /memory slash command — pending review + approval-gate toggle."""
@@ -2617,7 +2702,7 @@ class CLICommandsMixin:
             /busy status        Show current busy input mode
             /busy queue         Queue input for the next turn instead of interrupting
             /busy steer         Inject Enter mid-run via /steer (after next tool call)
-            /busy interrupt     Interrupt the current run on Enter (default)
+            /busy interrupt     Redirect the current run on Enter (default)
         """
         from cli import _ACCENT, _DIM, _RST, _cprint, save_config_value
         parts = cmd.strip().split(maxsplit=1)
@@ -2628,7 +2713,7 @@ class CLICommandsMixin:
             elif self.busy_input_mode == "steer":
                 _behavior = "steers into current run (after next tool call)"
             else:
-                _behavior = "interrupts current run"
+                _behavior = "redirects current run immediately"
             _cprint(f"  {_DIM}Enter while busy: {_behavior}{_RST}")
             _cprint(f"  {_DIM}Usage: /busy [queue|steer|interrupt|status]{_RST}")
             return
@@ -2646,7 +2731,7 @@ class CLICommandsMixin:
             elif arg == "steer":
                 behavior = "Enter will steer your message into the current run (after the next tool call)."
             else:
-                behavior = "Enter will interrupt the current run while Hermes is busy."
+                behavior = "Enter will redirect the current run while Hermes is busy; /stop still cancels it."
             _cprint(f"  {_ACCENT}✓ Busy input mode set to '{arg}' (saved to config){_RST}")
             _cprint(f"  {_DIM}{behavior}{_RST}")
         else:
