@@ -288,6 +288,19 @@ _TEMP_DIR = os.path.join(tempfile.gettempdir(), "hermes_voice")
 # ============================================================================
 # Audio cues (beep tones)
 # ============================================================================
+def audio_playback_disabled() -> bool:
+    """True when local speaker output is disabled via env.
+
+    ``HERMES_DISABLE_AUDIO_PLAYBACK=1`` silences every speaker-output path
+    (``play_beep``, ``play_audio_file``, and the streaming-TTS speaker in
+    ``tools.tts_tool``). Synthesis-to-file (``text_to_speech_tool`` with an
+    output path) is unaffected — only audible playback is suppressed. The
+    test suite sets this in ``tests/conftest.py`` so running tests never
+    plays sound on the developer's machine.
+    """
+    return os.environ.get("HERMES_DISABLE_AUDIO_PLAYBACK", "").strip() == "1"
+
+
 def play_beep(frequency: int = 880, duration: float = 0.12, count: int = 1) -> None:
     """Play a short beep tone using numpy + sounddevice.
 
@@ -296,6 +309,8 @@ def play_beep(frequency: int = 880, duration: float = 0.12, count: int = 1) -> N
         duration: Duration of each beep in seconds.
         count: Number of beeps to play (with short gap between).
     """
+    if audio_playback_disabled():
+        return
     try:
         sd, np = _import_audio()
     except (ImportError, OSError):
@@ -1060,6 +1075,10 @@ def play_audio_file(file_path: str) -> bool:
         ``True`` if playback succeeded, ``False`` otherwise.
     """
     global _active_playback
+
+    if audio_playback_disabled():
+        logger.debug("Audio playback disabled (HERMES_DISABLE_AUDIO_PLAYBACK=1): %s", file_path)
+        return False
 
     if not os.path.isfile(file_path):
         logger.warning("Audio file not found: %s", file_path)
