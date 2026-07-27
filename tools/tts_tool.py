@@ -2791,7 +2791,12 @@ def stream_tts_to_speaker(
         # Prefer a chunked streamer for low time-to-first-audio; fall back to
         # per-sentence sync synthesis (universal — edge + every non-streamer).
         from tools.tts_streaming import SentenceChunker, resolve_streaming_provider
-        streamer = resolve_streaming_provider(tts_config, preferred=provider)
+        from tools.voice_mode import audio_playback_disabled
+        playback_disabled = audio_playback_disabled()
+        streamer = (
+            None if playback_disabled
+            else resolve_streaming_provider(tts_config, preferred=provider)
+        )
 
         stream_max_len = 0
         if streamer is not None:
@@ -2837,6 +2842,9 @@ def stream_tts_to_speaker(
             # Display raw sentence on screen before TTS processing
             if display_callback is not None:
                 display_callback(sentence)
+            # Playback disabled → display-only: no synthesis, no speaker.
+            if playback_disabled:
+                return
             # No chunked streamer → per-sentence sync synthesis (universal).
             if streamer is None:
                 _speak_via_sync(cleaned)

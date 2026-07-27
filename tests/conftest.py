@@ -13,6 +13,12 @@ Hermetic-test invariants enforced here (see AGENTS.md for rationale):
 3. **Deterministic runtime.** TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0.
 4. **No HERMES_SESSION_* inheritance** — the agent's current gateway
    session must not leak into tests.
+5. **No audible playback.** HERMES_DISABLE_AUDIO_PLAYBACK=1 silences
+   every speaker path (play_beep, play_audio_file, streaming TTS).
+   Credential blanking alone does not cover this: the default TTS
+   provider (edge) is keyless, so tests exercising the real pipeline
+   would otherwise synthesize and speak their fixtures out loud on the
+   developer's machine.
 
 These invariants make the local test run match CI closely. Gaps that
 remain (CPU count, xdist worker count) are addressed by the canonical
@@ -398,6 +404,15 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # should never perform that implicit network/bootstrap path; Tirith-specific
     # tests opt back in by patching the security config directly.
     monkeypatch.setenv("TIRITH_ENABLED", "false")
+
+    # 4c. Never play sound (invariant 5). The default TTS provider (edge)
+    #     needs no API key, so credential blanking does not keep tests
+    #     that drive the real TTS pipeline silent — the full gateway run
+    #     audibly spoke its fixture sentences on macOS. Suppress every
+    #     speaker path at the source (see tools/voice_mode.py). Tests
+    #     that need to assert real playback behavior can monkeypatch this
+    #     var away explicitly.
+    monkeypatch.setenv("HERMES_DISABLE_AUDIO_PLAYBACK", "1")
 
     # 5. Reset plugin singleton so tests don't leak plugins from
     #    ~/.hermes/plugins/ (which, per step 3, is now empty — but the
