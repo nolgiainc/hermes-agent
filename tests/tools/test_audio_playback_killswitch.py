@@ -51,7 +51,10 @@ def test_play_audio_file_reaches_players_when_enabled(tmp_path, monkeypatch):
     _write_tiny_wav(str(wav))
 
     monkeypatch.delenv("HERMES_DISABLE_AUDIO_PLAYBACK", raising=False)
+    # CI runners have no player binary — stub which() so the loop always
+    # reaches the (mocked) Popen regardless of platform.
     with patch.object(voice_mode, "_import_audio", side_effect=ImportError), \
+         patch.object(voice_mode.shutil, "which", return_value="/usr/bin/player"), \
          patch.object(voice_mode.subprocess, "Popen") as mock_popen:
         mock_proc = MagicMock()
         mock_proc.wait.return_value = 0

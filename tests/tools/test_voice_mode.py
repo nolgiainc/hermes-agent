@@ -26,6 +26,17 @@ def _non_wsl_proc_version(real_open):
 # Fixtures
 # ============================================================================
 
+@pytest.fixture(autouse=True)
+def _enable_playback_layer(monkeypatch):
+    """Opt out of hermetic invariant 5 (HERMES_DISABLE_AUDIO_PLAYBACK).
+
+    This module tests the playback layer's own mechanics, so the suite-wide
+    kill-switch must be off here. Still silent: every test mocks sounddevice
+    and/or the player subprocess itself.
+    """
+    monkeypatch.delenv("HERMES_DISABLE_AUDIO_PLAYBACK", raising=False)
+
+
 @pytest.fixture
 def sample_wav(tmp_path):
     """Create a minimal valid WAV file (1 second of silence at 16kHz)."""
