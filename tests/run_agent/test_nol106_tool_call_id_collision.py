@@ -14,13 +14,15 @@ the session.
 
 Two independent defenses are covered:
 
-  * Layer 1 — ``_namespace_tool_call_ids`` rewrites provider-minted ids to be
-    globally unique per response at ingestion, so persisted history never
-    stores colliding ids in the first place.
+  * Layer 1 — ``_namespace_tool_call_ids`` de-collides provider-minted ids at
+    ingestion: an id that duplicates one already in the in-context history (or
+    an earlier call in the same response) is rewritten to be unique. Unique-id
+    providers (incl. strict-format ones like Mistral, and Anthropic's
+    interleaved-thinking path) are left untouched.
 
   * Layer 2 — ``_sanitize_api_messages`` guarantees it can NEVER emit an empty
-    assistant message, and repairs PRE-EXISTING poisoned histories (written by
-    the old code) so a wedged session un-sticks without manual DB surgery.
+    assistant message, repairs PRE-EXISTING poisoned histories (written by the
+    old code), and never leaves two adjacent user turns behind.
 """
 
 import types
@@ -42,47 +44,81 @@ def _tool_call(call_id, name="search", arguments="{}", provider_data=None):
     )
 
 
-def _response(tool_calls):
-    return types.SimpleNamespace(tool_calls=list(tool_calls))
+def _response(tool_calls, anthropic_content_blocks=None):
+    return types.SimpleNamespace(
+        tool_calls=list(tool_calls),
+        anthropic_content_blocks=anthropic_content_blocks,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Layer 1 — source-side uniqueness
+# Layer 1 — collision-triggered source-side uniqueness
 # ---------------------------------------------------------------------------
 
 class TestNamespaceProviderToolCallIds:
 
     def test_colliding_ids_across_turns_become_unique(self):
-        """Two turns that reuse the SAME provider id must end up unique.
+        """A later turn that reuses an id already in history is de-collided.
 
         Simulates Moonshot returning ``tool_call_201`` on two separate turns
-        (the 5251/5258 shape). After namespacing, the persisted ids differ, so
-        the assembly-time dedupe can never collapse the second turn's calls.
+        (the 5251/5258 shape). ``existing_ids`` carries the earlier turn's id,
+        so the second turn's duplicate is rewritten — the assembly-time dedupe
+        can never collapse it.
         """
         turn_a = _response([_tool_call("tool_call_201")])
-        turn_b = _response([_tool_call("tool_call_201")])
-
-        AIAgent._namespace_tool_call_ids(turn_a)
-        AIAgent._namespace_tool_call_ids(turn_b)
-
+        AIAgent._namespace_tool_call_ids(turn_a, set())
         id_a = turn_a.tool_calls[0].id
+        assert id_a == "tool_call_201"  # first sighting kept verbatim
+
+        turn_b = _response([_tool_call("tool_call_201")])  # provider reuses id
+        AIAgent._namespace_tool_call_ids(turn_b, {id_a})
         id_b = turn_b.tool_calls[0].id
 
-        # Provider prefix preserved for debuggability, but globally unique.
-        assert id_a != id_b
-        assert id_a.startswith("tool_call_201")
-        assert id_b.startswith("tool_call_201")
+        assert id_b != id_a
+        assert id_b.startswith("tool_call_201")  # prefix preserved for debugging
 
-    def test_within_turn_ids_stay_unique_and_paired(self):
-        """A parallel-call turn keeps one namespaced id per call."""
+    def test_within_turn_duplicate_ids_de_collided(self):
+        """A parallel-call turn that repeats an id gets one unique id per call."""
         turn = _response([
             _tool_call("tool_call_1", name="a"),
             _tool_call("tool_call_2", name="b"),
             _tool_call("tool_call_1", name="c"),  # provider re-used within turn
         ])
-        AIAgent._namespace_tool_call_ids(turn)
+        AIAgent._namespace_tool_call_ids(turn, set())
         ids = [tc.id for tc in turn.tool_calls]
-        assert len(set(ids)) == 3  # all distinct after namespacing
+        assert len(set(ids)) == 3  # all distinct after de-collision
+        assert ids[0] == "tool_call_1"  # first kept verbatim
+        assert ids[2].startswith("tool_call_1") and ids[2] != "tool_call_1"
+
+    def test_unique_ids_are_left_untouched(self):
+        """Well-behaved providers (unique ids) are NOT reformatted.
+
+        Guards the Mistral case: a strict provider requiring a fixed id schema
+        must keep its verbatim id across turns, because nothing collides.
+        """
+        turn_a = _response([_tool_call("abc123def")])  # Mistral-style 9-char
+        AIAgent._namespace_tool_call_ids(turn_a, set())
+        assert turn_a.tool_calls[0].id == "abc123def"
+
+        turn_b = _response([_tool_call("xyz789ghi")])
+        rewritten = AIAgent._namespace_tool_call_ids(turn_b, {"abc123def"})
+        assert rewritten == 0
+        assert turn_b.tool_calls[0].id == "xyz789ghi"  # untouched, format intact
+
+    def test_anthropic_interleaved_thinking_skipped(self):
+        """Turns carrying anthropic_content_blocks are skipped entirely.
+
+        The authoritative tool_use ids live in the verbatim ordered block list
+        (which this function does not rewrite); rewriting the parallel
+        tool_calls ids would desync them and 400 Anthropic on replay.
+        """
+        turn = _response(
+            [_tool_call("toolu_01", name="a"), _tool_call("toolu_01", name="b")],
+            anthropic_content_blocks=[{"type": "tool_use", "id": "toolu_01"}],
+        )
+        rewritten = AIAgent._namespace_tool_call_ids(turn, {"toolu_01"})
+        assert rewritten == 0
+        assert [tc.id for tc in turn.tool_calls] == ["toolu_01", "toolu_01"]
 
     def test_codex_style_ids_left_untouched(self):
         """Codex/Responses calls (call_id/response_item_id) are not rewritten."""
@@ -93,40 +129,40 @@ class TestNamespaceProviderToolCallIds:
                                "response_item_id": "fc_abc123"},
             ),
         ])
-        AIAgent._namespace_tool_call_ids(turn)
+        AIAgent._namespace_tool_call_ids(turn, {"call_abc123"})
         assert turn.tool_calls[0].id == "call_abc123"
 
     def test_missing_or_empty_id_left_for_fallback(self):
         """No provider id → left alone (deterministic fallback owns that case)."""
         turn = _response([_tool_call(""), _tool_call(None)])
-        rewritten = AIAgent._namespace_tool_call_ids(turn)
-        assert rewritten == 0
+        assert AIAgent._namespace_tool_call_ids(turn, set()) == 0
 
     def test_idempotent_no_double_namespacing(self):
-        """Running twice must not stack a second suffix."""
+        """Re-running on the already-de-collided object does not stack a suffix."""
         turn = _response([_tool_call("tool_call_9")])
-        AIAgent._namespace_tool_call_ids(turn)
+        AIAgent._namespace_tool_call_ids(turn, {"tool_call_9"})  # collides -> rewrite
         once = turn.tool_calls[0].id
-        AIAgent._namespace_tool_call_ids(turn)
+        assert once.startswith("tool_call_9") and once != "tool_call_9"
+        AIAgent._namespace_tool_call_ids(turn, {"tool_call_9"})  # id no longer collides
         assert turn.tool_calls[0].id == once
 
     def test_no_tool_calls_is_safe(self):
-        assert AIAgent._namespace_tool_call_ids(_response([])) == 0
-        assert AIAgent._namespace_tool_call_ids(types.SimpleNamespace()) == 0
+        assert AIAgent._namespace_tool_call_ids(_response([]), set()) == 0
+        assert AIAgent._namespace_tool_call_ids(types.SimpleNamespace(), set()) == 0
 
-    def test_namespaced_pair_survives_assembly(self):
-        """End-to-end: after namespacing, a 2-turn history assembles cleanly.
+    def test_de_collided_pair_survives_assembly(self):
+        """End-to-end: after de-collision, a 2-turn history assembles cleanly.
 
         Builds the persisted-shape history the way the loop would (assistant
         tool_calls[].id + matching tool.tool_call_id, both carrying the SAME
-        namespaced id), then runs the real assembly guard. No empty assistant,
+        de-collided id), then runs the real assembly guard. No empty assistant,
         no orphan, both turns preserved.
         """
         turn_a = _response([_tool_call("tool_call_201")])
-        turn_b = _response([_tool_call("tool_call_201")])
-        AIAgent._namespace_tool_call_ids(turn_a)
-        AIAgent._namespace_tool_call_ids(turn_b)
+        AIAgent._namespace_tool_call_ids(turn_a, set())
         id_a = turn_a.tool_calls[0].id
+        turn_b = _response([_tool_call("tool_call_201")])
+        AIAgent._namespace_tool_call_ids(turn_b, {id_a})
         id_b = turn_b.tool_calls[0].id
 
         history = [
@@ -248,3 +284,28 @@ class TestAssemblyGuardEmptyAssistant:
         ]
         out = AIAgent._sanitize_api_messages(history)
         assert any(m.get("role") == "assistant" for m in out)
+
+    def test_user_empty_assistant_user_leaves_no_adjacent_users(self):
+        """Dropping an empty assistant between two users must merge the users.
+
+        A host-fed/legacy ``user -> empty assistant -> user`` history would
+        otherwise become ``user, user`` — a same-role adjacency strict providers
+        reject — because the downstream merge pass only runs when it itself drops
+        a thinking-only turn.
+        """
+        history = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": ""},  # no payload — dropped
+            {"role": "user", "content": "second"},
+        ]
+        out = AIAgent._sanitize_api_messages(history)
+
+        assert all(m.get("role") != "assistant" for m in out)
+        roles = [m.get("role") for m in out]
+        assert not any(
+            roles[i] == "user" and roles[i + 1] == "user"
+            for i in range(len(roles) - 1)
+        )
+        merged = [m for m in out if m.get("role") == "user"]
+        assert len(merged) == 1
+        assert "first" in merged[0]["content"] and "second" in merged[0]["content"]

@@ -2767,13 +2767,13 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
 # collides with the Codex ``call_id|response_item_id`` delimiter. Mirrors the
 # ``__m``/``__u`` shape used by the live-incident data remediation (NOL-106).
 _TOOL_CALL_ID_NAMESPACE_MARKER = "__u"
-_TOOL_CALL_ID_NAMESPACE_RE = re.compile(
-    re.escape(_TOOL_CALL_ID_NAMESPACE_MARKER) + r"[0-9a-f]{8,}$"
-)
 
 
-def namespace_provider_tool_call_ids(assistant_message: Any) -> int:
-    """Make every provider-minted ``tool_call`` id globally unique at ingestion.
+def namespace_provider_tool_call_ids(
+    assistant_message: Any,
+    existing_ids: Optional[set] = None,
+) -> int:
+    """De-collide provider-minted ``tool_call`` ids at ingestion (NOL-106).
 
     Providers such as Moonshot/Kimi mint ``tool_call`` ids from a
     per-conversation counter that can RESET or OVERLAP across turns — most
@@ -2783,38 +2783,59 @@ def namespace_provider_tool_call_ids(assistant_message: Any) -> int:
     would filter a later turn's colliding calls, leaving an empty assistant
     message that Moonshot rejects with a NON-RETRYABLE HTTP 400 ("the message at
     position N with role 'assistant' must not be empty") — permanently wedging
-    the session (NOL-106).
+    the session.
 
     Fix the root cause at the ingestion boundary: as soon as a fresh provider
     response is normalized — BEFORE its ids are consumed for tool dispatch,
-    result pairing, persistence, or replay — suffix each provider-supplied id
-    with a random token, so no two tool calls in a session can ever share an id.
+    result pairing, persistence, or replay — rewrite any tool_call id that
+    COLLIDES with one already present in the in-context history (``existing_ids``,
+    gathered from the prior turns) or with an earlier call in this same response.
+    Colliding ids get a ``<id>__u<uuid>`` suffix so no two tool calls in the
+    session share an id.
 
-    Why here and not at persistence/on-load: during the live turn the SAME
-    normalized ``ToolCall`` object feeds BOTH the persisted assistant
+    Why collision-triggered rather than an unconditional suffix on every id:
+    well-behaved providers already mint unique ids, and some enforce a strict id
+    schema on replay (e.g. Mistral requires exactly nine alphanumerics; Anthropic
+    cross-references the id inside verbatim ``anthropic_content_blocks``). Blindly
+    reformatting every id would break those providers' next request. Rewriting
+    ONLY an id that actually duplicates one already in the conversation is a no-op
+    for unique-id providers (their ids are never touched, format preserved) while
+    still catching the exact Moonshot/Kimi counter-reset that caused the incident
+    — including across a resume, because ``existing_ids`` is derived from the
+    loaded history.
+
+    Why on the normalized object (not persistence/on-load): during the live turn
+    the SAME ``ToolCall`` object feeds BOTH the persisted assistant
     ``tool_calls[].id`` and the dispatcher that stamps each ``tool`` result's
-    ``tool_call_id`` (executor reads ``tc.id``). Rewriting the id on that one
-    object — before either consumer runs — keeps within-turn call↔result pairing
-    intact automatically, whereas a persistence-time rewrite would have to
-    re-pair rows written by separate ``append_message`` calls.
+    ``tool_call_id`` (executor reads ``tc.id``). Rewriting the id here — before
+    either consumer runs — keeps within-turn call↔result pairing intact
+    automatically. The suffix is minted ONCE and flows into stored history, so
+    replay is byte-stable and provider prompt caches stay warm.
 
-    Cache-safe: the suffix is minted ONCE and then flows into stored history, so
-    replay is byte-stable (a message's id never changes) and provider prompt
-    caches stay warm. This is unlike the deterministic-from-content fallback in
-    ``build_assistant_message`` (whose job is to avoid re-deriving on every call
-    when the provider omits an id) — that path is left untouched.
+    Skipped entirely:
+    * Anthropic interleaved-thinking turns (``anthropic_content_blocks`` present):
+      the authoritative tool_use ids live in that verbatim ordered block list,
+      which this function does not rewrite; Anthropic ids are already unique, so
+      there is nothing to de-collide.
+    * Codex/Responses calls (``call_id`` / ``response_item_id`` in
+      ``provider_data``): content-addressed ids that round-trip through the
+      Responses ``function_call`` ↔ ``function_call_output`` linkage.
 
-    Codex/Responses tool calls (identified by ``call_id`` / ``response_item_id``
-    in ``provider_data``) are deliberately NOT rewritten: their ids are
-    content-addressed ``fc_``/``call_`` identifiers that round-trip through the
-    Responses ``function_call`` ↔ ``function_call_output`` linkage and were not
-    implicated in the incident. The assembly guard still backstops them.
+    The assembly guard in :func:`sanitize_api_messages` backstops every provider
+    regardless — even a collision this function does not rewrite can never emit
+    an empty assistant message.
 
     Returns the number of ids rewritten (for logging/telemetry).
     """
     tool_calls = getattr(assistant_message, "tool_calls", None)
     if not tool_calls:
         return 0
+    # Anthropic interleaved-thinking replays verbatim ordered blocks whose
+    # tool_use ids we do NOT rewrite here — leave the parallel tool_calls ids
+    # untouched so the two never diverge (Anthropic ids are already unique).
+    if getattr(assistant_message, "anthropic_content_blocks", None):
+        return 0
+    seen: set = set(existing_ids) if existing_ids else set()
     rewritten = 0
     for tc in tool_calls:
         # Leave Codex/Responses ids alone — protocol-specific round-trip.
@@ -2827,16 +2848,21 @@ def namespace_provider_tool_call_ids(assistant_message: Any) -> int:
             # build_assistant_message owns the missing-id case; out of scope.
             continue
         raw = raw.strip()
-        if _TOOL_CALL_ID_NAMESPACE_RE.search(raw):
-            continue  # already namespaced (idempotent guard)
+        if raw not in seen:
+            # First sighting of this id in the conversation — keep it verbatim
+            # (format preserved for strict providers) and remember it.
+            seen.add(raw)
+            continue
+        # Collision: this id already belongs to an earlier call. Mint a unique
+        # variant so the later call is not filtered away at assembly.
         try:
-            tc.id = (
-                f"{raw}{_TOOL_CALL_ID_NAMESPACE_MARKER}{uuid.uuid4().hex[:12]}"
-            )
+            new_id = f"{raw}{_TOOL_CALL_ID_NAMESPACE_MARKER}{uuid.uuid4().hex[:12]}"
+            tc.id = new_id
         except (AttributeError, TypeError):
             # Frozen/immutable tool-call object — leave it; the assembly guard
             # is the backstop.
             continue
+        seen.add(new_id)
         rewritten += 1
     return rewritten
 
@@ -3101,10 +3127,34 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 if cid and cid not in live_call_ids:
                     continue  # orphaned by the empty-assistant drop
             swept.append(msg)
-        messages = swept
+        # Dropping an empty assistant that sat between two user turns
+        # (``user → empty assistant → user`` in a host-fed/legacy history) leaves
+        # two consecutive ``user`` messages, which strict providers reject. The
+        # downstream ``drop_thinking_only_and_merge_users`` pass only merges when
+        # it ITSELF dropped a thinking-only turn, so it will not repair this —
+        # merge the newly-adjacent user messages here (string content joined with
+        # a blank line; multimodal/list content is left as separate turns).
+        merged: List[Dict[str, Any]] = []
+        for msg in swept:
+            prev = merged[-1] if merged else None
+            if (
+                isinstance(prev, dict)
+                and isinstance(msg, dict)
+                and prev.get("role") == "user"
+                and msg.get("role") == "user"
+                and isinstance(prev.get("content"), str)
+                and isinstance(msg.get("content"), str)
+            ):
+                prev_copy = dict(prev)
+                sep = "\n\n" if prev["content"] and msg["content"] else ""
+                prev_copy["content"] = prev["content"] + sep + msg["content"]
+                merged[-1] = prev_copy
+                continue
+            merged.append(msg)
+        messages = merged
         _ra().logger.debug(
-            "Pre-call sanitizer: dropped %d empty assistant message(s) and "
-            "swept their now-orphaned tool result(s)",
+            "Pre-call sanitizer: dropped %d empty assistant message(s), swept "
+            "their now-orphaned tool result(s), merged adjacent user turns",
             dropped_empty_assistants,
         )
 

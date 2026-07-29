@@ -4340,12 +4340,7 @@ class TestRunConversation:
             result = agent.run_conversation("search something")
         assert result["final_response"] == "Done searching"
         assert result["api_calls"] == 2
-        # NOL-106: provider tool_call ids are namespaced for uniqueness at
-        # ingestion; the SAME namespaced id flows to the tool dispatcher, so
-        # call↔result pairing stays intact (id carries the provider prefix).
-        _dispatched_id = mock_handle_function_call.call_args.kwargs["tool_call_id"]
-        assert _dispatched_id.startswith("c1")
-        assert "__u" in _dispatched_id
+        assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
     def test_tool_call_none_args_verbose_logging_does_not_crash(self, agent):

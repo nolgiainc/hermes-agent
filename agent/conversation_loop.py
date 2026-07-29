@@ -5190,19 +5190,38 @@ def run_conversation(
                 else:
                     assistant_message.content = str(raw)
 
-            # NOL-106: namespace provider-minted tool_call ids to be globally
-            # unique BEFORE anything consumes them (tool dispatch, result
-            # pairing, persistence, replay). Moonshot/Kimi mint ids from a
-            # per-conversation counter that resets/overlaps across turns; stored
-            # verbatim they collide at assembly, get deduped to an empty
-            # assistant, and 400 the session permanently. Rewriting the single
-            # normalized object here keeps within-turn call↔result pairing intact.
-            _ns_rewritten = agent._namespace_tool_call_ids(assistant_message)
-            if _ns_rewritten:
-                logger.debug(
-                    "%sNamespaced %d provider tool_call id(s) for uniqueness",
-                    agent.log_prefix, _ns_rewritten,
+            # NOL-106: de-collide provider-minted tool_call ids BEFORE anything
+            # consumes them (tool dispatch, result pairing, persistence, replay).
+            # Moonshot/Kimi mint ids from a per-conversation counter that
+            # resets/overlaps across turns; stored verbatim they collide at
+            # assembly, get deduped to an empty assistant, and 400 the session
+            # permanently. Only ids that actually collide with an id already in
+            # the in-context history (or an earlier call in this response) are
+            # rewritten, so unique-id providers (incl. strict-format ones like
+            # Mistral/Anthropic) are untouched. Rewriting the single normalized
+            # object here keeps within-turn call↔result pairing intact.
+            if getattr(assistant_message, "tool_calls", None):
+                _existing_tc_ids: set = set()
+                for _hm in messages:
+                    if not isinstance(_hm, dict):
+                        continue
+                    if _hm.get("role") == "assistant":
+                        for _htc in _hm.get("tool_calls") or []:
+                            _hcid = agent._get_tool_call_id_static(_htc)
+                            if _hcid:
+                                _existing_tc_ids.add(_hcid)
+                    elif _hm.get("role") == "tool":
+                        _hcid = (_hm.get("tool_call_id") or "").strip()
+                        if _hcid:
+                            _existing_tc_ids.add(_hcid)
+                _ns_rewritten = agent._namespace_tool_call_ids(
+                    assistant_message, _existing_tc_ids
                 )
+                if _ns_rewritten:
+                    logger.debug(
+                        "%sDe-collided %d provider tool_call id(s) for uniqueness",
+                        agent.log_prefix, _ns_rewritten,
+                    )
 
             try:
                 from hermes_cli.plugins import (
