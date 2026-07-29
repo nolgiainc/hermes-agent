@@ -252,6 +252,50 @@ COPY apps/shared/ apps/shared/
 RUN cd web && npm run build && \
     cd ../ui-tui && npm run build
 
+# ---------- yt-dlp (Nolgia fork addition) ----------
+# yt-dlp powers the agent's local video-research lane: pull a video down
+# once, then sample frames and lift the transcript locally instead of
+# shipping the whole file to a vision model.  It is the partner of the
+# ffmpeg installed in the apt layer above — yt-dlp shells out to ffmpeg to
+# merge and convert the streams it fetches, so the pair only works baked in
+# together.  Installing it into the image is what makes it a fleet
+# capability.  A hand install does have somewhere to land — `uv tool
+# install` into the /opt/data PVC works and survives restarts, and the
+# video-learning ability documents it as a stopgap — but it is per-pod,
+# invisible to every other agent, unreproducible, and gone the moment a pod
+# is re-provisioned onto a fresh volume.  Baking it in is what makes the
+# video-research lane something every agent simply has.
+#
+# Installed as an isolated `uv tool` so yt-dlp resolves its dependencies in
+# its own venv and can never move a pin inside hermes' own
+# `uv sync --frozen` environment.  UV_TOOL_DIR has to stay outside
+# /opt/data because the runtime mounts a volume over that path and would
+# shadow a build-time install — the same reason PLAYWRIGHT_BROWSERS_PATH
+# points into /opt/hermes.  The console script is placed in /usr/local/bin,
+# which the base image already has on PATH.
+#
+# `--python /usr/bin/python3` pins the tool venv to the system interpreter.
+# uv otherwise prefers a *managed* Python and downloads one into root's
+# home, which is mode 0700: the build runs as root so it would still pass
+# the self-test below, and the tool would then be unreadable to the
+# non-root hermes user the container actually runs as.
+#
+# The install is deliberately architecture-independent (yt-dlp publishes a
+# pure-Python wheel), so this layer builds on both linux/amd64 and
+# linux/arm64.  Do NOT swap it for a downloaded `yt-dlp_linux` release
+# binary — those are x86_64-only and would break the arm64 leg of
+# .github/workflows/docker.yml.  `yt-dlp --version` is a build-time
+# self-test: a broken install fails the build here instead of publishing an
+# image whose video lane is silently dead.
+#
+# The layer sits after the dependency and frontend builds on purpose, so a
+# version bump re-runs only the cheap tail of the build instead of the
+# ~5 min npm + Playwright + `uv sync` block.
+ENV UV_TOOL_DIR=/opt/hermes/.uvtools
+RUN UV_TOOL_BIN_DIR=/usr/local/bin \
+    uv tool install --python /usr/bin/python3 yt-dlp==2026.7.4 && \
+    yt-dlp --version
+
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
 # --link decouples this layer from parents for cache purposes; --chmod bakes
