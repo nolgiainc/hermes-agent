@@ -1413,6 +1413,64 @@ def _bedrock_timeout_seconds(timeout: Any) -> Optional[float]:
     return seconds
 
 
+# ── Unforwarded-kwarg reporting (NOL-139) ──────────────────────────────────
+# The shim adapters translate ``chat.completions.create(**kwargs)`` into
+# provider-native calls by reading the kwargs they understand. Anything they
+# cannot forward must be SAID: a dropped kwarg produces no error and no
+# behavioural trace, so the symptom is an unexplained difference — a
+# reasoning config that does nothing, a header that never arrives, a stall —
+# which is expensive to attribute (the NOL-127 → NOL-135 chain). Deduped once
+# per (route, kwarg) for the same reason as _warn_timeout_unenforced: the
+# condition is a property of the callsite shape, not the individual call.
+_UNFORWARDED_KWARG_WARNED: Set[str] = set()
+
+
+def _warn_kwarg_unforwarded(route: str, key: str, reason: str) -> None:
+    """Log ONCE per (route, kwarg) that a chat.completions kwarg was dropped."""
+    dedup = f"{route}:{key}"
+    if dedup in _UNFORWARDED_KWARG_WARNED:
+        return
+    _UNFORWARDED_KWARG_WARNED.add(dedup)
+    logger.warning(
+        "%s: chat.completions kwarg %r is not forwarded by this adapter (%s). "
+        "The value was IGNORED on this and every later call on this route — "
+        "if behaviour depends on it, it is not reaching the provider. Logged "
+        "once per process per kwarg.",
+        route, key, reason,
+    )
+
+
+def _warn_unknown_kwargs(route: str, kwargs: Dict[str, Any], known) -> None:
+    """Report every non-private kwarg outside the adapter's translation table.
+
+    ``_``-prefixed keys are exempt: they are private Hermes plumbing
+    (``_reasoning_config`` et al.), never wire fields, and each consuming
+    adapter already knows its own.
+    """
+    for key in kwargs:
+        if key in known or str(key).startswith("_"):
+            continue
+        _warn_kwarg_unforwarded(
+            route, key, "not part of this adapter's translation table",
+        )
+
+
+# Kwargs the Anthropic/Bedrock shim adapters consume, forward, or explicitly
+# report (Bedrock's ``tool_choice``/``extra_headers`` drops go through
+# _warn_kwarg_unforwarded with a specific reason instead of the generic
+# sweep). ``stream``/``stream_options`` are handled by contract: both
+# adapters return a complete response object and the streaming caller
+# detects that and downgrades to non-live output (see the per-adapter
+# comments). Anything outside this set triggers _warn_unknown_kwargs — which
+# is exactly what catches a provider profile injecting a top-level key the
+# adapter ignores (e.g. Kimi's ``reasoning_effort`` on the Anthropic route).
+_SHIM_ADAPTER_HANDLED_KWARGS = frozenset({
+    "messages", "model", "tools", "tool_choice", "max_tokens",
+    "max_completion_tokens", "temperature", "top_p", "stop", "extra_body",
+    "extra_headers", "timeout", "stream", "stream_options",
+})
+
+
 class _AnthropicCompletionsAdapter:
     """OpenAI-client-compatible adapter for Anthropic Messages API."""
 
@@ -1424,6 +1482,13 @@ class _AnthropicCompletionsAdapter:
     def create(self, **kwargs) -> Any:
         from agent.anthropic_adapter import build_anthropic_kwargs, create_anthropic_message
         from agent.transports import get_transport
+
+        # Say — once per kwarg — when a caller passes something this adapter
+        # has no translation for, instead of discarding it in silence
+        # (NOL-139).
+        _warn_unknown_kwargs(
+            "AnthropicAuxiliaryClient", kwargs, _SHIM_ADAPTER_HANDLED_KWARGS,
+        )
 
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
@@ -1480,6 +1545,31 @@ class _AnthropicCompletionsAdapter:
             if not _forbids_sampling_params(model):
                 anthropic_kwargs["temperature"] = temperature
 
+        # ``stop`` and ``top_p`` are natively supported by the Messages API
+        # (as stop_sequences / top_p) — forward them instead of dropping
+        # (NOL-139). top_p follows the same model guard as temperature, plus
+        # one extra: with extended thinking active, Anthropic only accepts
+        # top_p in [0.95, 1], so an arbitrary caller value would 400 the
+        # call — report that drop rather than silence it.
+        stop = kwargs.get("stop")
+        if stop:
+            anthropic_kwargs["stop_sequences"] = (
+                [stop] if isinstance(stop, str) else list(stop)
+            )
+        top_p = kwargs.get("top_p")
+        if top_p is not None:
+            from agent.anthropic_adapter import _forbids_sampling_params
+            if _forbids_sampling_params(model):
+                pass  # same silent strip as temperature — the model 400s on it
+            elif "thinking" in anthropic_kwargs:
+                _warn_kwarg_unforwarded(
+                    "AnthropicAuxiliaryClient", "top_p",
+                    "incompatible with extended thinking — Anthropic rejects "
+                    "top_p outside [0.95, 1] when thinking is enabled",
+                )
+            else:
+                anthropic_kwargs["top_p"] = top_p
+
         # Pass through caller-supplied extra_body so providers behind
         # Anthropic-compatible gateways receive their per-vendor request
         # fields (thinking control, metadata, portal tags, ...). The dict
@@ -1504,6 +1594,31 @@ class _AnthropicCompletionsAdapter:
                 if not isinstance(existing, dict):
                     existing = {}
                 anthropic_kwargs["extra_body"] = {**existing, **passthrough}
+
+        # Forward caller-supplied per-request headers (NOL-139). The Anthropic
+        # SDK accepts ``extra_headers`` on both messages.create() and
+        # messages.stream(); callers set it via call_llm(extra_headers=...)
+        # for providers that gate capabilities on request attribution (e.g.
+        # Copilot's ``x-initiator``). Caller headers win per key over whatever
+        # build_anthropic_kwargs produced, EXCEPT ``anthropic-beta``, where a
+        # blanket override would silently disable the adapter's feature betas
+        # (fast mode, OAuth) — combine the two beta lists instead.
+        caller_extra_headers = kwargs.get("extra_headers")
+        if caller_extra_headers and isinstance(caller_extra_headers, dict):
+            built_headers = anthropic_kwargs.get("extra_headers") or {}
+            if not isinstance(built_headers, dict):
+                built_headers = {}
+            merged_headers = {**built_headers, **caller_extra_headers}
+            built_beta = built_headers.get("anthropic-beta")
+            caller_beta = caller_extra_headers.get("anthropic-beta")
+            if built_beta and caller_beta and built_beta != caller_beta:
+                combined: list = []
+                for beta in f"{built_beta},{caller_beta}".split(","):
+                    beta = beta.strip()
+                    if beta and beta not in combined:
+                        combined.append(beta)
+                merged_headers["anthropic-beta"] = ",".join(combined)
+            anthropic_kwargs["extra_headers"] = merged_headers
 
         # Preserve the chat.completions timeout contract (NOL-135). Every
         # auxiliary task computes a per-attempt budget and passes it here; the
@@ -1624,6 +1739,13 @@ class _BedrockCompletionsAdapter:
     def create(self, **kwargs) -> Any:
         from agent.bedrock_adapter import call_converse
 
+        # Say — once per kwarg — when a caller passes something this adapter
+        # has no translation for, instead of discarding it in silence
+        # (NOL-139).
+        _warn_unknown_kwargs(
+            "BedrockAuxiliaryClient", kwargs, _SHIM_ADAPTER_HANDLED_KWARGS,
+        )
+
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
         max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
@@ -1632,12 +1754,25 @@ class _BedrockCompletionsAdapter:
         if isinstance(stop, str):
             stop = [stop]
         if kwargs.get("tool_choice") is not None:
-            # Converse's toolChoice isn't wired through call_converse();
-            # no in-tree auxiliary caller passes tool_choice today. Surface
-            # the drop instead of silently ignoring it.
-            logger.debug(
-                "BedrockAuxiliaryClient: tool_choice=%r not supported by the "
-                "Converse shim — ignored.", kwargs.get("tool_choice"),
+            # Converse's toolChoice isn't wired through call_converse(); no
+            # in-tree auxiliary caller passes tool_choice today. A DEBUG line
+            # is invisible in production, so in practice that was still a
+            # silent drop — report it at WARNING, deduped (NOL-139).
+            _warn_kwarg_unforwarded(
+                "BedrockAuxiliaryClient", "tool_choice",
+                "Converse toolChoice is not wired through this shim — tool "
+                "selection stays model-chosen",
+            )
+        if kwargs.get("extra_headers"):
+            # botocore signs requests (SigV4) and pins headers at client
+            # construction; injecting per-call headers would need a botocore
+            # event hook registered on a shared, cached client — racy across
+            # concurrent auxiliary calls with different headers. Report the
+            # drop loudly instead (NOL-139).
+            _warn_kwarg_unforwarded(
+                "BedrockAuxiliaryClient", "extra_headers",
+                "botocore has no per-request header passthrough on the shared "
+                "runtime client",
             )
         if kwargs.get("stream"):
             # Converse streaming isn't wired through this shim. Return a
@@ -1649,6 +1784,26 @@ class _BedrockCompletionsAdapter:
                 "stream); caller downgrades to non-streaming.",
                 model,
             )
+        # Reasoning + model-native body fields (NOL-139). Reasoning priority
+        # mirrors the Anthropic adapter: an explicit per-call config
+        # (``_reasoning_config``, set by _build_call_kwargs) wins over an
+        # ``extra_body.reasoning`` dict (auxiliary.<task>.extra_body config /
+        # the generic profile fallback — the shape provider="bedrock" actually
+        # produces). Remaining extra_body keys ride Converse's native
+        # ``additionalModelRequestFields`` passthrough; ``_``-prefixed keys
+        # are private Hermes plumbing, never wire fields.
+        reasoning_cfg = kwargs.get("_reasoning_config")
+        additional_fields: Dict[str, Any] = {}
+        caller_extra_body = kwargs.get("extra_body")
+        if isinstance(caller_extra_body, dict):
+            if reasoning_cfg is None:
+                _rc = caller_extra_body.get("reasoning")
+                if isinstance(_rc, dict):
+                    reasoning_cfg = _rc
+            additional_fields = {
+                k: v for k, v in caller_extra_body.items()
+                if k != "reasoning" and not str(k).startswith("_")
+            }
         # Preserve the chat.completions timeout contract (NOL-135). botocore
         # has no per-request timeout, so call_converse() resolves a client
         # configured for this budget rather than the 60s botocore default
@@ -1663,6 +1818,8 @@ class _BedrockCompletionsAdapter:
             top_p=kwargs.get("top_p"),
             stop_sequences=stop,
             timeout=_bedrock_timeout_seconds(kwargs.get("timeout")),
+            reasoning_config=reasoning_cfg,
+            additional_model_request_fields=additional_fields or None,
         )
 
 
