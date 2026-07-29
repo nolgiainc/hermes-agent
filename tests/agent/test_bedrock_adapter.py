@@ -10,6 +10,7 @@ Covers:
 """
 
 import json
+import logging
 from contextlib import contextmanager
 from types import ModuleType
 from unittest.mock import MagicMock, patch
@@ -2153,3 +2154,195 @@ class TestBearerTokenRoutesToConverse:
         runtime = self._resolve(monkeypatch, bearer=False)
         assert runtime["api_mode"] == "anthropic_messages"
         assert runtime.get("bedrock_anthropic") is True
+
+
+# ---------------------------------------------------------------------------
+# Reasoning config → additionalModelRequestFields (NOL-139)
+# ---------------------------------------------------------------------------
+
+class TestBuildConverseKwargsReasoning:
+    """A reasoning config must be honoured or reported — never a silent no-op.
+
+    Before NOL-139, ``build_converse_kwargs`` had no way to receive a
+    reasoning config at all: ``_build_call_kwargs(provider="bedrock",
+    reasoning_config=...)`` produced ``extra_body={"reasoning": {...}}`` and
+    the Bedrock shim adapter never read ``extra_body``, so the setting had no
+    effect and nothing logged the drop.
+    """
+
+    @staticmethod
+    def _clear_warned():
+        from agent import bedrock_adapter as ba
+        ba._REASONING_UNSUPPORTED_WARNED.clear()
+
+    def test_adaptive_claude_gets_thinking_and_output_config(self):
+        from agent.bedrock_adapter import build_converse_kwargs
+
+        kwargs = build_converse_kwargs(
+            model="us.anthropic.claude-opus-4-7-20260101-v1:0",
+            messages=[{"role": "user", "content": "Hi"}],
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+
+        fields = kwargs["additionalModelRequestFields"]
+        assert fields["thinking"] == {
+            "type": "adaptive", "display": "summarized",
+        }
+        assert fields["output_config"] == {"effort": "high"}
+
+    def test_xhigh_downgrades_to_max_on_claude_4_6(self):
+        from agent.bedrock_adapter import build_converse_kwargs
+
+        kwargs = build_converse_kwargs(
+            model="anthropic.claude-opus-4-6-20251101-v1:0",
+            messages=[{"role": "user", "content": "Hi"}],
+            reasoning_config={"enabled": True, "effort": "xhigh"},
+        )
+
+        fields = kwargs["additionalModelRequestFields"]
+        assert fields["output_config"] == {"effort": "max"}
+
+    def test_legacy_claude_gets_manual_budget_and_max_tokens_bump(self):
+        from agent.bedrock_adapter import build_converse_kwargs
+
+        kwargs = build_converse_kwargs(
+            model="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            messages=[{"role": "user", "content": "Hi"}],
+            max_tokens=1024,
+            temperature=0.3,
+            top_p=0.9,
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+
+        fields = kwargs["additionalModelRequestFields"]
+        assert fields["thinking"] == {"type": "enabled", "budget_tokens": 16000}
+        # Anthropic requires max_tokens > budget_tokens for manual thinking
+        # and rejects non-default sampling params alongside it.
+        assert kwargs["inferenceConfig"]["maxTokens"] == 16000 + 4096
+        assert "temperature" not in kwargs["inferenceConfig"]
+        assert "topP" not in kwargs["inferenceConfig"]
+
+    def test_reasoning_disabled_sends_no_thinking_fields(self):
+        from agent.bedrock_adapter import build_converse_kwargs
+
+        kwargs = build_converse_kwargs(
+            model="us.anthropic.claude-opus-4-7-20260101-v1:0",
+            messages=[{"role": "user", "content": "Hi"}],
+            reasoning_config={"enabled": False},
+        )
+
+        assert "additionalModelRequestFields" not in kwargs
+
+    def test_non_claude_model_warns_loudly_and_once(self, caplog):
+        from agent import bedrock_adapter as ba
+
+        self._clear_warned()
+        try:
+            with caplog.at_level(logging.WARNING, logger=ba.logger.name):
+                for _ in range(2):
+                    kwargs = ba.build_converse_kwargs(
+                        model="amazon.nova-lite-v1:0",
+                        messages=[{"role": "user", "content": "Hi"}],
+                        reasoning_config={"enabled": True, "effort": "high"},
+                    )
+        finally:
+            self._clear_warned()
+
+        assert "additionalModelRequestFields" not in kwargs
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "reasoning config cannot be honoured" in r.getMessage()
+        ]
+        assert len(warnings) == 1, (
+            f"expected exactly one deduped warning, got {len(warnings)}"
+        )
+        assert "amazon.nova-lite-v1:0" in warnings[0].getMessage()
+
+    def test_haiku_warns_instead_of_silent_noop(self, caplog):
+        from agent import bedrock_adapter as ba
+
+        self._clear_warned()
+        try:
+            with caplog.at_level(logging.WARNING, logger=ba.logger.name):
+                kwargs = ba.build_converse_kwargs(
+                    model="anthropic.claude-3-haiku-20240307-v1:0",
+                    messages=[{"role": "user", "content": "Hi"}],
+                    reasoning_config={"enabled": True},
+                )
+        finally:
+            self._clear_warned()
+
+        assert "additionalModelRequestFields" not in kwargs
+        assert any(
+            "reasoning config cannot be honoured" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_raw_additional_fields_pass_through(self):
+        from agent.bedrock_adapter import build_converse_kwargs
+
+        kwargs = build_converse_kwargs(
+            model="us.anthropic.claude-opus-4-7-20260101-v1:0",
+            messages=[{"role": "user", "content": "Hi"}],
+            additional_model_request_fields={"vendor_field": {"a": 1}},
+        )
+
+        fields = kwargs["additionalModelRequestFields"]
+        assert fields["vendor_field"] == {"a": 1}
+
+    def test_translated_reasoning_wins_over_raw_duplicate(self):
+        from agent.bedrock_adapter import build_converse_kwargs
+
+        kwargs = build_converse_kwargs(
+            model="us.anthropic.claude-opus-4-7-20260101-v1:0",
+            messages=[{"role": "user", "content": "Hi"}],
+            reasoning_config={"enabled": True, "effort": "low"},
+            additional_model_request_fields={
+                "thinking": {"type": "enabled", "budget_tokens": 1},
+                "vendor_field": True,
+            },
+        )
+
+        fields = kwargs["additionalModelRequestFields"]
+        assert fields["thinking"] == {
+            "type": "adaptive", "display": "summarized",
+        }
+        assert fields["vendor_field"] is True
+
+    def test_call_converse_forwards_reasoning_to_the_wire(self):
+        """Full-path regression: the field must reach client.converse().
+
+        Fails if ANY layer (call_converse → build_converse_kwargs) drops the
+        reasoning config or the raw passthrough fields.
+        """
+        from agent import bedrock_adapter as ba
+
+        captured = {}
+
+        class _FakeClient:
+            def converse(self, **kwargs):
+                captured.update(kwargs)
+                return {
+                    "output": {"message": {"role": "assistant", "content": [
+                        {"text": "ok"},
+                    ]}},
+                    "stopReason": "end_turn",
+                    "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+                }
+
+        with patch.object(
+            ba, "_get_bedrock_runtime_client", return_value=_FakeClient(),
+        ):
+            ba.call_converse(
+                region="us-east-1",
+                model="us.anthropic.claude-opus-4-7-20260101-v1:0",
+                messages=[{"role": "user", "content": "Hi"}],
+                reasoning_config={"enabled": True, "effort": "medium"},
+                additional_model_request_fields={"vendor_field": 7},
+            )
+
+        fields = captured["additionalModelRequestFields"]
+        assert fields["thinking"]["type"] == "adaptive"
+        assert fields["output_config"] == {"effort": "medium"}
+        assert fields["vendor_field"] == 7

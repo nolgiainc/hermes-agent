@@ -1058,6 +1058,88 @@ def stream_converse_with_callbacks(
 # High-level API: call Bedrock Converse
 # ---------------------------------------------------------------------------
 
+# ── Reasoning config → additionalModelRequestFields ────────────────────────
+# Deduped once per (model, reason): the condition is a property of the
+# configured model, not of the individual call, so one line is signal and one
+# per call is noise. Mirrors _warn_timeout_unenforced in auxiliary_client.
+_REASONING_UNSUPPORTED_WARNED: set = set()
+
+
+def _warn_reasoning_unsupported(model: str, reason: str) -> None:
+    """Log ONCE per (model, reason) that a reasoning config was not honoured."""
+    key = f"{model}:{reason}"
+    if key in _REASONING_UNSUPPORTED_WARNED:
+        return
+    _REASONING_UNSUPPORTED_WARNED.add(key)
+    logger.warning(
+        "bedrock: reasoning config cannot be honoured for model %s (%s). The "
+        "call proceeds WITHOUT extended thinking — if you configured reasoning "
+        "for this model, it is not taking effect. Logged once per process per "
+        "model.",
+        model, reason,
+    )
+
+
+def build_reasoning_request_fields(
+    model: str,
+    reasoning_config: Optional[Dict],
+) -> Optional[Dict[str, Any]]:
+    """Translate a Hermes reasoning config into Converse request fields.
+
+    Bedrock's Converse API has no first-class reasoning parameter; model-native
+    fields ride in ``additionalModelRequestFields``, which is merged verbatim
+    into the model invocation body. For Claude models that body speaks the same
+    ``thinking`` contract as the native Anthropic Messages API, so the model
+    classification and effort mapping are reused from agent/anthropic_adapter.py
+    (adaptive thinking + output_config.effort on 4.6+, manual budget_tokens on
+    the legacy families).
+
+    Returns ``None`` when there is nothing to send. A config that CANNOT be
+    honoured (non-Claude model, Haiku) is reported loudly via
+    :func:`_warn_reasoning_unsupported` rather than dropped in silence —
+    "we believe we are sending a reasoning configuration and we are not" is
+    exactly the failure class NOL-139 exists to kill.
+    """
+    if not reasoning_config or not isinstance(reasoning_config, dict):
+        return None
+    if reasoning_config.get("enabled") is False:
+        return None
+
+    from agent.anthropic_adapter import (
+        ADAPTIVE_EFFORT_MAP,
+        THINKING_BUDGET,
+        _supports_adaptive_thinking,
+        _supports_xhigh_effort,
+    )
+
+    if not is_anthropic_bedrock_model(model):
+        _warn_reasoning_unsupported(
+            model,
+            "not an Anthropic Claude model — no known Converse thinking fields",
+        )
+        return None
+    if "haiku" in (model or "").lower():
+        # Mirrors build_anthropic_kwargs: Haiku does not support extended
+        # thinking. Unlike that path, say so — an auxiliary caller that set a
+        # reasoning config should learn it has no effect here.
+        _warn_reasoning_unsupported(
+            model, "Haiku models do not support extended thinking",
+        )
+        return None
+
+    effort = str(reasoning_config.get("effort") or "medium").lower()
+    if _supports_adaptive_thinking(model):
+        adaptive_effort = ADAPTIVE_EFFORT_MAP.get(effort, "medium")
+        if adaptive_effort == "xhigh" and not _supports_xhigh_effort(model):
+            adaptive_effort = "max"
+        return {
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": adaptive_effort},
+        }
+    budget = THINKING_BUDGET.get(effort, 8000)
+    return {"thinking": {"type": "enabled", "budget_tokens": budget}}
+
+
 def build_converse_kwargs(
     model: str,
     messages: List[Dict],
@@ -1067,10 +1149,19 @@ def build_converse_kwargs(
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
     guardrail_config: Optional[Dict] = None,
+    reasoning_config: Optional[Dict] = None,
+    additional_model_request_fields: Optional[Dict] = None,
 ) -> Dict[str, Any]:
     """Build kwargs for ``bedrock-runtime.converse()`` or ``converse_stream()``.
 
     Converts OpenAI-format inputs to Converse API parameters.
+
+    ``reasoning_config`` is the Hermes reasoning dict ({"enabled": ...,
+    "effort": ...}); it is translated into native thinking fields via
+    :func:`build_reasoning_request_fields`. ``additional_model_request_fields``
+    is a raw passthrough for caller-supplied model-native body fields
+    (chat.completions ``extra_body``); the translated reasoning fields win
+    over a raw duplicate.
     """
     system_prompt, converse_messages = convert_messages_to_converse(messages)
     cache_enabled = _model_supports_prompt_cache(model)
@@ -1126,6 +1217,36 @@ def build_converse_kwargs(
         if isinstance(content, list) and content:
             content.append({"cachePoint": {"type": "default"}})
 
+    # Model-native body fields (NOL-139). ``additionalModelRequestFields`` is
+    # Converse's raw passthrough into the model invocation body — the Converse
+    # counterpart of chat.completions ``extra_body``. Assemble caller fields
+    # first, then let the translated reasoning fields win over any raw
+    # duplicate so an explicit reasoning_config is authoritative.
+    additional_fields: Dict[str, Any] = {}
+    if additional_model_request_fields and isinstance(
+        additional_model_request_fields, dict
+    ):
+        additional_fields.update(additional_model_request_fields)
+
+    reasoning_fields = build_reasoning_request_fields(model, reasoning_config)
+    if reasoning_fields:
+        additional_fields.update(reasoning_fields)
+        thinking = reasoning_fields.get("thinking") or {}
+        if thinking.get("type") == "enabled":
+            # Manual (budget_tokens) thinking: Anthropic requires
+            # max_tokens > budget_tokens — mirror build_anthropic_kwargs'
+            # bump — and rejects non-default sampling params alongside
+            # thinking, so drop them rather than 400 the call.
+            budget = int(thinking.get("budget_tokens") or 0)
+            kwargs["inferenceConfig"]["maxTokens"] = max(
+                max_tokens, budget + 4096,
+            )
+            kwargs["inferenceConfig"].pop("temperature", None)
+            kwargs["inferenceConfig"].pop("topP", None)
+
+    if additional_fields:
+        kwargs["additionalModelRequestFields"] = additional_fields
+
     if guardrail_config:
         kwargs["guardrailConfig"] = guardrail_config
 
@@ -1143,6 +1264,8 @@ def call_converse(
     stop_sequences: Optional[List[str]] = None,
     guardrail_config: Optional[Dict] = None,
     timeout: Optional[float] = None,
+    reasoning_config: Optional[Dict] = None,
+    additional_model_request_fields: Optional[Dict] = None,
 ) -> SimpleNamespace:
     """Call Bedrock Converse API (non-streaming) and return an OpenAI-compatible response.
 
@@ -1152,6 +1275,9 @@ def call_converse(
     keeps botocore's defaults (60s read timeout plus its own retries); passing
     a budget routes through a client configured to honour it — see
     :func:`_get_bedrock_runtime_client`.
+
+    ``reasoning_config`` / ``additional_model_request_fields`` are forwarded
+    to :func:`build_converse_kwargs` (NOL-139).
     """
     client = _get_bedrock_runtime_client(region, timeout=timeout)
     kwargs = build_converse_kwargs(
@@ -1163,6 +1289,8 @@ def call_converse(
         top_p=top_p,
         stop_sequences=stop_sequences,
         guardrail_config=guardrail_config,
+        reasoning_config=reasoning_config,
+        additional_model_request_fields=additional_model_request_fields,
     )
 
     try:
@@ -1189,6 +1317,8 @@ def call_converse_stream(
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
     guardrail_config: Optional[Dict] = None,
+    reasoning_config: Optional[Dict] = None,
+    additional_model_request_fields: Optional[Dict] = None,
 ) -> SimpleNamespace:
     """Call Bedrock ConverseStream API and return an OpenAI-compatible response.
 
@@ -1205,6 +1335,8 @@ def call_converse_stream(
         top_p=top_p,
         stop_sequences=stop_sequences,
         guardrail_config=guardrail_config,
+        reasoning_config=reasoning_config,
+        additional_model_request_fields=additional_model_request_fields,
     )
 
     try:

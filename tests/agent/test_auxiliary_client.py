@@ -7064,3 +7064,468 @@ class TestBedrockAuxiliaryAdapterTimeout:
             f"budget of 2.0s was not enforced — call took {elapsed:.2f}s "
             f"(pre-seeded default client is 8.0s, botocore's own default 60s)"
         )
+
+
+class TestAnthropicAuxiliaryAdapterExtraHeaders:
+    """The Anthropic adapter must forward caller-supplied per-request headers.
+
+    ``call_llm(extra_headers=...)`` sets them for providers that gate
+    capabilities on request attribution (e.g. Copilot's ``x-initiator``); the
+    Anthropic SDK accepts ``extra_headers`` on both messages.create() and
+    messages.stream(). Before NOL-139 the adapter read neither, so the headers
+    silently never reached the wire.
+    """
+
+    @staticmethod
+    def _adapter(model="claude-fable-5"):
+        from agent.auxiliary_client import _AnthropicCompletionsAdapter
+
+        captured: dict = {}
+
+        class _Messages:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    content=[SimpleNamespace(type="text", text="ok")],
+                    stop_reason="end_turn",
+                    usage=SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
+                )
+
+        real_client = SimpleNamespace(messages=_Messages())
+        return _AnthropicCompletionsAdapter(real_client, model), captured
+
+    @staticmethod
+    def _streaming_adapter(model="claude-fable-5"):
+        from agent.auxiliary_client import _AnthropicCompletionsAdapter
+
+        captured: dict = {}
+        final = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="ok")],
+            stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
+        )
+
+        class _Messages:
+            def stream(self, **kwargs):
+                captured.update(kwargs)
+                return _FakeAnthropicStream(final)
+
+        real_client = SimpleNamespace(messages=_Messages())
+        return _AnthropicCompletionsAdapter(real_client, model), captured
+
+    def test_forwards_extra_headers_to_messages_create(self):
+        adapter, captured = self._adapter()
+
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=16,
+            extra_headers={"x-initiator": "agent", "x-request-tag": "aux"},
+        )
+
+        assert captured["extra_headers"] == {
+            "x-initiator": "agent", "x-request-tag": "aux",
+        }
+
+    def test_forwards_extra_headers_on_the_streaming_path(self):
+        adapter, captured = self._streaming_adapter()
+
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=16,
+            extra_headers={"x-initiator": "user"},
+        )
+
+        assert captured["extra_headers"] == {"x-initiator": "user"}
+
+    def test_no_extra_headers_key_when_caller_sends_none(self):
+        adapter, captured = self._adapter()
+
+        adapter.create(messages=[{"role": "user", "content": "hi"}], max_tokens=16)
+
+        assert "extra_headers" not in captured
+
+    def test_caller_beta_header_merges_with_adapter_built_betas(self):
+        """A caller ``anthropic-beta`` must not REPLACE the adapter's feature
+        betas (fast mode, OAuth) — the two comma-lists are combined."""
+        adapter, captured = self._adapter()
+
+        def _fake_build_anthropic_kwargs(**kwargs):
+            return {
+                "model": kwargs.get("model"),
+                "messages": kwargs.get("messages") or [],
+                "max_tokens": kwargs.get("max_tokens") or 16,
+                "extra_headers": {"anthropic-beta": "beta-a,beta-b"},
+            }
+
+        with patch(
+            "agent.anthropic_adapter.build_anthropic_kwargs",
+            _fake_build_anthropic_kwargs,
+        ):
+            adapter.create(
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=16,
+                extra_headers={"anthropic-beta": "beta-b,beta-c", "x-tag": "1"},
+            )
+
+        assert captured["extra_headers"]["anthropic-beta"] == "beta-a,beta-b,beta-c"
+        assert captured["extra_headers"]["x-tag"] == "1"
+
+
+class TestAnthropicAuxiliaryAdapterStopTopP:
+    """``stop`` and ``top_p`` are natively supported by the Messages API —
+    forward them (as stop_sequences / top_p) instead of dropping (NOL-139)."""
+
+    _adapter = staticmethod(TestAnthropicAuxiliaryAdapterExtraHeaders._adapter)
+
+    def test_string_stop_becomes_stop_sequences_list(self):
+        adapter, captured = self._adapter()
+
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=16,
+            stop="END",
+        )
+
+        assert captured["stop_sequences"] == ["END"]
+
+    def test_list_stop_forwarded_as_is(self):
+        adapter, captured = self._adapter()
+
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=16,
+            stop=["END", "STOP"],
+        )
+
+        assert captured["stop_sequences"] == ["END", "STOP"]
+
+    def test_top_p_forwarded_on_models_that_accept_sampling_params(self):
+        adapter, captured = self._adapter(model="claude-sonnet-4-5-20250929")
+
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=16,
+            top_p=0.9,
+        )
+
+        assert captured["top_p"] == 0.9
+
+    def test_top_p_stripped_on_models_that_forbid_sampling_params(self):
+        """Same protective strip as temperature — claude-fable-5 400s on any
+        non-default sampling param."""
+        adapter, captured = self._adapter(model="claude-fable-5")
+
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=16,
+            top_p=0.9,
+        )
+
+        assert "top_p" not in captured
+
+    def test_top_p_dropped_with_warning_when_thinking_enabled(self, caplog):
+        """Extended thinking only accepts top_p in [0.95, 1]; an arbitrary
+        caller value would 400 — the drop is reported, not silent."""
+        from agent import auxiliary_client as ac
+
+        adapter, captured = self._adapter(model="claude-sonnet-4-5-20250929")
+
+        ac._UNFORWARDED_KWARG_WARNED.clear()
+        try:
+            with caplog.at_level(logging.WARNING, logger=ac.logger.name):
+                adapter.create(
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_tokens=16,
+                    top_p=0.5,
+                    _reasoning_config={"enabled": True, "effort": "low"},
+                )
+        finally:
+            ac._UNFORWARDED_KWARG_WARNED.clear()
+
+        assert "thinking" in captured
+        assert "top_p" not in captured
+        assert any(
+            "'top_p'" in r.getMessage() and "not forwarded" in r.getMessage()
+            for r in caplog.records if r.levelno == logging.WARNING
+        )
+
+
+class TestBedrockAuxiliaryAdapterExtraBody:
+    """``extra_body`` must reach Bedrock as ``additionalModelRequestFields``.
+
+    The ticket's exact repro: ``_build_call_kwargs(provider="bedrock",
+    reasoning_config={...})`` returns ``extra_body={"reasoning": {...}}`` and
+    the adapter never read ``extra_body`` — so auxiliary reasoning config on
+    Bedrock was a silent no-op.
+    """
+
+    @staticmethod
+    def _run_adapter(model="us.anthropic.claude-opus-4-7-20260101-v1:0", **create_kwargs):
+        from agent.auxiliary_client import _BedrockCompletionsAdapter
+
+        captured: dict = {}
+
+        def _fake_call_converse(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(choices=[], model="m", usage=None)
+
+        adapter = _BedrockCompletionsAdapter("us-east-1", model)
+        with patch("agent.bedrock_adapter.call_converse", _fake_call_converse):
+            adapter.create(**create_kwargs)
+        return captured
+
+    def test_extra_body_reasoning_reaches_call_converse(self):
+        captured = self._run_adapter(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"enabled": True, "effort": "high"}},
+        )
+
+        assert captured["reasoning_config"] == {"enabled": True, "effort": "high"}
+
+    def test_explicit_reasoning_config_wins_over_extra_body(self):
+        captured = self._run_adapter(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"enabled": True, "effort": "low"}},
+            _reasoning_config={"enabled": True, "effort": "high"},
+        )
+
+        assert captured["reasoning_config"] == {"enabled": True, "effort": "high"}
+
+    def test_extra_body_passthrough_keys_ride_additional_fields(self):
+        captured = self._run_adapter(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={
+                "reasoning": {"enabled": True},
+                "vendor_field": {"a": 1},
+                "_private": "never-wire",
+            },
+        )
+
+        assert captured["additional_model_request_fields"] == {
+            "vendor_field": {"a": 1},
+        }
+
+    def test_no_extra_body_sends_no_additional_fields(self):
+        captured = self._run_adapter(messages=[{"role": "user", "content": "hi"}])
+
+        assert captured["reasoning_config"] is None
+        assert captured["additional_model_request_fields"] is None
+
+    def test_build_call_kwargs_reasoning_reaches_the_converse_wire(self):
+        """End to end across the exact layers the ticket names: kwargs built
+        by _build_call_kwargs(provider="bedrock", reasoning_config=...) are
+        fed to the adapter and the thinking fields must arrive in
+        client.converse(**kwargs). Fails if ANY layer silently drops them.
+        """
+        from agent import bedrock_adapter as ba
+        from agent.auxiliary_client import _BedrockCompletionsAdapter
+
+        model = "us.anthropic.claude-opus-4-7-20260101-v1:0"
+        call_kwargs = _build_call_kwargs(
+            provider="bedrock",
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        assert call_kwargs.get("extra_body", {}).get("reasoning") or \
+            call_kwargs.get("_reasoning_config"), (
+            "precondition: _build_call_kwargs no longer carries the reasoning "
+            "config — update this test to follow where it moved"
+        )
+
+        captured: dict = {}
+
+        class _FakeClient:
+            def converse(self, **kwargs):
+                captured.update(kwargs)
+                return {
+                    "output": {"message": {"role": "assistant", "content": [
+                        {"text": "ok"},
+                    ]}},
+                    "stopReason": "end_turn",
+                    "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+                }
+
+        adapter = _BedrockCompletionsAdapter("us-east-1", model)
+        with patch.object(
+            ba, "_get_bedrock_runtime_client", return_value=_FakeClient(),
+        ):
+            adapter.create(**call_kwargs)
+
+        fields = captured.get("additionalModelRequestFields") or {}
+        assert fields.get("thinking", {}).get("type") == "adaptive", (
+            "reasoning config was silently dropped between _build_call_kwargs "
+            f"and client.converse() — additionalModelRequestFields={fields!r}"
+        )
+        assert fields.get("output_config") == {"effort": "high"}
+
+
+class TestShimAdapterUnforwardedKwargWarnings:
+    """Any kwarg an adapter receives but cannot forward must produce a deduped
+    WARNING — never silence (NOL-139). A dropped kwarg has no error and no
+    behavioural trace, so a log line is the only way the drop is attributable.
+    """
+
+    _anthropic_adapter = staticmethod(
+        TestAnthropicAuxiliaryAdapterExtraHeaders._adapter
+    )
+
+    @staticmethod
+    def _run_bedrock_adapter(**create_kwargs):
+        from agent.auxiliary_client import _BedrockCompletionsAdapter
+
+        captured: dict = {}
+
+        def _fake_call_converse(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(choices=[], model="m", usage=None)
+
+        adapter = _BedrockCompletionsAdapter("us-east-1", "amazon.nova-lite-v1:0")
+        with patch("agent.bedrock_adapter.call_converse", _fake_call_converse):
+            adapter.create(**create_kwargs)
+        return captured
+
+    @staticmethod
+    def _unforwarded_warnings(caplog):
+        return [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "not forwarded by this adapter" in r.getMessage()
+        ]
+
+    def test_unknown_kwarg_on_anthropic_route_warns_once(self, caplog):
+        """The ticket's live case: the Kimi provider profile injects a
+        top-level ``reasoning_effort`` that the Anthropic adapter ignores —
+        benign only by accident, and previously invisible."""
+        from agent import auxiliary_client as ac
+
+        adapter, _ = self._anthropic_adapter()
+
+        ac._UNFORWARDED_KWARG_WARNED.clear()
+        try:
+            with caplog.at_level(logging.WARNING, logger=ac.logger.name):
+                for _ in range(2):
+                    adapter.create(
+                        messages=[{"role": "user", "content": "hi"}],
+                        max_tokens=16,
+                        reasoning_effort="high",
+                    )
+        finally:
+            ac._UNFORWARDED_KWARG_WARNED.clear()
+
+        warnings = self._unforwarded_warnings(caplog)
+        assert len(warnings) == 1, (
+            f"expected exactly one deduped warning, got {len(warnings)}"
+        )
+        assert "'reasoning_effort'" in warnings[0].getMessage()
+        assert "AnthropicAuxiliaryClient" in warnings[0].getMessage()
+
+    def test_unknown_kwarg_on_bedrock_route_warns_once(self, caplog):
+        from agent import auxiliary_client as ac
+
+        ac._UNFORWARDED_KWARG_WARNED.clear()
+        try:
+            with caplog.at_level(logging.WARNING, logger=ac.logger.name):
+                for _ in range(2):
+                    self._run_bedrock_adapter(
+                        messages=[{"role": "user", "content": "hi"}],
+                        response_format={"type": "json_object"},
+                    )
+        finally:
+            ac._UNFORWARDED_KWARG_WARNED.clear()
+
+        warnings = self._unforwarded_warnings(caplog)
+        assert len(warnings) == 1
+        assert "'response_format'" in warnings[0].getMessage()
+        assert "BedrockAuxiliaryClient" in warnings[0].getMessage()
+
+    def test_bedrock_tool_choice_warns_at_warning_not_debug(self, caplog):
+        """Previously logged only at DEBUG — invisible in production, so in
+        practice still a silent drop."""
+        from agent import auxiliary_client as ac
+
+        ac._UNFORWARDED_KWARG_WARNED.clear()
+        try:
+            with caplog.at_level(logging.WARNING, logger=ac.logger.name):
+                for _ in range(2):
+                    self._run_bedrock_adapter(
+                        messages=[{"role": "user", "content": "hi"}],
+                        tool_choice={"type": "function", "function": {"name": "f"}},
+                    )
+        finally:
+            ac._UNFORWARDED_KWARG_WARNED.clear()
+
+        warnings = self._unforwarded_warnings(caplog)
+        assert len(warnings) == 1
+        assert "'tool_choice'" in warnings[0].getMessage()
+
+    def test_bedrock_extra_headers_warns(self, caplog):
+        from agent import auxiliary_client as ac
+
+        ac._UNFORWARDED_KWARG_WARNED.clear()
+        try:
+            with caplog.at_level(logging.WARNING, logger=ac.logger.name):
+                self._run_bedrock_adapter(
+                    messages=[{"role": "user", "content": "hi"}],
+                    extra_headers={"x-initiator": "agent"},
+                )
+        finally:
+            ac._UNFORWARDED_KWARG_WARNED.clear()
+
+        warnings = self._unforwarded_warnings(caplog)
+        assert len(warnings) == 1
+        assert "'extra_headers'" in warnings[0].getMessage()
+
+    def test_fully_handled_kwargs_do_not_warn(self, caplog):
+        """The sweep must stay quiet for the translation table itself — a
+        warning that fires on every normal call is noise, not signal."""
+        from agent import auxiliary_client as ac
+
+        adapter, _ = self._anthropic_adapter(model="claude-sonnet-4-5-20250929")
+
+        ac._UNFORWARDED_KWARG_WARNED.clear()
+        try:
+            with caplog.at_level(logging.WARNING, logger=ac.logger.name):
+                adapter.create(
+                    messages=[{"role": "user", "content": "hi"}],
+                    model="claude-sonnet-4-5-20250929",
+                    max_tokens=64,
+                    temperature=0.2,
+                    top_p=0.9,
+                    stop="END",
+                    timeout=5.0,
+                    extra_body={"vendor_field": 1},
+                    extra_headers={"x-tag": "1"},
+                )
+                self._run_bedrock_adapter(
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_tokens=64,
+                    temperature=0.2,
+                    top_p=0.9,
+                    stop="END",
+                    timeout=5.0,
+                    extra_body={"reasoning": {"enabled": True}},
+                )
+        finally:
+            ac._UNFORWARDED_KWARG_WARNED.clear()
+
+        assert self._unforwarded_warnings(caplog) == []
+
+    def test_private_underscore_kwargs_are_exempt(self, caplog):
+        from agent import auxiliary_client as ac
+
+        adapter, _ = self._anthropic_adapter()
+
+        ac._UNFORWARDED_KWARG_WARNED.clear()
+        try:
+            with caplog.at_level(logging.WARNING, logger=ac.logger.name):
+                adapter.create(
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_tokens=16,
+                    _reasoning_config={"enabled": False},
+                    _skip_zai_max_tokens=False,
+                )
+        finally:
+            ac._UNFORWARDED_KWARG_WARNED.clear()
+
+        assert self._unforwarded_warnings(caplog) == []
