@@ -258,10 +258,13 @@ RUN cd web && npm run build && \
 # shipping the whole file to a vision model.  It is the partner of the
 # ffmpeg installed in the apt layer above — yt-dlp shells out to ffmpeg to
 # merge and convert the streams it fetches, so the pair only works baked in
-# together.  Installing it into the image (rather than by hand per pod) is
-# the only durable option: /opt/hermes is sealed read-only for the runtime
-# user and HERMES_DISABLE_LAZY_INSTALLS=1, so a hand install has nowhere to
-# land that survives a container recreate or image update.
+# together.  Installing it into the image is what makes it a fleet
+# capability.  A hand install does have somewhere to land — `uv tool
+# install` into the /opt/data PVC works and survives restarts, and the
+# video-learning ability documents it as a stopgap — but it is per-pod,
+# invisible to every other agent, unreproducible, and gone the moment a pod
+# is re-provisioned onto a fresh volume.  Baking it in is what makes the
+# video-research lane something every agent simply has.
 #
 # Installed as an isolated `uv tool` so yt-dlp resolves its dependencies in
 # its own venv and can never move a pin inside hermes' own
