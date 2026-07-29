@@ -169,7 +169,11 @@ def test_skill_config_raw_cache_invalidates_on_config_edit(tmp_path, monkeypatch
 
     config_path.write_text("skills:\n  disabled: [new-skill]\n", encoding="utf-8")
     import os
-    os.utime(config_path, None)
+    # Bump to an explicitly newer mtime.  ``os.utime(path, None)`` stamps *now*,
+    # which on a coarse-timestamp filesystem is the same value the first write
+    # got — the cache would see no change and serve the stale disabled set.
+    future = config_path.stat().st_mtime + 5.0
+    os.utime(config_path, (future, future))
 
     assert get_disabled_skill_names() == {"new-skill"}
 

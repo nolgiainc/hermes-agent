@@ -71,6 +71,13 @@ def test_nested_category_skill_add_invalidates(tmp_path):
     _write_skill(tmp_path, "cat-a", "skill-two")
     import os
     os.utime(root, (root_stat.st_atime, root_stat.st_mtime))
+    # Push the category dir's mtime explicitly ahead of the root's.  Creating
+    # the nested skill bumps ``cat-a`` implicitly, but on a coarse-timestamp
+    # filesystem that bump can land on the same mtime the first scan saw, so
+    # the signature would not move and the cache would not invalidate.
+    category = root / "cat-a"
+    future = max(category.stat().st_mtime, root_stat.st_mtime) + 5.0
+    os.utime(category, (future, future))
 
     names = sorted(s["name"] for s in st._find_all_skills())
     assert names == ["skill-one", "skill-two"], (
