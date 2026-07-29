@@ -245,8 +245,13 @@ def test_mixed_batch_preserves_tool_call_result_pairing(agent_env):
         if isinstance(m, dict) and m.get("role") == "tool"
     ]
     # Both the valid and blank call must appear in the assistant message,
-    # and each must have exactly one matching tool result.
-    assert set(tc_ids) == {"call_0", "call_1"}
+    # and each must have exactly one matching tool result. NOL-106: provider
+    # tool_call ids are namespaced for uniqueness (``call_N`` -> ``call_N__u<uuid>``),
+    # so compare on the provider prefix; the pairing invariant below is what the
+    # namespacing must preserve, and it does (each result carries its call's
+    # namespaced id).
+    assert {tid.split("__u")[0] for tid in tc_ids} == {"call_0", "call_1"}
+    assert len(set(tc_ids)) == 2
     assert sorted(result_ids) == sorted(tc_ids)
 
 
