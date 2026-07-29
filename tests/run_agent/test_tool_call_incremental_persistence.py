@@ -138,7 +138,10 @@ def test_run_conversation_flushes_assistant_tool_call_before_execution():
     last = snapshot_at_execute[0]
     assert last is not None, "no flush occurred before tool execution"
     assert last[-1]["role"] == "assistant"
-    assert last[-1]["tool_calls"][0]["id"] == "c1"
+    # NOL-106: the provider id is namespaced for global uniqueness at ingestion,
+    # so the persisted id carries the provider prefix plus a uniqueness suffix.
+    assert last[-1]["tool_calls"][0]["id"].startswith("c1")
+    assert "__u" in last[-1]["tool_calls"][0]["id"]
     assert result["final_response"] == "done"
 
 

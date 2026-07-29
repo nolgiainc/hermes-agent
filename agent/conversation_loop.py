@@ -5190,6 +5190,20 @@ def run_conversation(
                 else:
                     assistant_message.content = str(raw)
 
+            # NOL-106: namespace provider-minted tool_call ids to be globally
+            # unique BEFORE anything consumes them (tool dispatch, result
+            # pairing, persistence, replay). Moonshot/Kimi mint ids from a
+            # per-conversation counter that resets/overlaps across turns; stored
+            # verbatim they collide at assembly, get deduped to an empty
+            # assistant, and 400 the session permanently. Rewriting the single
+            # normalized object here keeps within-turn call↔result pairing intact.
+            _ns_rewritten = agent._namespace_tool_call_ids(assistant_message)
+            if _ns_rewritten:
+                logger.debug(
+                    "%sNamespaced %d provider tool_call id(s) for uniqueness",
+                    agent.log_prefix, _ns_rewritten,
+                )
+
             try:
                 from hermes_cli.plugins import (
                     has_hook,

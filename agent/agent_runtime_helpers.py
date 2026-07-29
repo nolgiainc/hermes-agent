@@ -28,6 +28,7 @@ import logging
 import re
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -2760,6 +2761,86 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
 
 
 
+# Marker separating a provider-minted tool_call id from the hermes-added
+# uniqueness suffix. Kept inside ``[A-Za-z0-9_]`` (never ``|``) so a namespaced
+# id survives ``_derive_responses_function_call_id`` sanitizing and never
+# collides with the Codex ``call_id|response_item_id`` delimiter. Mirrors the
+# ``__m``/``__u`` shape used by the live-incident data remediation (NOL-106).
+_TOOL_CALL_ID_NAMESPACE_MARKER = "__u"
+_TOOL_CALL_ID_NAMESPACE_RE = re.compile(
+    re.escape(_TOOL_CALL_ID_NAMESPACE_MARKER) + r"[0-9a-f]{8,}$"
+)
+
+
+def namespace_provider_tool_call_ids(assistant_message: Any) -> int:
+    """Make every provider-minted ``tool_call`` id globally unique at ingestion.
+
+    Providers such as Moonshot/Kimi mint ``tool_call`` ids from a
+    per-conversation counter that can RESET or OVERLAP across turns — most
+    reliably when a turn is interrupted mid-tool-call and the continuation turn
+    reissues ids from the same counter range. Hermes stored those ids verbatim
+    and relied on them for uniqueness at request assembly, where the dedupe pass
+    would filter a later turn's colliding calls, leaving an empty assistant
+    message that Moonshot rejects with a NON-RETRYABLE HTTP 400 ("the message at
+    position N with role 'assistant' must not be empty") — permanently wedging
+    the session (NOL-106).
+
+    Fix the root cause at the ingestion boundary: as soon as a fresh provider
+    response is normalized — BEFORE its ids are consumed for tool dispatch,
+    result pairing, persistence, or replay — suffix each provider-supplied id
+    with a random token, so no two tool calls in a session can ever share an id.
+
+    Why here and not at persistence/on-load: during the live turn the SAME
+    normalized ``ToolCall`` object feeds BOTH the persisted assistant
+    ``tool_calls[].id`` and the dispatcher that stamps each ``tool`` result's
+    ``tool_call_id`` (executor reads ``tc.id``). Rewriting the id on that one
+    object — before either consumer runs — keeps within-turn call↔result pairing
+    intact automatically, whereas a persistence-time rewrite would have to
+    re-pair rows written by separate ``append_message`` calls.
+
+    Cache-safe: the suffix is minted ONCE and then flows into stored history, so
+    replay is byte-stable (a message's id never changes) and provider prompt
+    caches stay warm. This is unlike the deterministic-from-content fallback in
+    ``build_assistant_message`` (whose job is to avoid re-deriving on every call
+    when the provider omits an id) — that path is left untouched.
+
+    Codex/Responses tool calls (identified by ``call_id`` / ``response_item_id``
+    in ``provider_data``) are deliberately NOT rewritten: their ids are
+    content-addressed ``fc_``/``call_`` identifiers that round-trip through the
+    Responses ``function_call`` ↔ ``function_call_output`` linkage and were not
+    implicated in the incident. The assembly guard still backstops them.
+
+    Returns the number of ids rewritten (for logging/telemetry).
+    """
+    tool_calls = getattr(assistant_message, "tool_calls", None)
+    if not tool_calls:
+        return 0
+    rewritten = 0
+    for tc in tool_calls:
+        # Leave Codex/Responses ids alone — protocol-specific round-trip.
+        pd = getattr(tc, "provider_data", None)
+        if isinstance(pd, dict) and (pd.get("call_id") or pd.get("response_item_id")):
+            continue
+        raw = getattr(tc, "id", None)
+        if not isinstance(raw, str) or not raw.strip():
+            # No provider id → the deterministic fallback in
+            # build_assistant_message owns the missing-id case; out of scope.
+            continue
+        raw = raw.strip()
+        if _TOOL_CALL_ID_NAMESPACE_RE.search(raw):
+            continue  # already namespaced (idempotent guard)
+        try:
+            tc.id = (
+                f"{raw}{_TOOL_CALL_ID_NAMESPACE_MARKER}{uuid.uuid4().hex[:12]}"
+            )
+        except (AttributeError, TypeError):
+            # Frozen/immutable tool-call object — leave it; the assembly guard
+            # is the backstop.
+            continue
+        rewritten += 1
+    return rewritten
+
+
 def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Fix orphaned tool_call / tool_result pairs before every LLM call.
 
@@ -2955,6 +3036,78 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             "Pre-call sanitizer: removed %d duplicate tool_call_id reference(s)",
             removed_dupes,
         )
+
+    # 4. FINAL GUARD — never emit an assistant message with no payload.
+    # After the dedupe above, an assistant whose tool_calls were ALL filtered as
+    # duplicates (a colliding-id turn — NOL-106) is left as
+    # ``{"role":"assistant","content":"","tool_calls":[]}``. Moonshot/OpenAI
+    # reject an assistant message with neither content nor tool_calls with a
+    # NON-RETRYABLE HTTP 400 ("the message at position N with role 'assistant'
+    # must not be empty"), which permanently wedges the session — every retry
+    # resends the identical poisoned history. Drop any assistant that carries NO
+    # payload of any kind (no content, no tool_calls, no reasoning), then sweep
+    # the ``tool`` results that depended on it (their calls were the duplicates;
+    # the surviving answers live under the earlier id-holder). Running on the
+    # per-call copy at the final chokepoint means this ALSO repairs PRE-EXISTING
+    # poisoned histories written by the old code — a wedged session un-sticks on
+    # its next turn with no manual DB surgery. Reasoning-only assistants are
+    # preserved: strict thinking providers (Kimi/DeepSeek) require the
+    # reasoning_content echo, and those turns are handled by
+    # _is_thinking_only_assistant, not here.
+    def _assistant_has_payload(m: Dict[str, Any]) -> bool:
+        content = m.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                return True
+        elif isinstance(content, list):
+            if any(part for part in content):
+                return True
+        elif content not in (None, ""):
+            return True
+        if isinstance(m.get("tool_calls"), list) and m.get("tool_calls"):
+            return True
+        for _k in (
+            "reasoning_content", "reasoning", "reasoning_details",
+            "codex_reasoning_items", "codex_message_items",
+            "anthropic_content_blocks",
+        ):
+            if m.get(_k):
+                return True
+        return False
+
+    kept: List[Dict[str, Any]] = []
+    dropped_empty_assistants = 0
+    for msg in messages:
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and not _assistant_has_payload(msg)
+        ):
+            dropped_empty_assistants += 1
+            continue
+        kept.append(msg)
+    if dropped_empty_assistants:
+        live_call_ids: set = set()
+        for msg in kept:
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    cid = _ra().AIAgent._get_tool_call_id_static(tc)
+                    if cid:
+                        live_call_ids.add(cid)
+        swept: List[Dict[str, Any]] = []
+        for msg in kept:
+            if isinstance(msg, dict) and msg.get("role") == "tool":
+                cid = (msg.get("tool_call_id") or "").strip()
+                if cid and cid not in live_call_ids:
+                    continue  # orphaned by the empty-assistant drop
+            swept.append(msg)
+        messages = swept
+        _ra().logger.debug(
+            "Pre-call sanitizer: dropped %d empty assistant message(s) and "
+            "swept their now-orphaned tool result(s)",
+            dropped_empty_assistants,
+        )
+
     return messages
 
 
