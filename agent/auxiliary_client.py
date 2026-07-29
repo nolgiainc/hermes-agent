@@ -52,7 +52,7 @@ import threading
 import time
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
@@ -1359,6 +1359,60 @@ class AsyncCodexAuxiliaryClient:
         self._real_client = sync_wrapper._real_client
 
 
+# ── Per-attempt timeout budget: unenforceable-drop reporting ───────────────
+# Every auxiliary task computes a per-attempt timeout budget and hands it
+# down through chat.completions.create(timeout=...). Adapters that translate
+# those kwargs into a provider-native call must forward it; where a provider
+# genuinely cannot take the value, the caller has to be able to find out from
+# a log line instead of from an unexplained multi-minute stall (NOL-135).
+_TIMEOUT_UNENFORCED_WARNED: Set[str] = set()
+
+
+def _warn_timeout_unenforced(route: str, reason: str, timeout: Any) -> None:
+    """Log ONCE per (route, reason) that a timeout budget was not enforced.
+
+    Deduped because the condition is a property of the deployment, not of the
+    individual call — repeating it on every auxiliary call would bury the
+    signal it exists to raise. ``reason`` must be a stable short token so the
+    dedup key does not vary with the offending value.
+    """
+    key = f"{route}:{reason}"
+    if key in _TIMEOUT_UNENFORCED_WARNED:
+        return
+    _TIMEOUT_UNENFORCED_WARNED.add(key)
+    logger.warning(
+        "%s: per-attempt timeout budget %r could not be enforced (%s). This "
+        "call runs to the provider SDK default instead of the caller's "
+        "budget; a hung endpoint will stall for that long. Logged once per "
+        "process per cause.",
+        route, timeout, reason,
+    )
+
+
+def _bedrock_timeout_seconds(timeout: Any) -> Optional[float]:
+    """Coerce a chat.completions ``timeout`` to seconds for botocore.
+
+    The OpenAI wire contract also accepts an ``httpx.Timeout`` object, which
+    botocore cannot consume. Rather than dropping such a value in silence,
+    report it once and fall back to the SDK default.
+    """
+    if timeout is None:
+        return None
+    try:
+        seconds = float(timeout)
+    except (TypeError, ValueError):
+        _warn_timeout_unenforced(
+            "BedrockAuxiliaryClient", "non-numeric-timeout", timeout,
+        )
+        return None
+    if seconds <= 0 or seconds != seconds:  # non-positive or NaN
+        _warn_timeout_unenforced(
+            "BedrockAuxiliaryClient", "non-positive-timeout", timeout,
+        )
+        return None
+    return seconds
+
+
 class _AnthropicCompletionsAdapter:
     """OpenAI-client-compatible adapter for Anthropic Messages API."""
 
@@ -1450,6 +1504,19 @@ class _AnthropicCompletionsAdapter:
                 if not isinstance(existing, dict):
                     existing = {}
                 anthropic_kwargs["extra_body"] = {**existing, **passthrough}
+
+        # Preserve the chat.completions timeout contract (NOL-135). Every
+        # auxiliary task computes a per-attempt budget and passes it here; the
+        # Anthropic SDK takes it as a per-request option on both
+        # messages.stream() and messages.create(), so it costs one key to
+        # honour. Dropping it fell back to the client-level default —
+        # build_anthropic_client() uses 900s when no timeout is supplied, and
+        # every auxiliary Anthropic client is built without one — so a hung
+        # Anthropic-compatible gateway stalled a 30s compression or 60s vision
+        # call for fifteen minutes with nothing in the logs to explain it.
+        timeout = kwargs.get("timeout")
+        if timeout is not None:
+            anthropic_kwargs["timeout"] = timeout
 
         response = create_anthropic_message(
             self._client,
@@ -1582,6 +1649,10 @@ class _BedrockCompletionsAdapter:
                 "stream); caller downgrades to non-streaming.",
                 model,
             )
+        # Preserve the chat.completions timeout contract (NOL-135). botocore
+        # has no per-request timeout, so call_converse() resolves a client
+        # configured for this budget rather than the 60s botocore default
+        # multiplied by botocore's own read-timeout retries.
         return call_converse(
             region=self._region,
             model=model,
@@ -1591,6 +1662,7 @@ class _BedrockCompletionsAdapter:
             temperature=kwargs.get("temperature"),
             top_p=kwargs.get("top_p"),
             stop_sequences=stop,
+            timeout=_bedrock_timeout_seconds(kwargs.get("timeout")),
         )
 
 

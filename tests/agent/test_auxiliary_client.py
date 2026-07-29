@@ -6752,3 +6752,315 @@ class TestCustomEndpointApiKeyInheritance:
             )
 
         assert captured.get("api_key") == "no-key-required"
+
+
+# ---------------------------------------------------------------------------
+# NOL-135 — per-attempt timeout budget on the native provider adapters
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def black_hole_endpoint():
+    """A TCP listener that completes the handshake and then says nothing.
+
+    Reproduces the exact production shape these tests are about — a provider
+    that is reachable but never answers — with no credentials, no egress and
+    no billable call. Yields ``http://127.0.0.1:<port>``.
+
+    Same squatter pattern as ``tests/hermes_cli/test_browser_connect_dual_stack.py``.
+    """
+    import socket
+    import threading
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(8)
+    port = server.getsockname()[1]
+
+    held: list = []
+    stop = threading.Event()
+
+    def _accept_loop() -> None:
+        server.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = server.accept()
+                held.append(conn)  # hold the socket open, send nothing
+            except OSError:
+                continue
+
+    thread = threading.Thread(target=_accept_loop, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+        for conn in held:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        server.close()
+
+
+class TestAnthropicAuxiliaryAdapterTimeout:
+    """The Anthropic adapter must forward the caller's per-attempt budget.
+
+    It used to read messages/model/tools/tool_choice/_reasoning_config/
+    max_tokens/temperature and drop ``timeout`` on the floor. Every auxiliary
+    task computes a budget and passes it down, so on this route the budget was
+    decorative: the call actually ran to the client-level default, which
+    ``build_anthropic_client()`` sets to 900s when no timeout is supplied —
+    and every auxiliary Anthropic client is built without one.
+    """
+
+    @staticmethod
+    def _adapter(model="claude-fable-5"):
+        from agent.auxiliary_client import _AnthropicCompletionsAdapter
+
+        captured: dict = {}
+
+        class _Messages:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    content=[SimpleNamespace(type="text", text="ok")],
+                    stop_reason="end_turn",
+                    usage=SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
+                )
+
+        real_client = SimpleNamespace(messages=_Messages())
+        return _AnthropicCompletionsAdapter(real_client, model), captured
+
+    @staticmethod
+    def _streaming_adapter(model="claude-fable-5"):
+        """Adapter over a client that exposes ``messages.stream()`` — the path
+        ``create_anthropic_message`` actually prefers for real clients."""
+        from agent.auxiliary_client import _AnthropicCompletionsAdapter
+
+        captured: dict = {}
+        final = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="ok")],
+            stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
+        )
+
+        class _Messages:
+            def stream(self, **kwargs):
+                captured.update(kwargs)
+                return _FakeAnthropicStream(final)
+
+        real_client = SimpleNamespace(messages=_Messages())
+        return _AnthropicCompletionsAdapter(real_client, model), captured
+
+    def test_forwards_timeout_to_messages_create(self):
+        adapter, captured = self._adapter()
+
+        adapter.create(
+            messages=[{"role": "user", "content": "summarize this"}],
+            max_tokens=16,
+            timeout=12.5,
+        )
+
+        assert captured["timeout"] == 12.5
+
+    def test_forwards_timeout_on_the_streaming_path(self):
+        adapter, captured = self._streaming_adapter()
+
+        adapter.create(
+            messages=[{"role": "user", "content": "summarize this"}],
+            max_tokens=16,
+            timeout=7.0,
+        )
+
+        assert captured["timeout"] == 7.0
+
+    def test_omits_timeout_when_the_caller_supplies_none(self):
+        """No budget means no key on the wire — the SDK/client default stands.
+        Sending ``timeout=None`` explicitly would override a client-level
+        default with 'no timeout' on some SDK versions."""
+        adapter, captured = self._adapter()
+
+        adapter.create(messages=[{"role": "user", "content": "hi"}], max_tokens=16)
+
+        assert "timeout" not in captured
+
+    def test_hung_endpoint_returns_at_the_budget_not_the_client_default(
+        self, black_hole_endpoint,
+    ):
+        """End-to-end against a real Anthropic SDK client pointed at a socket
+        that accepts and never answers.
+
+        The client default is pinned to 8s here purely so a regression fails
+        in seconds instead of the 900s a production auxiliary client would
+        actually burn. Without the fix this call returns at ~8s (the client
+        default) instead of ~1s (the caller's budget).
+        """
+        anthropic = pytest.importorskip("anthropic")
+        from agent.auxiliary_client import _AnthropicCompletionsAdapter
+
+        client = anthropic.Anthropic(
+            api_key="test-key-not-used",
+            base_url=black_hole_endpoint,
+            timeout=8.0,
+            max_retries=0,
+        )
+        adapter = _AnthropicCompletionsAdapter(client, "claude-fable-5")
+
+        started = time.monotonic()
+        with pytest.raises(Exception) as excinfo:
+            adapter.create(
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=16,
+                timeout=1.0,
+            )
+        elapsed = time.monotonic() - started
+
+        assert "timeout" in type(excinfo.value).__name__.lower() or \
+            "timed out" in str(excinfo.value).lower()
+        assert elapsed < 4.0, (
+            f"budget of 1.0s was not enforced — call took {elapsed:.2f}s "
+            f"(client default is 8.0s in this test, 900s in production)"
+        )
+
+
+class TestBedrockAuxiliaryAdapterTimeout:
+    """The Bedrock adapter must forward the caller's per-attempt budget.
+
+    botocore has no per-request timeout, so the adapter hands the budget to
+    ``call_converse()``, which resolves a client configured for it. Dropping
+    it left the call running to botocore's 60s read timeout multiplied by
+    botocore's own read-timeout retries.
+    """
+
+    @staticmethod
+    def _run_adapter(**create_kwargs):
+        from agent.auxiliary_client import _BedrockCompletionsAdapter
+
+        captured: dict = {}
+
+        def _fake_call_converse(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(choices=[], model="m", usage=None)
+
+        adapter = _BedrockCompletionsAdapter("us-east-1", "amazon.nova-lite-v1:0")
+        with patch("agent.bedrock_adapter.call_converse", _fake_call_converse):
+            adapter.create(**create_kwargs)
+        return captured
+
+    def test_forwards_timeout_to_call_converse(self):
+        captured = self._run_adapter(
+            messages=[{"role": "user", "content": "hi"}], timeout=7.0,
+        )
+        assert captured["timeout"] == 7.0
+
+    def test_passes_none_when_the_caller_supplies_no_budget(self):
+        captured = self._run_adapter(messages=[{"role": "user", "content": "hi"}])
+        assert captured["timeout"] is None
+
+    def test_unusable_timeout_warns_once_instead_of_dropping_silently(self, caplog):
+        """The chat.completions contract also allows an ``httpx.Timeout``
+        object, which botocore cannot consume. That drop is real — so it is
+        reported at WARNING, once per process, rather than swallowed. An
+        unenforceable budget the caller knows about beats one it does not.
+        """
+        httpx = pytest.importorskip("httpx")
+        from agent import auxiliary_client as ac
+
+        ac._TIMEOUT_UNENFORCED_WARNED.clear()
+        try:
+            with caplog.at_level(logging.WARNING, logger=ac.logger.name):
+                first = self._run_adapter(
+                    messages=[{"role": "user", "content": "hi"}],
+                    timeout=httpx.Timeout(30.0),
+                )
+                second = self._run_adapter(
+                    messages=[{"role": "user", "content": "hi"}],
+                    timeout=httpx.Timeout(45.0),
+                )
+        finally:
+            ac._TIMEOUT_UNENFORCED_WARNED.clear()
+
+        assert first["timeout"] is None
+        assert second["timeout"] is None
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "could not be enforced" in r.getMessage()
+        ]
+        assert len(warnings) == 1, (
+            f"expected exactly one deduped warning, got {len(warnings)}"
+        )
+        assert "BedrockAuxiliaryClient" in warnings[0].getMessage()
+
+    def test_non_positive_timeout_warns_and_falls_back(self, caplog):
+        from agent import auxiliary_client as ac
+
+        ac._TIMEOUT_UNENFORCED_WARNED.clear()
+        try:
+            with caplog.at_level(logging.WARNING, logger=ac.logger.name):
+                captured = self._run_adapter(
+                    messages=[{"role": "user", "content": "hi"}], timeout=0,
+                )
+        finally:
+            ac._TIMEOUT_UNENFORCED_WARNED.clear()
+
+        assert captured["timeout"] is None
+        assert any(
+            "could not be enforced" in r.getMessage() for r in caplog.records
+        )
+
+    def test_hung_endpoint_returns_at_the_budget_not_the_client_default(
+        self, black_hole_endpoint, monkeypatch,
+    ):
+        """End-to-end against a real boto3 bedrock-runtime client pointed at a
+        socket that accepts and never answers.
+
+        The unbudgeted cache entry is pre-seeded with an 8s client so a
+        regression fails in seconds rather than at botocore's 60s default:
+        without the fix the adapter's call resolves that pre-seeded client
+        (cache key is the bare region) and takes ~8s, with the fix it builds
+        a 2s-budget client and returns at ~2s.
+        """
+        pytest.importorskip("boto3", reason="boto3 required for the Bedrock route")
+        from botocore.config import Config
+        import boto3
+
+        from agent import bedrock_adapter as ba
+        from agent.auxiliary_client import _BedrockCompletionsAdapter
+
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-not-used")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-not-used")
+        monkeypatch.setenv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", black_hole_endpoint)
+
+        ba.reset_client_cache()
+        try:
+            ba._bedrock_runtime_client_cache["us-east-1"] = boto3.client(
+                "bedrock-runtime",
+                region_name="us-east-1",
+                config=Config(
+                    connect_timeout=8, read_timeout=8,
+                    retries={"total_max_attempts": 1},
+                ),
+            )
+            adapter = _BedrockCompletionsAdapter(
+                "us-east-1", "anthropic.claude-3-haiku-20240307-v1:0",
+            )
+
+            started = time.monotonic()
+            with pytest.raises(Exception) as excinfo:
+                adapter.create(
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_tokens=16,
+                    timeout=2.0,
+                )
+            elapsed = time.monotonic() - started
+        finally:
+            ba.reset_client_cache()
+
+        assert "timeout" in type(excinfo.value).__name__.lower()
+        assert elapsed < 5.0, (
+            f"budget of 2.0s was not enforced — call took {elapsed:.2f}s "
+            f"(pre-seeded default client is 8.0s, botocore's own default 60s)"
+        )
