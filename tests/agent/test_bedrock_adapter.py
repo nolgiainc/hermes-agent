@@ -1577,6 +1577,144 @@ class TestInvalidateRuntimeClient:
         reset_client_cache()
         assert invalidate_runtime_client("eu-west-1") is False
 
+    def test_evicts_budgeted_variants_of_the_target_region(self):
+        """A stale connection pool belongs to the region's endpoint, not to
+        one timeout budget — every ``region#t<seconds>`` client for that
+        region has to go too, or the next budgeted call reuses a dead socket.
+        """
+        from agent.bedrock_adapter import (
+            _bedrock_runtime_client_cache,
+            invalidate_runtime_client,
+            reset_client_cache,
+        )
+        reset_client_cache()
+        _bedrock_runtime_client_cache["us-east-1"] = "dead-default"
+        _bedrock_runtime_client_cache["us-east-1#t30"] = "dead-30s"
+        _bedrock_runtime_client_cache["us-east-1#t60"] = "dead-60s"
+        _bedrock_runtime_client_cache["us-west-2#t30"] = "live-30s"
+
+        assert invalidate_runtime_client("us-east-1") is True
+
+        assert sorted(_bedrock_runtime_client_cache) == ["us-west-2#t30"]
+
+    def test_returns_true_when_only_a_budgeted_variant_is_cached(self):
+        from agent.bedrock_adapter import (
+            _bedrock_runtime_client_cache,
+            invalidate_runtime_client,
+            reset_client_cache,
+        )
+        reset_client_cache()
+        _bedrock_runtime_client_cache["eu-west-1#t15"] = "dead"
+
+        assert invalidate_runtime_client("eu-west-1") is True
+        assert not _bedrock_runtime_client_cache
+
+
+class TestBedrockRuntimeClientTimeoutBudget:
+    """NOL-135: botocore fixes connect/read timeouts at client construction,
+    so honouring a caller's per-attempt budget means resolving a client built
+    for that budget rather than the shared default one.
+    """
+
+    @staticmethod
+    def _fake_boto3(captured):
+        class _FakeBoto3:
+            def client(self, service, **kwargs):
+                captured.append((service, kwargs))
+                return f"client-{len(captured)}"
+        return _FakeBoto3()
+
+    def test_default_client_is_unchanged_and_keyed_by_bare_region(self):
+        from agent.bedrock_adapter import (
+            _bedrock_runtime_client_cache,
+            _get_bedrock_runtime_client,
+            reset_client_cache,
+        )
+        reset_client_cache()
+        captured: list = []
+        with patch("agent.bedrock_adapter._require_boto3",
+                   return_value=self._fake_boto3(captured)):
+            _get_bedrock_runtime_client("us-east-1")
+
+        assert list(_bedrock_runtime_client_cache) == ["us-east-1"]
+        service, kwargs = captured[0]
+        assert service == "bedrock-runtime"
+        assert kwargs == {"region_name": "us-east-1"}, (
+            "an unbudgeted call must keep botocore's own defaults"
+        )
+
+    def test_budget_produces_a_separate_client_with_matching_config(self):
+        pytest.importorskip("botocore", reason="botocore required for Config assertions")
+        from agent.bedrock_adapter import (
+            _bedrock_runtime_client_cache,
+            _get_bedrock_runtime_client,
+            reset_client_cache,
+        )
+        reset_client_cache()
+        captured: list = []
+        with patch("agent.bedrock_adapter._require_boto3",
+                   return_value=self._fake_boto3(captured)):
+            _get_bedrock_runtime_client("us-east-1")
+            _get_bedrock_runtime_client("us-east-1", timeout=30.0)
+
+        assert sorted(_bedrock_runtime_client_cache) == ["us-east-1", "us-east-1#t30"]
+        _, budgeted_kwargs = captured[1]
+        config = budgeted_kwargs["config"]
+        assert config.connect_timeout == 30.0
+        assert config.read_timeout == 30.0
+        # botocore retries read timeouts by default, which would silently
+        # multiply the caller's budget. Hermes owns the retry decision.
+        assert config.retries == {"total_max_attempts": 1}
+
+    def test_same_budget_reuses_one_client(self):
+        from agent.bedrock_adapter import _get_bedrock_runtime_client, reset_client_cache
+        reset_client_cache()
+        captured: list = []
+        with patch("agent.bedrock_adapter._require_boto3",
+                   return_value=self._fake_boto3(captured)):
+            first = _get_bedrock_runtime_client("us-east-1", timeout=30.0)
+            second = _get_bedrock_runtime_client("us-east-1", timeout=30.0)
+
+        assert first is second
+        assert len(captured) == 1
+
+    def test_distinct_budgets_do_not_share_a_client(self):
+        from agent.bedrock_adapter import _get_bedrock_runtime_client, reset_client_cache
+        reset_client_cache()
+        captured: list = []
+        with patch("agent.bedrock_adapter._require_boto3",
+                   return_value=self._fake_boto3(captured)):
+            slow = _get_bedrock_runtime_client("us-east-1", timeout=60.0)
+            fast = _get_bedrock_runtime_client("us-east-1", timeout=5.0)
+
+        assert slow != fast
+        assert len(captured) == 2
+
+    def test_call_converse_forwards_the_budget_to_the_client_factory(self):
+        from agent.bedrock_adapter import call_converse
+
+        seen: dict = {}
+
+        def _fake_factory(region, timeout=None):
+            seen["region"] = region
+            seen["timeout"] = timeout
+            client = MagicMock()
+            client.converse.return_value = {"output": {"message": {"content": []}}}
+            return client
+
+        with patch("agent.bedrock_adapter._get_bedrock_runtime_client", _fake_factory), \
+             patch("agent.bedrock_adapter.normalize_converse_response",
+                   return_value="normalized"):
+            result = call_converse(
+                region="us-east-1",
+                model="anthropic.claude-3-haiku-20240307-v1:0",
+                messages=[{"role": "user", "content": "hi"}],
+                timeout=12.5,
+            )
+
+        assert result == "normalized"
+        assert seen == {"region": "us-east-1", "timeout": 12.5}
+
 
 class TestIsStaleConnectionError:
     """Classifier that decides whether an exception warrants client eviction."""

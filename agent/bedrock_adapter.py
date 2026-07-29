@@ -88,17 +88,51 @@ def _require_boto3():
     return boto3
 
 
-def _get_bedrock_runtime_client(region: str):
+# Separator for budgeted entries in ``_bedrock_runtime_client_cache``. Keys
+# stay plain region strings for the default (unbudgeted) client so existing
+# callers and tests are unaffected; a per-call timeout budget appends
+# "<sep><seconds>". ``#`` cannot appear in an AWS region name, so a budgeted
+# key can never collide with a bare region.
+_RUNTIME_CACHE_TIMEOUT_SEP = "#t"
+
+
+def _get_bedrock_runtime_client(region: str, timeout: Optional[float] = None):
     """Get or create a cached ``bedrock-runtime`` client for the given region.
 
     Uses the default AWS credential chain (env vars → profile → instance role).
+
+    ``timeout`` is the caller's per-attempt budget in seconds. botocore has no
+    per-request timeout — connect/read timeouts are fixed at client
+    construction — so a budgeted call gets its own client, cached under
+    ``region#t<seconds>``. Distinct budgets come from per-task auxiliary
+    config (a handful of values), so the cache stays small.
+
+    Budgeted clients also pin ``total_max_attempts=1``. botocore retries read
+    timeouts by default, which would silently multiply the caller's budget by
+    the retry count — the same amplification NOL-127 hit on the OpenAI route.
+    Hermes owns the retry decision (``call_llm`` / ``async_call_llm``), so the
+    SDK must not add its own, exactly as the auxiliary OpenAI clients pin
+    ``max_retries=0``. Unbudgeted clients keep botocore's defaults.
     """
-    if region not in _bedrock_runtime_client_cache:
+    if timeout is None:
+        cache_key = region
+    else:
+        cache_key = f"{region}{_RUNTIME_CACHE_TIMEOUT_SEP}{float(timeout):g}"
+    if cache_key not in _bedrock_runtime_client_cache:
         boto3 = _require_boto3()
-        _bedrock_runtime_client_cache[region] = boto3.client(
-            "bedrock-runtime", region_name=region,
+        client_kwargs: Dict[str, Any] = {"region_name": region}
+        if timeout is not None:
+            from botocore.config import Config
+
+            client_kwargs["config"] = Config(
+                connect_timeout=float(timeout),
+                read_timeout=float(timeout),
+                retries={"total_max_attempts": 1},
+            )
+        _bedrock_runtime_client_cache[cache_key] = boto3.client(
+            "bedrock-runtime", **client_kwargs,
         )
-    return _bedrock_runtime_client_cache[region]
+    return _bedrock_runtime_client_cache[cache_key]
 
 
 def _get_bedrock_control_client(region: str):
@@ -125,12 +159,21 @@ def invalidate_runtime_client(region: str) -> bool:
     gone stale, so the next call allocates a fresh client (with a fresh
     connection pool) instead of reusing a dead socket.
 
-    Returns True if a cached entry was evicted, False if the region was not
-    cached.
+    Evicts every cached client for the region — the bare-region entry and any
+    budgeted ``region#t<seconds>`` variants — because a stale connection pool
+    is a property of the region's endpoint, not of one timeout budget.
+
+    Returns True if at least one cached entry was evicted, False if the region
+    was not cached.
     """
-    existed = region in _bedrock_runtime_client_cache
-    _bedrock_runtime_client_cache.pop(region, None)
-    return existed
+    prefix = f"{region}{_RUNTIME_CACHE_TIMEOUT_SEP}"
+    doomed = [
+        key for key in _bedrock_runtime_client_cache
+        if key == region or key.startswith(prefix)
+    ]
+    for key in doomed:
+        _bedrock_runtime_client_cache.pop(key, None)
+    return bool(doomed)
 
 
 # ---------------------------------------------------------------------------
@@ -1099,12 +1142,18 @@ def call_converse(
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
     guardrail_config: Optional[Dict] = None,
+    timeout: Optional[float] = None,
 ) -> SimpleNamespace:
     """Call Bedrock Converse API (non-streaming) and return an OpenAI-compatible response.
 
     This is the primary entry point for the agent loop when using the Bedrock provider.
+
+    ``timeout`` is the caller's per-attempt budget in seconds. Passing None
+    keeps botocore's defaults (60s read timeout plus its own retries); passing
+    a budget routes through a client configured to honour it — see
+    :func:`_get_bedrock_runtime_client`.
     """
-    client = _get_bedrock_runtime_client(region)
+    client = _get_bedrock_runtime_client(region, timeout=timeout)
     kwargs = build_converse_kwargs(
         model=model,
         messages=messages,
