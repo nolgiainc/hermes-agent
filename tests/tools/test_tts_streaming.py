@@ -156,6 +156,14 @@ def _sd_mock():
 def test_streamer_path_writes_pcm_to_output(monkeypatch):
     from tools import tts_tool
 
+    # This test asserts real speaker-output behavior (PCM written to the
+    # sounddevice stream), so it must opt out of the suite-wide audio
+    # kill-switch (conftest sets HERMES_DISABLE_AUDIO_PLAYBACK=1 to keep test
+    # runs silent). Without this the streamer path short-circuits and nothing
+    # is ever written. No live audio/network results: the provider and
+    # sounddevice are both mocked below.
+    monkeypatch.setenv("HERMES_DISABLE_AUDIO_PLAYBACK", "0")
+
     class _Fake(ts.StreamingTTSProvider):
         sample_rate = 24000
 
@@ -212,11 +220,19 @@ def test_stop_event_aborts_streaming(monkeypatch):
 def test_sync_fallback_speaks_each_sentence(monkeypatch):
     from tools import tts_tool
 
+    # Asserts real per-sentence synthesis + playback. It stubs the whole
+    # tools.voice_mode module with a MagicMock, whose audio_playback_disabled
+    # attribute would otherwise return a truthy Mock and suppress the speaker
+    # path (the suite-wide kill-switch lives there — conftest sets
+    # HERMES_DISABLE_AUDIO_PLAYBACK=1). Pin it False so the fallback actually
+    # runs. Still fully mocked (text_to_speech_tool + voice_mode) — no live
+    # TTS, network, or audio device is touched.
     spoken = []
     monkeypatch.setattr(tts_tool, "text_to_speech_tool",
                         lambda text, output_path: spoken.append(text))
     played = []
     fake_vm = MagicMock()
+    fake_vm.audio_playback_disabled.return_value = False
     fake_vm.play_audio_file.side_effect = lambda p: played.append(p)
     monkeypatch.setitem(__import__("sys").modules, "tools.voice_mode", fake_vm)
     monkeypatch.setattr("os.path.getsize", lambda p: 100)
