@@ -1070,3 +1070,214 @@ class TestRunsProviderAuthFailure:
                 assert status["status"] == "failed"
                 assert status["error"] == "⚠️ Provider authentication failed: No credentials found for provider 'nous'"
                 assert status["last_event"] == "run.failed"
+
+
+# ---------------------------------------------------------------------------
+# Durable terminal run statuses (NOL-93)
+# ---------------------------------------------------------------------------
+
+
+class TestDurableRunStatus:
+    """A /v1/runs turn can outlive its supervisor: the platform relay
+    budget-fails the turn while the pod keeps executing and completes later.
+    Terminal statuses must therefore survive both the in-memory TTL and a
+    gateway restart, so a late GET /v1/runs/{run_id} salvages the outcome
+    instead of forcing a full (billed) re-run. In-flight statuses must NOT
+    persist — after a restart that work is genuinely gone and a durable
+    "running" row would lie forever."""
+
+    @pytest.mark.asyncio
+    async def test_terminal_status_survives_adapter_restart(self):
+        first = _make_adapter()
+        first._set_run_status(
+            "run_persist",
+            "completed",
+            output="the 30s spot is delivered",
+            usage={"total_tokens": 6},
+            last_event="run.completed",
+        )
+
+        # A fresh adapter simulates a gateway restart: empty _run_statuses,
+        # same on-disk response_store.db (per-test HERMES_HOME).
+        reborn = _make_adapter()
+        assert reborn._run_statuses == {}
+        app = _create_runs_app(reborn)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/runs/run_persist")
+            assert resp.status == 200
+            status = await resp.json()
+        assert status["status"] == "completed"
+        assert status["output"] == "the 30s spot is delivered"
+        assert status["usage"]["total_tokens"] == 6
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("terminal", ["failed", "cancelled"])
+    async def test_failed_and_cancelled_statuses_persist(self, terminal):
+        first = _make_adapter()
+        first._set_run_status("run_terminal", terminal, error="boom")
+
+        reborn = _make_adapter()
+        app = _create_runs_app(reborn)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/runs/run_terminal")
+            assert resp.status == 200
+            status = await resp.json()
+        assert status["status"] == terminal
+
+    @pytest.mark.asyncio
+    async def test_in_flight_status_is_not_persisted(self):
+        first = _make_adapter()
+        first._set_run_status("run_live", "running")
+
+        reborn = _make_adapter()
+        app = _create_runs_app(reborn)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/runs/run_live")
+            assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_memory_ttl_expiry_still_serves_terminal_status(self, adapter):
+        adapter._set_run_status(
+            "run_aged",
+            "completed",
+            output="done",
+            last_event="run.completed",
+        )
+        adapter._sweep_orphaned_runs_once(time.time() + adapter._RUN_STATUS_TTL + 1)
+        assert "run_aged" not in adapter._run_statuses
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/runs/run_aged")
+            assert resp.status == 200
+            status = await resp.json()
+        assert status["status"] == "completed"
+        assert status["output"] == "done"
+
+    def test_retention_prunes_expired_rows(self, adapter):
+        store = adapter._response_store
+        store.put_run_status("run_old", {"status": "completed", "output": "old"})
+        expired = time.time() - store.RUN_STATUS_RETENTION_SECONDS - 60
+        with store._run_status_lock:
+            store._conn.execute(
+                "UPDATE run_statuses SET updated_at = ? WHERE run_id = ?",
+                (expired, "run_old"),
+            )
+            store._conn.commit()
+
+        # Any later persist prunes rows past retention.
+        store.put_run_status("run_new", {"status": "completed", "output": "new"})
+        assert store.get_run_status("run_old") is None
+        assert store.get_run_status("run_new")["output"] == "new"
+
+    def test_capacity_prunes_oldest_rows(self, adapter):
+        store = adapter._response_store
+        keep = store.MAX_STORED_RUN_STATUSES
+        for i in range(keep + 5):
+            store.put_run_status(f"run_{i:04d}", {"status": "completed", "output": str(i)})
+            # Distinct updated_at ordering without sleeping: backdate each row
+            # progressively so eviction order is deterministic.
+            with store._run_status_lock:
+                store._conn.execute(
+                    "UPDATE run_statuses SET updated_at = ? WHERE run_id = ?",
+                    (time.time() - (keep + 5 - i), f"run_{i:04d}"),
+                )
+                store._conn.commit()
+        store.put_run_status("run_final", {"status": "completed", "output": "final"})
+        assert store.get_run_status("run_0000") is None
+        assert store.get_run_status("run_final")["output"] == "final"
+
+    def test_expired_row_is_not_served_on_read(self, adapter):
+        """put_run_status only prunes when a newer write lands; the read path
+        must enforce retention too or a quiet gateway serves stale results
+        forever."""
+        store = adapter._response_store
+        store.put_run_status("run_stale", {"status": "completed", "output": "old"})
+        expired = time.time() - store.RUN_STATUS_RETENTION_SECONDS - 60
+        with store._run_status_lock:
+            store._conn.execute(
+                "UPDATE run_statuses SET updated_at = ? WHERE run_id = ?",
+                (expired, "run_stale"),
+            )
+            store._conn.commit()
+        assert store.get_run_status("run_stale") is None
+        # And the row was evicted, not just filtered.
+        with store._run_status_lock:
+            row = store._conn.execute(
+                "SELECT 1 FROM run_statuses WHERE run_id = ?", ("run_stale",)
+            ).fetchone()
+        assert row is None
+
+    def test_non_durable_terminal_status_stays_in_memory_only(self):
+        first = _make_adapter()
+        first._set_run_status("run_teardown", "cancelled", durable=False)
+        # Late pollers on the SAME process still see it...
+        assert first._run_statuses["run_teardown"]["status"] == "cancelled"
+        # ...but it is not persisted: a restarted gateway must 404 so the
+        # caller resubmits the lost work instead of treating it as settled.
+        reborn = _make_adapter()
+        assert reborn._response_store.get_run_status("run_teardown") is None
+
+    @pytest.mark.asyncio
+    async def test_teardown_cancellation_is_not_persisted(self):
+        """cancel_background_tasks() (gateway restart) cancelling a live
+        _run_and_close task must not leave a durable 'cancelled' behind."""
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, interrupted = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                agent_ready.wait(timeout=3.0)
+                await asyncio.sleep(0.05)
+
+                task = adapter._active_run_tasks[run_id]
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+                # In-memory: cancelled (same-process pollers stay informed).
+                assert adapter._run_statuses[run_id]["status"] == "cancelled"
+                # Durable: nothing — a restarted gateway must 404 this run.
+                assert adapter._response_store.get_run_status(run_id) is None
+                interrupted.set()  # release the executor thread
+
+    @pytest.mark.asyncio
+    async def test_user_stop_cancellation_is_persisted(self):
+        """A /stop-initiated cancellation is a genuinely settled outcome and
+        must survive a restart (the caller should NOT resubmit)."""
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, _ = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                agent_ready.wait(timeout=3.0)
+                await asyncio.sleep(0.05)
+
+                stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
+                assert stop_resp.status == 200
+
+                for _ in range(40):
+                    if adapter._run_statuses.get(run_id, {}).get("status") == "cancelled":
+                        break
+                    await asyncio.sleep(0.05)
+                assert adapter._run_statuses[run_id]["status"] == "cancelled"
+                assert adapter._response_store.get_run_status(run_id)["status"] == "cancelled"
+
+    def test_corrupted_row_is_evicted(self, adapter):
+        store = adapter._response_store
+        with store._run_status_lock:
+            store._conn.execute(
+                "INSERT OR REPLACE INTO run_statuses (run_id, data, updated_at) VALUES (?, ?, ?)",
+                ("run_bad", "{not json", time.time()),
+            )
+            store._conn.commit()
+        assert store.get_run_status("run_bad") is None
+        assert store.get_run_status("run_bad") is None  # evicted, stays gone
