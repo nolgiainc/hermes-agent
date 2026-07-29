@@ -1070,3 +1070,130 @@ class TestRunsProviderAuthFailure:
                 assert status["status"] == "failed"
                 assert status["error"] == "⚠️ Provider authentication failed: No credentials found for provider 'nous'"
                 assert status["last_event"] == "run.failed"
+
+
+# ---------------------------------------------------------------------------
+# Durable terminal run statuses (NOL-93)
+# ---------------------------------------------------------------------------
+
+
+class TestDurableRunStatus:
+    """A /v1/runs turn can outlive its supervisor: the platform relay
+    budget-fails the turn while the pod keeps executing and completes later.
+    Terminal statuses must therefore survive both the in-memory TTL and a
+    gateway restart, so a late GET /v1/runs/{run_id} salvages the outcome
+    instead of forcing a full (billed) re-run. In-flight statuses must NOT
+    persist — after a restart that work is genuinely gone and a durable
+    "running" row would lie forever."""
+
+    @pytest.mark.asyncio
+    async def test_terminal_status_survives_adapter_restart(self):
+        first = _make_adapter()
+        first._set_run_status(
+            "run_persist",
+            "completed",
+            output="the 30s spot is delivered",
+            usage={"total_tokens": 6},
+            last_event="run.completed",
+        )
+
+        # A fresh adapter simulates a gateway restart: empty _run_statuses,
+        # same on-disk response_store.db (per-test HERMES_HOME).
+        reborn = _make_adapter()
+        assert reborn._run_statuses == {}
+        app = _create_runs_app(reborn)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/runs/run_persist")
+            assert resp.status == 200
+            status = await resp.json()
+        assert status["status"] == "completed"
+        assert status["output"] == "the 30s spot is delivered"
+        assert status["usage"]["total_tokens"] == 6
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("terminal", ["failed", "cancelled"])
+    async def test_failed_and_cancelled_statuses_persist(self, terminal):
+        first = _make_adapter()
+        first._set_run_status("run_terminal", terminal, error="boom")
+
+        reborn = _make_adapter()
+        app = _create_runs_app(reborn)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/runs/run_terminal")
+            assert resp.status == 200
+            status = await resp.json()
+        assert status["status"] == terminal
+
+    @pytest.mark.asyncio
+    async def test_in_flight_status_is_not_persisted(self):
+        first = _make_adapter()
+        first._set_run_status("run_live", "running")
+
+        reborn = _make_adapter()
+        app = _create_runs_app(reborn)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/runs/run_live")
+            assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_memory_ttl_expiry_still_serves_terminal_status(self, adapter):
+        adapter._set_run_status(
+            "run_aged",
+            "completed",
+            output="done",
+            last_event="run.completed",
+        )
+        adapter._sweep_orphaned_runs_once(time.time() + adapter._RUN_STATUS_TTL + 1)
+        assert "run_aged" not in adapter._run_statuses
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/runs/run_aged")
+            assert resp.status == 200
+            status = await resp.json()
+        assert status["status"] == "completed"
+        assert status["output"] == "done"
+
+    def test_retention_prunes_expired_rows(self, adapter):
+        store = adapter._response_store
+        store.put_run_status("run_old", {"status": "completed", "output": "old"})
+        expired = time.time() - store.RUN_STATUS_RETENTION_SECONDS - 60
+        with store._run_status_lock:
+            store._conn.execute(
+                "UPDATE run_statuses SET updated_at = ? WHERE run_id = ?",
+                (expired, "run_old"),
+            )
+            store._conn.commit()
+
+        # Any later persist prunes rows past retention.
+        store.put_run_status("run_new", {"status": "completed", "output": "new"})
+        assert store.get_run_status("run_old") is None
+        assert store.get_run_status("run_new")["output"] == "new"
+
+    def test_capacity_prunes_oldest_rows(self, adapter):
+        store = adapter._response_store
+        keep = store.MAX_STORED_RUN_STATUSES
+        for i in range(keep + 5):
+            store.put_run_status(f"run_{i:04d}", {"status": "completed", "output": str(i)})
+            # Distinct updated_at ordering without sleeping: backdate each row
+            # progressively so eviction order is deterministic.
+            with store._run_status_lock:
+                store._conn.execute(
+                    "UPDATE run_statuses SET updated_at = ? WHERE run_id = ?",
+                    (time.time() - (keep + 5 - i), f"run_{i:04d}"),
+                )
+                store._conn.commit()
+        store.put_run_status("run_final", {"status": "completed", "output": "final"})
+        assert store.get_run_status("run_0000") is None
+        assert store.get_run_status("run_final")["output"] == "final"
+
+    def test_corrupted_row_is_evicted(self, adapter):
+        store = adapter._response_store
+        with store._run_status_lock:
+            store._conn.execute(
+                "INSERT OR REPLACE INTO run_statuses (run_id, data, updated_at) VALUES (?, ?, ?)",
+                ("run_bad", "{not json", time.time()),
+            )
+            store._conn.commit()
+        assert store.get_run_status("run_bad") is None
+        assert store.get_run_status("run_bad") is None  # evicted, stays gone

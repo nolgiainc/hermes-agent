@@ -53,6 +53,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -682,7 +683,28 @@ class ResponseStore:
                 response_id TEXT NOT NULL
             )"""
         )
+        # Durable terminal run statuses (NOL-93). A /v1/runs turn can outlive
+        # its supervisor: the Nolgia platform budget-fails a turn while the
+        # pod keeps executing and completes minutes later. The in-memory
+        # _run_statuses copy dies with the process (and with its 1h TTL), so
+        # a late GET /v1/runs/{id} salvage probe would 404 and the caller's
+        # only recourse is re-running the whole turn — double side effects,
+        # double credit spend. Terminal statuses (completed/failed/cancelled)
+        # are therefore mirrored here; in-flight statuses are NOT (a pod
+        # restart mid-run genuinely loses the work, and a durable "running"
+        # row would lie about it forever).
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS run_statuses (
+                run_id TEXT PRIMARY KEY,
+                data TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )"""
+        )
         self._conn.commit()
+        # _set_run_status can be reached from the run's executor thread (a
+        # late tool_progress event) as well as the event loop; sqlite3 shares
+        # one connection here, so run-status reads/writes take this lock.
+        self._run_status_lock = threading.Lock()
         # response_store.db contains conversation history (tool payloads,
         # prompts, results). Tighten to owner-only after creation so other
         # local users on a shared box can't read it. Run once at __init__
@@ -792,6 +814,61 @@ class ResponseStore:
             (name, response_id),
         )
         self._conn.commit()
+
+    # Durable terminal run statuses -------------------------------------
+
+    # Retention comfortably outlives every platform-side salvage window
+    # (the Nolgia relay's reclaim/sweep chain is measured in minutes; ops
+    # post-mortems in hours/days) while keeping the table bounded.
+    RUN_STATUS_RETENTION_SECONDS = 48 * 3600
+    MAX_STORED_RUN_STATUSES = 500
+
+    def put_run_status(self, run_id: str, data: Dict[str, Any]) -> None:
+        """Persist a terminal run status (INSERT OR REPLACE) and prune."""
+        now = time.time()
+        with self._run_status_lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO run_statuses (run_id, data, updated_at) VALUES (?, ?, ?)",
+                (run_id, json.dumps(data, default=str), now),
+            )
+            self._conn.execute(
+                "DELETE FROM run_statuses WHERE updated_at < ?",
+                (now - self.RUN_STATUS_RETENTION_SECONDS,),
+            )
+            count = self._conn.execute(
+                "SELECT COUNT(*) FROM run_statuses"
+            ).fetchone()[0]
+            if count > self.MAX_STORED_RUN_STATUSES:
+                self._conn.execute(
+                    """DELETE FROM run_statuses WHERE run_id IN (
+                        SELECT run_id FROM run_statuses
+                        ORDER BY updated_at ASC LIMIT ?
+                    )""",
+                    (count - self.MAX_STORED_RUN_STATUSES,),
+                )
+            self._conn.commit()
+
+    def get_run_status(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """Return a persisted terminal run status, or None."""
+        with self._run_status_lock:
+            row = self._conn.execute(
+                "SELECT data FROM run_statuses WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                "Corrupted JSON in run status store for run_id=%s, evicting entry",
+                run_id,
+            )
+            with self._run_status_lock:
+                self._conn.execute(
+                    "DELETE FROM run_statuses WHERE run_id = ?", (run_id,)
+                )
+                self._conn.commit()
+            return None
 
     def close(self) -> None:
         """Close the database connection."""
@@ -5978,6 +6055,19 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
+        if status in ("completed", "failed", "cancelled"):
+            # Mirror terminal statuses durably so a supervisor that lost the
+            # run (budget timeout, restart on either side) can still salvage
+            # the outcome from GET /v1/runs/{run_id} instead of re-executing
+            # the turn. Best-effort: a store hiccup must never fail the run.
+            try:
+                self._response_store.put_run_status(run_id, dict(current))
+            except Exception:
+                logger.debug(
+                    "[api_server] failed to persist terminal status for run %s",
+                    run_id,
+                    exc_info=True,
+                )
         return current
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
@@ -6451,6 +6541,16 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
+        if status is None:
+            # Memory miss: the entry aged out of _RUN_STATUS_TTL or the
+            # gateway restarted since the run settled. Terminal statuses are
+            # mirrored durably (see ResponseStore.put_run_status) precisely
+            # so this late poll can still salvage the outcome; only runs that
+            # never reached a terminal state 404 (that work is really gone).
+            try:
+                status = self._response_store.get_run_status(run_id)
+            except Exception:
+                status = None
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
