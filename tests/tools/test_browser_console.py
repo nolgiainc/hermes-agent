@@ -439,7 +439,7 @@ class TestBrowserVisionConfig:
         assert result["success"] is True
         assert result["analysis"] == "Default screenshot analysis"
         assert mock_llm.call_args.kwargs["temperature"] == 0.1
-        assert mock_llm.call_args.kwargs["timeout"] == 120.0
+        assert mock_llm.call_args.kwargs["timeout"] == 60.0
 
     def test_browser_vision_native_fast_path_returns_multimodal(self, tmp_path):
         """supports_vision override → screenshot attached natively, no aux call."""

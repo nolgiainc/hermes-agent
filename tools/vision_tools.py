@@ -70,7 +70,51 @@ def _resolve_download_timeout() -> float:
         pass
     return 30.0
 
+
 _VISION_DOWNLOAD_TIMEOUT = _resolve_download_timeout()
+
+# Per-attempt timeout for the vision/video LLM call itself.  Separate from
+# _VISION_DOWNLOAD_TIMEOUT above, which governs only the HTTP image fetch.
+# Resolution: env HERMES_VISION_TIMEOUT → config.yaml auxiliary.vision.timeout
+# → the caller's default, mirroring _resolve_download_timeout().
+#
+# 60s, not the old 120s: every other auxiliary task defaults to 30s
+# (_DEFAULT_AUX_TIMEOUT), and a healthy provider returns this tool's capped
+# max_tokens=2000 analysis in well under 20s.  A vision call still running at
+# 60s is stalled, not slow, and a stall here is pure dead wall-clock inside a
+# user-visible agent run.  Local VLMs (llama.cpp, ollama) that legitimately
+# need longer raise it with one line of config or the env var.
+_VISION_DEFAULT_TIMEOUT = 60.0
+
+
+def _resolve_vision_timeout(
+    default: float = _VISION_DEFAULT_TIMEOUT, *, floor: float = 0.0
+) -> float:
+    """Resolve the per-attempt vision LLM timeout, never below *floor*.
+
+    ``floor`` exists for ``video_analyze_tool``, whose payloads are an order of
+    magnitude larger than a single image: it keeps a low image-tuned config
+    value from starving video analysis.  Best-effort throughout — any config
+    read or parse failure falls back to *default*.
+    """
+    try:
+        env_val = os.getenv("HERMES_VISION_TIMEOUT", "").strip()
+        if env_val:
+            try:
+                resolved = float(env_val)
+            except ValueError:
+                pass
+            else:
+                return max(resolved, floor)
+
+        from hermes_cli.config import cfg_get, load_config
+        cfg = load_config()
+        val = cfg_get(cfg, "auxiliary", "vision", "timeout")
+        resolved = float(val) if val is not None else default
+    except Exception:
+        resolved = default
+    return max(resolved, floor)
+
 
 # Hard cap on downloaded image file size (50 MB). Prevents OOM from
 # attacker-hosted multi-gigabyte files or decompression bombs.
@@ -1226,17 +1270,12 @@ async def vision_analyze_tool(
         logger.info("Processing image with vision model...")
         
         # Call the vision API via centralized router.
-        # Read timeout from config.yaml (auxiliary.vision.timeout), default 120s.
-        # Local vision models (llama.cpp, ollama) can take well over 30s.
-        vision_timeout = 120.0
+        vision_timeout = _resolve_vision_timeout()
         vision_temperature = 0.1
         try:
             from hermes_cli.config import cfg_get, load_config
             _cfg = load_config()
             _vision_cfg = cfg_get(_cfg, "auxiliary", "vision", default={})
-            _vt = _vision_cfg.get("timeout")
-            if _vt is not None:
-                vision_timeout = float(_vt)
             _vtemp = _vision_cfg.get("temperature")
             if _vtemp is not None:
                 vision_temperature = float(_vtemp)
@@ -1733,15 +1772,12 @@ async def video_analyze_tool(
             }
         ]
 
-        vision_timeout = 180.0
+        vision_timeout = _resolve_vision_timeout(default=180.0, floor=180.0)
         vision_temperature = 0.1
         try:
             from hermes_cli.config import cfg_get, load_config
             _cfg = load_config()
             _vision_cfg = cfg_get(_cfg, "auxiliary", "vision", default={})
-            _vt = _vision_cfg.get("timeout")
-            if _vt is not None:
-                vision_timeout = max(float(_vt), 180.0)
             _vtemp = _vision_cfg.get("temperature")
             if _vtemp is not None:
                 vision_temperature = float(_vtemp)

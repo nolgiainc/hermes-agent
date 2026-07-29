@@ -3357,9 +3357,136 @@ class TestTransientTransportRetry:
         assert primary.chat.completions.create.call_count == 1
         assert fb_client.chat.completions.create.call_count == 1
 
+    def test_vision_skips_same_provider_retry_on_timeout(self):
+        """A vision timeout must NOT retry the same provider.
+
+        Measured in production: a 120s vision budget retried once became a
+        240.72s dead stall inside a live agent run, for an advisory
+        contact-sheet check the deliverable did not depend on. The sync path
+        is the worse of the two — it retries ``_transient_retry_count()``
+        times (default 2), so the worst case was ~3 x the budget.
+        """
+        class _Timeout(Exception):
+            pass
+        _Timeout.__name__ = "APITimeoutError"
+
+        primary = MagicMock()
+        primary.base_url = "https://openrouter.ai/api/v1"
+        primary.chat.completions.create.side_effect = _Timeout("Request timed out.")
+
+        fb_client = MagicMock()
+        fb_client.base_url = "https://api.openai.com/v1"
+        fb_client.chat.completions.create.return_value = {"fallback": True}
+
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch(
+                "agent.auxiliary_client.resolve_vision_provider_client",
+                return_value=("openrouter", primary, "some-model"),
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ),
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+                return_value=(fb_client, "fb-model", "openai"),
+            ),
+        ):
+            result = call_llm(task="vision", messages=[{"role": "user", "content": "hi"}])
+
+        assert result == {"fallback": True}
+        assert primary.chat.completions.create.call_count == 1
+        assert fb_client.chat.completions.create.call_count == 1
+
+    def test_vision_still_retries_streaming_close(self):
+        """Only full-budget timeouts are skipped for vision. A fast
+        streaming-close costs nothing to retry and usually succeeds, so it
+        keeps the same-provider retry.
+        """
+        primary = MagicMock()
+        primary.base_url = "https://openrouter.ai/api/v1"
+        primary.chat.completions.create.side_effect = [
+            Exception(
+                "peer closed connection without sending complete message body "
+                "(incomplete chunked read)"
+            ),
+            {"ok": True},
+        ]
+
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch(
+                "agent.auxiliary_client.resolve_vision_provider_client",
+                return_value=("openrouter", primary, "some-model"),
+            ),
+        ):
+            result = call_llm(task="vision", messages=[{"role": "user", "content": "hi"}])
+
+        assert result == {"ok": True}
+        assert primary.chat.completions.create.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_async_vision_skips_same_provider_retry_on_timeout(self):
+        """Same guard on the async path, which is the one vision_analyze
+        actually uses — and the one that retried with no backoff at all,
+        i.e. an immediate identical request to an already-hung endpoint.
+        """
+        class _Timeout(Exception):
+            pass
+        _Timeout.__name__ = "APITimeoutError"
+
+        primary = MagicMock()
+        primary.base_url = "https://openrouter.ai/api/v1"
+        primary.chat.completions.create = AsyncMock(
+            side_effect=_Timeout("Request timed out.")
+        )
+
+        fallback = MagicMock()
+        fallback.base_url = "https://api.openai.com/v1"
+        async_fallback = MagicMock()
+        async_fallback.base_url = "https://api.openai.com/v1"
+        async_fallback.chat.completions.create = AsyncMock(
+            return_value={"fallback": True}
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("openrouter", "some-model", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_vision_provider_client",
+                return_value=("openrouter", primary, "some-model"),
+            ),
+            patch(
+                "agent.auxiliary_client._validate_llm_response",
+                side_effect=lambda resp, _task, **_kw: resp,
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(fallback, "fb-model", "openai"),
+            ),
+            patch(
+                "agent.auxiliary_client._to_async_client",
+                return_value=(async_fallback, "fb-model"),
+            ),
+        ):
+            result = await async_call_llm(
+                task="vision",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert result == {"fallback": True}
+        primary.chat.completions.create.assert_awaited_once()
+        async_fallback.chat.completions.create.assert_awaited_once()
+
     def test_non_compression_still_retries_same_provider_on_timeout(self):
-        """The timeout skip is scoped to compression only; other auxiliary
-        tasks keep the single same-provider transient retry.
+        """The timeout skip is scoped to _NO_TIMEOUT_RETRY_TASKS
+        (compression, vision); every other auxiliary task keeps the single
+        same-provider transient retry.
         """
         class _Timeout(Exception):
             pass

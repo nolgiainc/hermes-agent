@@ -888,14 +888,16 @@ def camofox_vision(question: str, annotate: bool = False,
             f"{annotation_context}"
         )
 
+        from tools.vision_tools import _resolve_vision_timeout
+
+        _vision_timeout = _resolve_vision_timeout()
+        _vision_temperature = 0.1
         try:
             _cfg = load_config()
             _vision_cfg = cfg_get(_cfg, "auxiliary", "vision", default={})
-            _vision_timeout = float(_vision_cfg.get("timeout", 120))
             _vision_temperature = float(_vision_cfg.get("temperature", 0.1))
         except Exception:
-            _vision_timeout = 120.0
-            _vision_temperature = 0.1
+            pass
 
         response = call_llm(
             messages=[{

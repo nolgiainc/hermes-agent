@@ -3273,6 +3273,34 @@ def _is_timeout_error(exc: Exception) -> bool:
     return "timed out" in str(exc).lower()
 
 
+# Auxiliary tasks that must NOT spend a second full timeout budget retrying the
+# same provider after a full-budget stall.
+#
+# A timeout burns the entire configured ``timeout`` before it surfaces, so a
+# same-provider retry costs another full budget for an endpoint that has already
+# proven unresponsive — and the async path retries with no backoff at all, i.e.
+# an immediate identical request to a hung target.
+#
+# ``compression`` is here because it sits on the critical preflight path
+# (issue #54465). ``vision`` is here because it is the opposite case and lands
+# in the same place: a vision analysis is almost always advisory (a frame or
+# contact-sheet QA check), the agent already handles the structured error, and
+# the retry doubled a 120s budget into a measured 240.72s of dead wall-clock
+# inside a user-visible agent run — for a call whose result the deliverable did
+# not depend on.
+#
+# Fast blips (streaming-close, 5xx, 408) still retry for every task: those fail
+# cheaply and usually succeed on the second attempt.
+_NO_TIMEOUT_RETRY_TASKS = frozenset({"compression", "vision"})
+
+
+def _skip_same_provider_timeout_retry(
+    task: Optional[str], exc: Exception
+) -> bool:
+    """True when *task* must fall straight through to fallback on a timeout."""
+    return task in _NO_TIMEOUT_RETRY_TASKS and _is_timeout_error(exc)
+
+
 def _is_connection_error(exc: Exception) -> bool:
     """Detect connection/network errors that warrant provider fallback.
 
@@ -7727,19 +7755,14 @@ def call_llm(
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise
-            # Compression is on the critical preflight path: a user cannot
-            # continue or resume an oversized session until it compacts. A
-            # same-provider retry on a timeout means another full ``timeout``-
-            # long wall-clock block before the except-chain below can fall
-            # back — doubling the user-visible stall (issue #54465). Skip the
-            # same-provider retry for compression on a full-budget timeout and
-            # fall straight through to provider/model fallback; fast blips (a
-            # streaming-close or a 5xx) still retry, since those are cheap.
-            if task == "compression" and _is_timeout_error(transient_err):
+            # Full-budget timeouts for selected tasks fall straight through to
+            # provider/model fallback; see _NO_TIMEOUT_RETRY_TASKS for the
+            # incident rationale. Fast streaming-close and 5xx blips still retry.
+            if _skip_same_provider_timeout_retry(task, transient_err):
                 logger.info(
-                    "Auxiliary compression: timeout on the critical path; "
-                    "skipping same-provider retry and falling back: %s",
-                    transient_err,
+                    "Auxiliary %s: timeout after the full budget; skipping "
+                    "same-provider retry and falling back: %s",
+                    task or "call", transient_err,
                 )
                 raise
             _max_transient_retries = _transient_retry_count()
@@ -8337,14 +8360,13 @@ async def async_call_llm(
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise
-            # See call_llm(): compression is on the critical preflight path,
-            # so skip the same-provider retry on a full-budget timeout and
-            # fall straight through to fallback (issue #54465).
-            if task == "compression" and _is_timeout_error(transient_err):
+            # See call_llm(): selected tasks skip the same-provider retry after
+            # a full-budget timeout and fall straight through to fallback.
+            if _skip_same_provider_timeout_retry(task, transient_err):
                 logger.info(
-                    "Auxiliary compression (async): timeout on the critical "
-                    "path; skipping same-provider retry and falling back: %s",
-                    transient_err,
+                    "Auxiliary %s (async): timeout after the full budget; "
+                    "skipping same-provider retry and falling back: %s",
+                    task or "call", transient_err,
                 )
                 raise
             logger.info(

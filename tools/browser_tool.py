@@ -4210,6 +4210,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         # turn — no aux call, no information loss. Consistent with vision_analyze.
         from tools.vision_tools import (
             _build_native_vision_tool_result,
+            _resolve_vision_timeout,
             _should_use_native_vision_fast_path,
         )
 
@@ -4247,17 +4248,12 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                      len(_screenshot_bytes))
 
         # Read vision timeout/temperature from config (auxiliary.vision.*).
-        # Local vision models (llama.cpp, ollama) can take well over 30s for
-        # screenshot analysis, so the default timeout must be generous.
-        vision_timeout = 120.0
+        vision_timeout = _resolve_vision_timeout()
         vision_temperature = 0.1
         try:
             from hermes_cli.config import load_config
             _cfg = load_config()
             _vision_cfg = cfg_get(_cfg, "auxiliary", "vision", default={})
-            _vt = _vision_cfg.get("timeout")
-            if _vt is not None:
-                vision_timeout = float(_vt)
             _vtemp = _vision_cfg.get("temperature")
             if _vtemp is not None:
                 vision_temperature = float(_vtemp)
