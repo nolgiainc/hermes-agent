@@ -32,6 +32,29 @@ def test_real_read_tool_binaries_confirm_option_ownership(
     assert completed.stdout == expected_output
 
 
+def _man_can_render(page: str) -> bool:
+    """True when ``man`` is a real implementation with a page for ``page``.
+
+    ``shutil.which("man")`` is not enough.  Minimized Ubuntu images (the base
+    for several CI runner images) ship a ``/usr/bin/man`` *stub* shell script
+    that prints an "unminimize" notice and exits 0 without consulting a pager,
+    and images carrying man-db with ``/usr/share/man`` stripped cannot resolve
+    the page at all.  In both cases the pager under test never runs, so the
+    case must skip rather than fail.
+    """
+    try:
+        located = subprocess.run(
+            ["man", "-w", page], text=True, capture_output=True, timeout=20
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if located.returncode != 0:
+        return False
+    return any(
+        os.path.isfile(line.strip()) for line in located.stdout.splitlines() if line.strip()
+    )
+
+
 @pytest.mark.parametrize(
     ("tool", "args", "stdin", "needs_tty"),
     [
@@ -49,6 +72,8 @@ def test_real_binaries_execute_leading_dash_program_payload(
     """A PATH marker proves these binaries do not reparse '-program' as an option."""
     if shutil.which(tool) is None or (needs_tty and shutil.which("script") is None):
         pytest.skip(f"{tool} or script is not installed")
+    if tool == "man" and not _man_can_render(args[-1]):
+        pytest.skip(f"man cannot render a page for {args[-1]} on this system")
 
     marker = tmp_path / "executed"
     payload = tmp_path / "-payload-marker"
