@@ -4073,6 +4073,12 @@ class AIAgent:
         return sanitize_api_messages(messages)
 
     @staticmethod
+    def _namespace_tool_call_ids(assistant_message: Any, existing_ids=None) -> int:
+        """Forwarder — see ``agent.agent_runtime_helpers.namespace_provider_tool_call_ids``."""
+        from agent.agent_runtime_helpers import namespace_provider_tool_call_ids
+        return namespace_provider_tool_call_ids(assistant_message, existing_ids)
+
+    @staticmethod
     def _is_thinking_only_assistant(
         msg: Dict[str, Any],
         *,
