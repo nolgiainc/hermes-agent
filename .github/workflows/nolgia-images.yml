@@ -50,7 +50,7 @@ jobs:
     name: Build & push (${{ matrix.env }})
     if: github.repository == 'nolgiainc/hermes-agent'
     # stays hosted: needs docker daemon
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     strategy:
       # Envs are independent: prod auth failing must not cancel stg.
       fail-fast: false
