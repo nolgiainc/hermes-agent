@@ -390,6 +390,10 @@ class TestCamofoxVisionConfig:
             patch("tools.browser_camofox.open", create=True) as mock_open,
             patch("agent.auxiliary_client.call_llm", return_value=mock_response) as mock_llm,
             patch("tools.browser_camofox.load_config", return_value={"auxiliary": {"vision": {"temperature": 1, "timeout": 45}}}),
+            # The timeout now resolves through tools.vision_tools._resolve_vision_timeout,
+            # which reads the canonical hermes_cli.config.load_config rather than
+            # browser_camofox's module-local alias.
+            patch("hermes_cli.config.load_config", return_value={"auxiliary": {"vision": {"temperature": 1, "timeout": 45}}}),
         ):
             mock_open.return_value.__enter__.return_value.read.return_value = b"fakepng"
             result = json.loads(camofox_vision("what is on the page?", annotate=True, task_id="t11"))
@@ -422,6 +426,7 @@ class TestCamofoxVisionConfig:
             patch("tools.browser_camofox.open", create=True) as mock_open,
             patch("agent.auxiliary_client.call_llm", return_value=mock_response) as mock_llm,
             patch("tools.browser_camofox.load_config", return_value={"auxiliary": {"vision": {}}}),
+            patch("hermes_cli.config.load_config", return_value={"auxiliary": {"vision": {}}}),
         ):
             mock_open.return_value.__enter__.return_value.read.return_value = b"fakepng"
             result = json.loads(camofox_vision("what is on the page?", annotate=True, task_id="t12"))
@@ -429,7 +434,7 @@ class TestCamofoxVisionConfig:
         assert result["success"] is True
         assert result["analysis"] == "Default camofox screenshot analysis"
         assert mock_llm.call_args.kwargs["temperature"] == 0.1
-        assert mock_llm.call_args.kwargs["timeout"] == 120.0
+        assert mock_llm.call_args.kwargs["timeout"] == 60.0
 
 
 # ---------------------------------------------------------------------------

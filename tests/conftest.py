@@ -234,6 +234,10 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     # these, so production tests must not see them either.
     "HERMES_DASHBOARD_OAUTH_CLIENT_ID",
     "HERMES_DASHBOARD_PORTAL_URL",
+    # Per-attempt vision LLM timeout override. Resolved on every call (not
+    # cached at import), so a developer shell that exports it silently
+    # changes the timeout every vision/browser-vision test asserts on.
+    "HERMES_VISION_TIMEOUT",
     "TERMINAL_CWD",
     "TERMINAL_ENV",
     "TERMINAL_CONTAINER_CPU",

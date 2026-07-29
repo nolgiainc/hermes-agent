@@ -21,6 +21,7 @@ from tools.vision_tools import (
     _is_image_size_error,
     _MAX_BASE64_BYTES,
     _RESIZE_TARGET_BYTES,
+    _resolve_vision_timeout,
     vision_analyze_tool,
     check_vision_requirements,
 )
@@ -421,6 +422,64 @@ class TestErrorLoggingExcInfo:
             assert warning_records[0].exc_info is not None
 
 
+class TestResolveVisionTimeout:
+    """Per-attempt vision LLM timeout: env → config → default, then floor.
+
+    ``HERMES_VISION_TIMEOUT`` is scrubbed by the hermetic-environment fixture,
+    so the tests below that omit it are genuinely exercising the config layer.
+    """
+
+    def test_uses_default_when_unconfigured(self):
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"auxiliary": {"vision": {}}},
+        ):
+            assert _resolve_vision_timeout() == 60.0
+
+    def test_uses_config_override(self):
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"auxiliary": {"vision": {"timeout": 77}}},
+        ):
+            assert _resolve_vision_timeout() == 77.0
+
+    def test_env_override_wins_over_config(self, monkeypatch):
+        monkeypatch.setenv("HERMES_VISION_TIMEOUT", "45")
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"auxiliary": {"vision": {"timeout": 77}}},
+        ):
+            assert _resolve_vision_timeout() == 45.0
+
+    def test_env_below_floor_is_floored(self, monkeypatch):
+        monkeypatch.setenv("HERMES_VISION_TIMEOUT", "45")
+        assert _resolve_vision_timeout(default=180.0, floor=180.0) == 180.0
+
+    def test_config_below_floor_is_floored(self):
+        """video_analyze_tool's preserved semantic: an image-tuned config
+        value must not starve the (much larger) video payload.
+        """
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"auxiliary": {"vision": {"timeout": 60}}},
+        ):
+            assert _resolve_vision_timeout(default=180.0, floor=180.0) == 180.0
+
+    def test_config_above_floor_is_kept(self):
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"auxiliary": {"vision": {"timeout": 300}}},
+        ):
+            assert _resolve_vision_timeout(default=180.0, floor=180.0) == 300.0
+
+    def test_malformed_config_falls_back_to_default(self):
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"auxiliary": {"vision": {"timeout": "invalid"}}},
+        ):
+            assert _resolve_vision_timeout() == 60.0
+
+
 class TestVisionConfig:
     @pytest.mark.asyncio
     async def test_vision_uses_configured_temperature_and_timeout(self, tmp_path):
@@ -478,7 +537,7 @@ class TestVisionConfig:
 
         assert result["success"] is True
         assert mock_llm.await_args.kwargs["temperature"] == 0.1
-        assert mock_llm.await_args.kwargs["timeout"] == 120.0
+        assert mock_llm.await_args.kwargs["timeout"] == 60.0
 
 
 class TestVisionSafetyGuards:

@@ -1063,7 +1063,7 @@ auxiliary:
     model: ""                  # e.g. "openai/gpt-4o", "google/gemini-2.5-flash"
     base_url: ""               # Custom OpenAI-compatible endpoint (overrides provider)
     api_key: ""                # API key for base_url (falls back to OPENAI_API_KEY)
-    timeout: 120               # seconds — LLM API call timeout; vision payloads need generous timeout
+    timeout: 60                # seconds — per-attempt vision LLM call timeout (env: HERMES_VISION_TIMEOUT)
     download_timeout: 30       # seconds — image HTTP download; increase for slow connections
     max_concurrency: 8         # max concurrent image encode/resize bursts across the process
                                # (default: host CPU core count, no ceiling) — bounds only the
@@ -1147,7 +1147,7 @@ auxiliary:
 ```
 
 :::tip
-Each auxiliary task has a configurable `timeout` (in seconds). Defaults: vision 120s, web_extract 360s, approval 30s, compression 120s. Increase these if you use slow local models for auxiliary tasks. Vision also has a separate `download_timeout` (default 30s) for the HTTP image download — increase this for slow connections or self-hosted image servers.
+Each auxiliary task has a configurable `timeout` (in seconds). Defaults: vision 60s, web_extract 360s, approval 30s, compression 120s. Increase these if you use slow local models for auxiliary tasks. The vision timeout is per attempt and can also be set with `HERMES_VISION_TIMEOUT`; a vision call that times out is **not** retried on the same provider (it falls straight through to the fallback chain), so a stalled endpoint costs one budget rather than several. Vision also has a separate `download_timeout` (default 30s) for the HTTP image download — increase this for slow connections or self-hosted image servers.
 :::
 
 :::info

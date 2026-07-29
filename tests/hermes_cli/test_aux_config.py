@@ -126,10 +126,10 @@ def test_save_aux_choice_preserves_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     (tmp_path / ".hermes").mkdir(exist_ok=True)
 
-    # Default vision timeout is 120
+    # Default vision timeout is 60
     cfg_before = load_config()
     default_timeout = cfg_before["auxiliary"]["vision"]["timeout"]
-    assert default_timeout == 120
+    assert default_timeout == 60
 
     _save_aux_choice("vision", provider="nous", model="gemini-3-flash")
     cfg_after = load_config()

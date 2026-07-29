@@ -791,7 +791,7 @@ auxiliary:
     model: ""                  # 例如 "openai/gpt-4o"、"google/gemini-2.5-flash"
     base_url: ""               # 自定义 OpenAI 兼容端点（覆盖 provider）
     api_key: ""                # base_url 的 API 密钥（回退到 OPENAI_API_KEY）
-    timeout: 120               # 秒 —— LLM API 调用超时；视觉负载需要宽裕的超时
+    timeout: 60                # 秒 —— 每次视觉 LLM 调用的超时（环境变量：HERMES_VISION_TIMEOUT）
     download_timeout: 30       # 秒 —— 图像 HTTP 下载；慢速连接请增加
 
   # 网页摘要 + 浏览器页面文本提取
@@ -851,7 +851,7 @@ auxiliary:
 ```
 
 :::tip
-每个辅助任务都有可配置的 `timeout`（秒）。默认值：vision 120s、web_extract 360s、approval 30s、compression 120s。如果您为辅助任务使用慢速本地模型，请增加这些值。Vision 还有单独的 `download_timeout`（默认 30s）用于 HTTP 图像下载 —— 对于慢速连接或自托管图像服务器，请增加此值。
+每个辅助任务都有可配置的 `timeout`（秒）。默认值：vision 60s、web_extract 360s、approval 30s、compression 120s。如果您为辅助任务使用慢速本地模型，请增加这些值。Vision 还有单独的 `download_timeout`（默认 30s）用于 HTTP 图像下载 —— 对于慢速连接或自托管图像服务器，请增加此值。
 :::
 
 :::info
