@@ -849,11 +849,25 @@ class ResponseStore:
             self._conn.commit()
 
     def get_run_status(self, run_id: str) -> Optional[Dict[str, Any]]:
-        """Return a persisted terminal run status, or None."""
+        """Return a persisted, unexpired terminal run status, or None.
+
+        Retention is enforced here as well as in put_run_status: the write
+        path only prunes when a NEWER terminal status lands, so on a quiet
+        gateway an expired row would otherwise stay servable forever.
+        """
         with self._run_status_lock:
             row = self._conn.execute(
-                "SELECT data FROM run_statuses WHERE run_id = ?", (run_id,)
+                "SELECT data, updated_at FROM run_statuses WHERE run_id = ?",
+                (run_id,),
             ).fetchone()
+            if row is not None and (
+                time.time() - float(row[1] or 0) > self.RUN_STATUS_RETENTION_SECONDS
+            ):
+                self._conn.execute(
+                    "DELETE FROM run_statuses WHERE run_id = ?", (run_id,)
+                )
+                self._conn.commit()
+                row = None
         if row is None:
             return None
         try:
@@ -6042,8 +6056,18 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
 
-    def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
-        """Update pollable run status without exposing private agent objects."""
+    def _set_run_status(
+        self, run_id: str, status: str, durable: bool = True, **fields: Any
+    ) -> Dict[str, Any]:
+        """Update pollable run status without exposing private agent objects.
+
+        ``durable=False`` keeps a terminal status in memory only. Used for
+        teardown cancellations (gateway restart cancelling the
+        ``_run_and_close`` task): persisting that synthetic "cancelled"
+        would make the restarted gateway serve a durable terminal result
+        where the honest answer is 404 — the in-flight work was lost and the
+        caller should resubmit.
+        """
         now = time.time()
         current = self._run_statuses.get(run_id, {})
         current.update({
@@ -6055,7 +6079,7 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
-        if status in ("completed", "failed", "cancelled"):
+        if durable and status in ("completed", "failed", "cancelled"):
             # Mirror terminal statuses durably so a supervisor that lost the
             # run (budget timeout, restart on either side) can still salvage
             # the outcome from GET /v1/runs/{run_id} instead of re-executing
@@ -6436,9 +6460,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     _put_event_if_active(completed_event)
                     self._set_run_status(run_id, "completed", **completed_fields)
             except asyncio.CancelledError:
+                # A user /stop interrupts the agent and lets the run settle
+                # through the executor path; a CancelledError landing HERE is
+                # (aside from a stop racing teardown) the gateway shutting
+                # down mid-run. That work is lost — keep the terminal status
+                # in memory for late same-process pollers, but do NOT persist
+                # it: after the restart the honest answer is 404 (resubmit),
+                # not a durable "cancelled" that reads as a settled run.
                 self._set_run_status(
                     run_id,
                     "cancelled",
+                    durable=run_id in self._stopping_run_ids,
                     last_event="run.cancelled",
                 )
                 try:
