@@ -240,6 +240,30 @@ _GATEWAY_RATE_LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A malformed-PAYLOAD 400 — our assembled request was structurally invalid, NOT
+# a provider outage and NOT a policy/safety rejection. Moonshot/OpenAI/DeepSeek
+# emit these when the ``messages`` array is wrong: an empty-content user or
+# assistant message ("the message at position N with role 'user' must not be
+# empty" — NOL-216/NOL-106), an empty/duplicate ``tool_calls`` array, or an
+# orphaned function-call output. These 400s are non-retryable and the fix is on
+# OUR side — the pre-call sanitizer (agent.agent_runtime_helpers) now strips the
+# offending message so the next turn goes through — so the user-facing copy must
+# say "internal request error, retry", not the misleading "the model provider
+# failed after retries" (the provider is fine). Phrases are specific structural
+# signatures, so a genuine outage (HTTP 5xx / timeout) or a policy 400
+# (cybersecurity risk) never matches here.
+_GATEWAY_VALIDATION_ERROR_RE = re.compile(
+    r"("
+    r"must\s+not\s+be\s+empty"
+    r"|message\s+at\s+position\s+\d+"
+    r"|invalid\s+'?messages\b"
+    r"|expected\s+an\s+array\s+with\s+minimum\s+length"
+    r"|duplicate\s+value\s+for\s+'?tool_call_id"
+    r"|no\s+tool\s+call\s+found\s+for\s+function\s+call\s+output"
+    r")",
+    re.IGNORECASE,
+)
+
 _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_\-]{12,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
@@ -490,6 +514,15 @@ def _gateway_provider_error_reply(text: str) -> str:
         )
     if _GATEWAY_RATE_LIMIT_RE.search(text):
         return "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."
+    if _GATEWAY_VALIDATION_ERROR_RE.search(text):
+        # Malformed-payload 400: our side, not a provider outage. The pre-call
+        # sanitizer strips the offending message, so a resend should succeed.
+        return (
+            "⚠️ I hit an internal error building the request to the model (a "
+            "malformed message in the conversation), not a provider outage. I've "
+            "sanitized the history — please resend and it should go through. "
+            "Diagnostics are in the gateway logs."
+        )
     return (
         "⚠️ The model provider failed after retries. I kept raw provider details "
         "out of chat; check gateway logs for diagnostics."
