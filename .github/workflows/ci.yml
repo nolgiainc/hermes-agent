@@ -110,6 +110,14 @@ jobs:
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/contributor-check.yml
 
+  # Gates commit messages, not files, so it is deliberately NOT gated on
+  # detect's path classification, only on the event being a pull request.
+  commit-attribution:
+    name: Commit attribution
+    needs: detect
+    if: needs.detect.outputs.event_name == 'pull_request'
+    uses: ./.github/workflows/commit-attribution-check.yml
+
   uv-lockfile:
     name: Check uv.lock
     needs: detect
@@ -179,7 +187,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   comment-live:
     name: CI review comment (live)
-    needs: [detect, review-labels, lockfile-diff, supply-chain, osv-scanner, uv-lockfile, history-check, contributor-check, e2e-desktop]
+    needs: [detect, review-labels, lockfile-diff, supply-chain, osv-scanner, uv-lockfile, history-check, contributor-check, commit-attribution, e2e-desktop]
     if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork != true
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 40
@@ -264,6 +272,7 @@ jobs:
       - docs-site
       - history-check
       - contributor-check
+      - commit-attribution
       - uv-lockfile
       - lockfile-diff
       - docker-lint
