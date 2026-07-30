@@ -447,6 +447,19 @@ def _inject_session_context_env(env: dict) -> None:
             # inherited global so a sibling session's value can't leak in.
             env.pop(var_name, None)
 
+    # Run-scoped Nolgia platform token: when bound for THIS task, override the
+    # pod-wide NOLGIA_TOKEN for the child so bash-invoked platform tooling
+    # (the nolgia CLI) authenticates as the causing run — the piece that lets
+    # the platform attribute each concurrent run's generations to the right
+    # turn. Unbound leaves the pod-wide value untouched (today's behavior).
+    # Safe against the shared-snapshot leak channel: the snapshot filter
+    # (tools/environments/base._SNAPSHOT_EXCLUDED_ENV_REGEX) excludes
+    # NOLGIA_TOKEN, so this per-command override can never persist into the
+    # shared shell snapshot and be sourced by a sibling run's commands.
+    scoped_nolgia_token = env.get("HERMES_SESSION_NOLGIA_TOKEN", "")
+    if scoped_nolgia_token:
+        env["NOLGIA_TOKEN"] = scoped_nolgia_token
+
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""

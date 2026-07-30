@@ -120,6 +120,17 @@ _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_P
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# Run-scoped Nolgia platform token. On the Nolgia platform relay, each
+# submitted run may carry its own short-lived credential so the platform can
+# attribute every outbound call (asset uploads, generation) to the exact run
+# that caused it — the pod-wide NOLGIA_TOKEN cannot distinguish concurrent
+# runs. Read by gateway.platforms.nolgia_assets (session var first, pod env
+# fallback) and bridged into tool subprocesses as NOLGIA_TOKEN via the
+# session-context env bridge. The HERMES_SESSION_ prefix is load-bearing:
+# it keeps the value task-scoped (no sibling-run leak: _UNSET strips) and
+# excluded from the shared shell snapshot (_SNAPSHOT_EXCLUDED_ENV_REGEX).
+_SESSION_NOLGIA_TOKEN: ContextVar = ContextVar("HERMES_SESSION_NOLGIA_TOKEN", default=_UNSET)
+
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
@@ -137,6 +148,7 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
+    "HERMES_SESSION_NOLGIA_TOKEN": _SESSION_NOLGIA_TOKEN,
 }
 
 
@@ -171,6 +183,7 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    nolgia_token: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -207,6 +220,7 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _SESSION_NOLGIA_TOKEN.set(nolgia_token),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -242,6 +256,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _SESSION_NOLGIA_TOKEN,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a
@@ -301,6 +316,26 @@ def reset_session_vars() -> None:
         from agent.runtime_cwd import clear_session_cwd
 
         clear_session_cwd()
+    except Exception:
+        pass
+
+
+def set_session_nolgia_token(token: str):
+    """Bind the run-scoped Nolgia platform token in THIS context.
+
+    For code paths that need the token OUTSIDE a full ``set_session_vars``
+    binding — e.g. the API server's post-run egress hop, which runs on the
+    request task after the executor thread's session binding was already
+    cleared. Returns the ContextVar reset token; pass it to
+    :func:`reset_session_nolgia_token` in a ``finally`` block.
+    """
+    return _SESSION_NOLGIA_TOKEN.set(token)
+
+
+def reset_session_nolgia_token(reset_token) -> None:
+    """Undo :func:`set_session_nolgia_token`; never raises."""
+    try:
+        _SESSION_NOLGIA_TOKEN.reset(reset_token)
     except Exception:
         pass
 
