@@ -91,10 +91,14 @@ _COMPLETE_TIMEOUT_SECONDS = 300.0
 _MAX_UPLOADS_PER_MESSAGE = 6
 _UPLOAD_WALL_BUDGET_SECONDS = 120.0
 
-# (resolved path, mtime_ns, size) → asset id. Repeat deliveries of the
-# same unchanged file (within a message or across turns in this process)
-# reuse the already-uploaded asset instead of re-uploading.
-_asset_cache: Dict[Tuple[str, int, int], str] = {}
+# (resolved path, mtime_ns, size, token fingerprint) → asset id. Repeat
+# deliveries of the same unchanged file (within a message or across turns
+# in this process) reuse the already-uploaded asset instead of re-uploading.
+# The token FINGERPRINT dimension matters with run-scoped credentials: an
+# asset uploaded under run A's turn token is attributed to run A's turn, so
+# run B must not reuse it — B re-uploads under its own token and gets its
+# own correctly-attributed asset.
+_asset_cache: Dict[Tuple[str, int, int, str], str] = {}
 _asset_cache_lock = threading.Lock()
 
 # All extensions the shared tag matcher recognizes (lowercased, for
@@ -106,6 +110,36 @@ _DELIVERABLE_EXT_SUFFIXES: Tuple[str, ...] = tuple(ext.lower() for ext in MEDIA_
 _INTRA_PATH_WHITESPACE_RE = re.compile(r"[^\S\n]+")
 
 
+def _platform_token() -> str:
+    """The credential for platform calls: the RUN-scoped token when bound, else pod env.
+
+    A run submitted with a ``nolgia_token`` (turn-scoped attribution
+    credential) binds it as the ``HERMES_SESSION_NOLGIA_TOKEN`` session
+    context var; platform calls made on that run's task (or in threads the
+    task context propagates to — ``asyncio.to_thread`` copies context) then
+    authenticate as the causing turn. Everything else falls back to the
+    pod-wide ``NOLGIA_TOKEN`` exactly as before.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        scoped = get_session_env("HERMES_SESSION_NOLGIA_TOKEN", "").strip()
+        if scoped:
+            return scoped
+    except Exception:
+        pass
+    return os.environ.get("NOLGIA_TOKEN", "").strip()
+
+
+def _token_fingerprint(token: str) -> str:
+    """Short non-reversible cache-key dimension for the active credential."""
+    import hashlib
+
+    if not token:
+        return ""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
 def resolver_enabled() -> bool:
     """True when platform credentials are present and the resolver isn't opted out.
 
@@ -113,7 +147,8 @@ def resolver_enabled() -> bool:
     container by the platform deployment chart, so presence of both is the
     platform-mode signal (env is deployment-owned and changes on every
     roll, unlike the PVC-persisted config.yaml). ``NOLGIA_MEDIA_RESOLVER=0``
-    is the operator escape hatch.
+    is the operator escape hatch. The gate deliberately stays on the POD
+    env (not the run-scoped token): platform mode is a deployment property.
     """
     if os.environ.get("NOLGIA_MEDIA_RESOLVER", "").strip() == "0":
         return False
@@ -130,7 +165,7 @@ def _api_base() -> str:
 
 def _http_json(method: str, path: str, payload: Optional[dict], timeout: float) -> dict:
     """Authenticated JSON round trip against the platform API."""
-    headers = {"Authorization": "Bearer " + os.environ.get("NOLGIA_TOKEN", "").strip()}
+    headers = {"Authorization": "Bearer " + _platform_token()}
     data = None
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
@@ -270,7 +305,7 @@ def _resolve_tag(raw_path: str, budget: _MessageBudget) -> str:
         )
         return fallback
 
-    cache_key = (str(resolved), stat.st_mtime_ns, stat.st_size)
+    cache_key = (str(resolved), stat.st_mtime_ns, stat.st_size, _token_fingerprint(_platform_token()))
     with _asset_cache_lock:
         cached = _asset_cache.get(cache_key)
     if cached:

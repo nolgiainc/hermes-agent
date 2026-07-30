@@ -397,9 +397,14 @@ def _cwd_marker(session_id: str) -> str:
 # set), not Hermes' per-turn session identity.
 #
 # Kept in sync with gateway.session_context._VAR_MAP: every bridged name starts
-# with one of these prefixes.
+# with one of these prefixes. NOLGIA_TOKEN= (exact name) is excluded for the
+# same reason: with run-scoped platform tokens the bridge overrides it
+# per-command, and a snapshot capturing one run's override would hand that
+# run's credential — and its causal attribution — to every sibling run's
+# later commands. The pod-wide value keeps flowing to children through plain
+# env inheritance regardless; only snapshot PERSISTENCE is suppressed.
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)"
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|NOLGIA_TOKEN=)"
 )
 
 

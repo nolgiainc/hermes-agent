@@ -2943,6 +2943,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events_sse": True,
                 "run_stop": True,
                 "run_steer": True,
+                # POST /v1/runs accepts a run-scoped Nolgia platform token
+                # ("nolgia_token") and binds it to the run's session context:
+                # the run's platform egress (asset uploads) and tool
+                # subprocesses (the nolgia CLI) then authenticate as the
+                # causing turn. The platform relay keys per-user concurrent
+                # turn execution on this flag.
+                "nolgia_run_token": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -5812,6 +5819,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        nolgia_token: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -5827,6 +5835,12 @@ class APIServerAdapter(BasePlatformAdapter):
         ``finally`` block (the binding is request-scoped and must not outlive
         the turn — a session resumed later on a delivering interface, e.g. the
         CLI or a gateway platform, re-binds fresh and is NOT blocked).
+
+        ``nolgia_token`` is the run-scoped Nolgia platform credential (see
+        ``HERMES_SESSION_NOLGIA_TOKEN`` in gateway.session_context): platform
+        egress and tool subprocesses of THIS run then authenticate as the
+        causing turn instead of the pod-wide bearer. Empty means "no run
+        scoping" — everything falls back to pod env exactly as before.
         """
         from gateway.session_context import set_session_vars
 
@@ -5836,6 +5850,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_key=session_key,
             session_id=session_id,
             async_delivery=False,
+            nolgia_token=nolgia_token,
         )
 
     async def _run_agent(
@@ -6215,6 +6230,28 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         session_id = body.get("session_id") or stored_session_id
+
+        # Run-scoped Nolgia platform credential (turn-scoped attribution):
+        # the platform relay may hand each run its own short-lived token so
+        # the run's platform calls (asset uploads, generation via the nolgia
+        # CLI) name the exact turn that caused them — required for the
+        # platform to execute a user's turns concurrently without
+        # cross-attributing their output. Validated like the session-key
+        # header (printable, no CR/LF/NUL, bounded) and NEVER logged; an
+        # empty/absent value keeps the pod-wide NOLGIA_TOKEN behavior.
+        raw_nolgia_token = body.get("nolgia_token")
+        nolgia_token = ""
+        if raw_nolgia_token is not None:
+            if not isinstance(raw_nolgia_token, str):
+                return web.json_response(
+                    _openai_error("'nolgia_token' must be a string"), status=400
+                )
+            nolgia_token = raw_nolgia_token.strip()
+            if len(nolgia_token) > 512 or re.search(r"[\r\n\x00]", nolgia_token):
+                return web.json_response(
+                    _openai_error("'nolgia_token' is malformed"), status=400
+                )
+
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
         selection_error = self._request_route_conflict_error(
@@ -6366,6 +6403,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 chat_id=session_id or "",
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
+                                nolgia_token=nolgia_token,
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             r = agent.run_conversation(
@@ -6434,7 +6472,24 @@ class APIServerAdapter(BasePlatformAdapter):
                         # as pending_steer on this same completion and the
                         # caller re-sends it as a new run, so this single
                         # hook covers steer continuations too.
-                        final_response = await _resolve_media_tags_to_platform_assets(final_response)
+                        #
+                        # This hop runs on the request task, AFTER _run_sync's
+                        # session binding was cleared in its executor thread,
+                        # so the run-scoped platform token must be re-bound
+                        # here for the uploads to attribute to THIS run
+                        # (asyncio.to_thread copies the task context).
+                        _nolgia_token_reset = None
+                        if nolgia_token:
+                            from gateway.session_context import set_session_nolgia_token
+
+                            _nolgia_token_reset = set_session_nolgia_token(nolgia_token)
+                        try:
+                            final_response = await _resolve_media_tags_to_platform_assets(final_response)
+                        finally:
+                            if _nolgia_token_reset is not None:
+                                from gateway.session_context import reset_session_nolgia_token
+
+                                reset_session_nolgia_token(_nolgia_token_reset)
                     completed_event = {
                         "event": "run.completed",
                         "run_id": run_id,
