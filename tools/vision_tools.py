@@ -121,6 +121,92 @@ def _resolve_vision_timeout(
 _VISION_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
 
 
+import threading
+
+# ---------------------------------------------------------------------------
+# Consecutive-timeout loop guard (NOL-197)
+# ---------------------------------------------------------------------------
+# Measured on a live production pod (NOL-151 run): 6 of 15 vision_analyze
+# calls timed out at ~68s each, and the agent's response to each timeout was
+# to downsize the same contact sheet and resubmit — full res, 1400px, 1024px
+# all burned the entire per-attempt budget, ~7 minutes of a 16.6-minute tail,
+# before it finally switched to single frames (which mostly succeed). The
+# structured error alone did not tell the model that a THIRD resolution of an
+# image the route just proved it cannot analyze within budget is not a new
+# experiment. This guard does: after _VISION_TIMEOUT_SWITCH_AT consecutive
+# timeouts the error's analysis text orders the strategy switch outright.
+#
+# Process-wide by design (a threading.Lock, not per-session): concurrent
+# vision calls run on per-thread event loops (see the CPU-cap note below),
+# and every session in the process shares one auxiliary vision route — two
+# consecutive full-budget burns are evidence about the ROUTE, whoever made
+# them. Any success resets the streak.
+_VISION_TIMEOUT_SWITCH_AT = 2
+_vision_timeout_streak_lock = threading.Lock()
+_vision_timeout_streak = 0
+
+
+def _is_vision_timeout(exc: Exception) -> bool:
+    """A full-budget request timeout, as the auxiliary router classifies it
+    (same predicate family as auxiliary_client._is_timeout_error)."""
+    try:
+        from openai import APITimeoutError
+        if isinstance(exc, APITimeoutError):
+            return True
+    except ImportError:
+        pass
+    if "Timeout" in type(exc).__name__:
+        return True
+    return "timed out" in str(exc).lower()
+
+
+def _record_vision_timeout() -> int:
+    """Advance the consecutive-timeout streak; returns the new count."""
+    global _vision_timeout_streak
+    with _vision_timeout_streak_lock:
+        _vision_timeout_streak += 1
+        return _vision_timeout_streak
+
+
+def _reset_vision_timeout_streak() -> None:
+    global _vision_timeout_streak
+    with _vision_timeout_streak_lock:
+        _vision_timeout_streak = 0
+
+
+def _vision_timeout_analysis(exc: Exception, streak: int,
+                             timeout: float) -> str:
+    """The analysis text for a timed-out vision call — streak-aware so the
+    second consecutive burn says 'switch strategy', not just 'it failed'."""
+    if streak >= _VISION_TIMEOUT_SWITCH_AT:
+        return (
+            f"Vision request timed out after its {timeout:.0f}s per-attempt "
+            f"budget — the {_ordinal(streak)} consecutive vision timeout. "
+            "STOP: do not resize this image and retry — an image class that "
+            "has timed out twice will keep timing out at any resolution "
+            "(dense composites like contact sheets, grids and collages are "
+            "the classic case). Switch strategy NOW: analyze single small "
+            "frames one at a time (those fit the budget), or record this "
+            "check as 'QC unavailable — vision timeout' and continue the "
+            f"task. Error: {exc}"
+        )
+    return (
+        f"Vision request timed out after its {timeout:.0f}s per-attempt "
+        "budget. One more attempt on this image is reasonable (a smaller "
+        "or simpler version helps); if that also times out, stop retrying "
+        "this image class and switch strategy — single small frames, or "
+        f"record the check as unavailable and continue. Error: {exc}"
+    )
+
+
+def _ordinal(n: int) -> str:
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
 # ---------------------------------------------------------------------------
 # CPU-burst concurrency cap (vision encode/resize)
 # ---------------------------------------------------------------------------
@@ -1331,21 +1417,33 @@ async def vision_analyze_tool(
         
         debug_call_data["success"] = True
         debug_call_data["analysis_length"] = analysis_length
-        
+
+        # A successful call proves the route is serving requests again —
+        # the consecutive-timeout streak resets (NOL-197).
+        _reset_vision_timeout_streak()
+
         # Log debug information
         _debug.log_call("vision_analyze_tool", debug_call_data)
         _debug.save()
-        
+
         return json.dumps(result, indent=2, ensure_ascii=False)
-        
+
     except Exception as e:
         error_msg = f"Error analyzing image: {str(e)}"
         logger.error("%s", error_msg, exc_info=True)
-        
+
         # Detect vision capability errors — give the model a clear message
         # so it can inform the user instead of a cryptic API error.
         err_str = str(e).lower()
-        if any(hint in err_str for hint in (
+        if _is_vision_timeout(e):
+            # Streak-aware timeout guidance (NOL-197): the second
+            # consecutive full-budget burn orders the strategy switch
+            # instead of letting the model resize and resubmit a third
+            # resolution of an image the route cannot analyze in budget.
+            streak = _record_vision_timeout()
+            analysis = _vision_timeout_analysis(
+                e, streak, _resolve_vision_timeout())
+        elif any(hint in err_str for hint in (
             "402", "insufficient", "payment required", "credits", "billing",
         )):
             analysis = (
