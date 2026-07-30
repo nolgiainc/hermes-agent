@@ -16,37 +16,41 @@ name: Commit Attribution Check
 #   contributor-check.yml -> is the commit AUTHOR a mapped contributor?
 #   this workflow         -> does the commit BODY credit a third party?
 #
-# Deliberately standalone rather than a `workflow_call` job wired into ci.yml's
-# `all-checks-pass`: the jobs there are gated on `detect`'s path classification,
-# and this must never be skipped on the basis of which files a PR touches. It
-# gates commit messages, not files. Nothing in ci.yml or contributor-check.yml
-# is modified by adding it.
+# Wired into ci.yml as a `workflow_call` job and listed in `all-checks-pass`,
+# because branch protection requires only that aggregate gate: a standalone
+# workflow would go red without blocking the merge. It is gated the same way
+# `history-check` is (`event_name == 'pull_request'`, no path classification),
+# so it can never be skipped on the basis of which files a PR touches. It
+# gates commit messages, not files.
 #
 # Scope is deliberately narrow: only the `Co-authored-by:` TRAILER form is a
 # violation. Ordinary prose mentioning Claude or Anthropic is legitimate and
-# frequent here (the Anthropic adapter, Claude model classification), so the
-# pattern is anchored to the start of a trailer line and never judges prose.
-# A check that fires on real work gets switched off, which protects nothing.
+# frequent here (the Anthropic adapter, Claude model classification), so
+# candidate lines are run through `git interpret-trailers --parse` and only
+# real, git-recognised trailers are judged. A check that fires on real work
+# gets switched off, which protects nothing.
 #
 # Prevention only. Existing history is deliberately left alone — stripping the
 # trailers already merged would mean force-pushing the default branch and
 # invalidating every clone for a cosmetic gain.
 
 on:
-  pull_request:
+  workflow_call:
+    outputs:
+      review_status:
+        description: "JSON array of review_status objects for the synthesizer."
+        value: ${{ jobs.attribution.outputs.review_status }}
 
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   attribution:
     name: No third-party attribution trailers
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
+    outputs:
+      review_status: ${{ steps.check.outputs.review_status }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -54,27 +58,51 @@ jobs:
           fetch-depth: 0 # full history: the check walks the PR's commit range
 
       - name: Reject Claude/Anthropic Co-authored-by trailers
+        id: check
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -uo pipefail
 
+          # End the range at the PR head, not at HEAD. On `pull_request` the
+          # checkout is the synthetic `refs/pull/N/merge` commit, which is a
+          # merge commit that belongs to no author, so bounding to head.sha drops
+          # it without having to drop every merge commit, so merge commits the
+          # PR actually introduces are still inspected below.
+          if git rev-parse --verify --quiet "${HEAD_SHA}^{commit}" >/dev/null; then
+            TIP="$HEAD_SHA"
+          else
+            TIP=HEAD
+          fi
+
           if git rev-parse --verify --quiet "origin/$BASE_REF" >/dev/null; then
-            RANGE_START=$(git merge-base "origin/$BASE_REF" HEAD)
+            RANGE_START=$(git merge-base "origin/$BASE_REF" "$TIP")
           else
             RANGE_START="$BASE_SHA"
           fi
 
-          COMMITS=$(git log --no-merges --format=%H "$RANGE_START..HEAD")
+          # No --no-merges: a hand-rolled merge commit can carry a trailer in
+          # its body just like any other commit.
+          COMMITS=$(git log --format=%H "$RANGE_START..$TIP")
           if [ -z "$COMMITS" ]; then
-            echo "No non-merge commits in range — nothing to check."
+            echo "No commits in range: nothing to check."
+            echo "review_status=[]" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           FAILED=0
           for sha in $COMMITS; do
-            HITS=$(git log -1 --format=%B "$sha" | grep -Ei '^Co-authored-by:.*(claude|anthropic)' || true)
+            # Match git's own notion of a trailer rather than raw %B text.
+            # `--parse` (= --only-trailers --only-input --unfold) yields the
+            # normalised `Token: value` lines of the trailer block only, so
+            # `Co-authored-by : Claude ...` (a real trailer git accepts) is
+            # caught, while a body that merely quotes the trailer form and then
+            # continues in prose is not a trailer and is left alone.
+            HITS=$(git log -1 --format=%B "$sha" \
+              | git interpret-trailers --parse \
+              | grep -Ei '^co-authored-by:.*(claude|anthropic)' || true)
             if [ -n "$HITS" ]; then
               FAILED=1
               echo "::error::${sha} carries a disallowed attribution trailer"
@@ -84,6 +112,7 @@ jobs:
           done
 
           if [ "$FAILED" -ne 0 ]; then
+            echo 'review_status=[{"source":"commit attribution","results":[{"kind":"action_required","title":"Third-party attribution trailer","summary":"A commit on this branch carries a Claude/Anthropic Co-authored-by trailer.","detail":"","how_to_fix":"Reword the offending commit(s) on this PR branch, then update it:\n```\ngit rebase -i '"$RANGE_START"'\n```\nNever rewrite a default branch to fix this.\n"}]}]' >> "$GITHUB_OUTPUT"
             echo ""
             echo "Org commits carry no third-party attribution."
             echo "Reword the offending commit(s) on this PR branch and update it:"
@@ -92,4 +121,5 @@ jobs:
             exit 1
           fi
 
-          echo "OK — no Claude/Anthropic Co-authored-by trailers in $(git log --no-merges --oneline "$RANGE_START..HEAD" | wc -l | tr -d ' ') commit(s)."
+          echo "review_status=[]" >> "$GITHUB_OUTPUT"
+          echo "OK: no Claude/Anthropic Co-authored-by trailers in $(echo "$COMMITS" | wc -l | tr -d ' ') commit(s)."
