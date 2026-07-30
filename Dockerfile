@@ -360,6 +360,31 @@ RUN bash -lc 'test "$(command -v python3)" = /opt/hermes/.venv/bin/python3 && \
     su -s /bin/bash hermes -c 'bash -lc "test \"\$(command -v python3)\" = /opt/hermes/.venv/bin/python3 && \
         python3 -c \"import PIL\" && command -v bc >/dev/null && command -v montage >/dev/null"'
 
+# ---------- /opt/data/bin on the login-shell PATH (Nolgia fork addition) ----------
+# gh and the pinned nolgia CLI (NOL-80) are provisioned into /opt/data/bin at
+# runtime, but that dir was on the default PATH in NEITHER login nor non-login
+# shells, so the daily org-repo-sync cron — which runs in a login shell —
+# failed every run with `gh: command not found`, which the script misreported
+# as a "gh auth / network" error (NOL-215). The zz-hermes-path.sh snippet above
+# now also prepends /opt/data/bin; this pins that it lands. /opt/data is a
+# runtime volume, empty at build time, so the real binaries are absent here —
+# we stub gh+nolgia into /opt/data/bin, prove a login shell resolves them from
+# the exact shell shape the cron and the agent exec tool use (root AND the
+# hermes user), then a negative control moves the snippet aside and shows the
+# same login shell can no longer find them (pinning the profile.d prepend as
+# the fix), and finally remove the stubs. The runtime volume mounts over
+# /opt/data, so nothing staged here reaches production.
+RUN mkdir -p /opt/data/bin && \
+    for c in gh nolgia; do printf '#!/bin/sh\nexit 0\n' > /opt/data/bin/"$c" && chmod 0755 /opt/data/bin/"$c"; done && \
+    bash -lc 'command -v gh >/dev/null && command -v nolgia >/dev/null' && \
+    su -s /bin/bash hermes -c 'bash -lc "command -v gh >/dev/null && command -v nolgia >/dev/null"' && \
+    mv /etc/profile.d/zz-hermes-path.sh /tmp/zz-hermes-path.sh && \
+    if bash -lc 'command -v gh >/dev/null 2>&1'; then \
+        echo "NOL-215 negative control failed: /opt/data/bin on PATH without the profile.d snippet" >&2; exit 1; \
+    fi && \
+    mv /tmp/zz-hermes-path.sh /etc/profile.d/zz-hermes-path.sh && \
+    rm -rf /opt/data/bin
+
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
 # --link decouples this layer from parents for cache purposes; --chmod bakes
