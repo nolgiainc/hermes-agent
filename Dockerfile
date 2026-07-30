@@ -296,6 +296,70 @@ RUN UV_TOOL_BIN_DIR=/usr/local/bin \
     uv tool install --python /usr/bin/python3 yt-dlp==2026.7.4 && \
     yt-dlp --version
 
+# ---------- Production QC toolchain (Nolgia fork addition) ----------
+# The preset-production pipeline assumes these exist on every pod; when they
+# are missing, runs re-install them mid-production (NOL-132's raw-shell
+# emblem, `uv pip install ... Pillow`) or lose whole QC passes (NOL-151 /
+# session 8050af4b lost its first frame-extraction pass to `bc: command not
+# found` and rewrote the contact-sheet loop in Python because `montage` was
+# absent). Baked in so no production pays that cost again (NOL-199):
+#   - bc — ffmpeg midpoint arithmetic in QC frame extraction
+#   - imagemagick — `montage` contact sheets, `convert`/`identify` QC probes
+#     (Debian 13's package is IM7 with the classic-name compat links, so both
+#     `magick` and `convert`/`montage` spellings work)
+#   - fonts-dejavu-core / fonts-liberation — productions probe fc-list for
+#     exactly these families for end cards; today they arrive only
+#     transitively (Playwright's --with-deps), so declare them instead of
+#     inheriting them from another layer's dependency tree.
+# Pillow is deliberately NOT installed here: it has been a core hermes
+# dependency (pyproject.toml `Pillow==12.2.0`) since 2026-06-06, so the
+# `uv sync` layer above already bakes it into /opt/hermes/.venv — which is
+# what `python3` resolves to at runtime (the venv leads PATH below; the
+# profile.d snippet installed after this layer keeps that true in login
+# shells too, which is where the agent actually ran `import PIL` and
+# failed). The assert pins that guarantee: if a future dependency change
+# drops Pillow from the venv, the build fails here instead of shipping pods
+# that re-grow mid-run venvs. Loading a real DejaVu face through ImageFont
+# doubles as the end-card self-test — Pillow and the font it renders with,
+# together. The venv path is absolute because the runtime PATH ENV is
+# declared later in this file and build-stage RUNs never see it.
+RUN apt-get -o Acquire::Retries=3 update && \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+        bc imagemagick fonts-dejavu-core fonts-liberation && \
+    rm -rf /var/lib/apt/lists/* && \
+    bc --version && \
+    convert -version && \
+    montage -version && \
+    identify -version && \
+    /opt/hermes/.venv/bin/python3 -c "import PIL; \
+from PIL import Image, ImageDraw, ImageFont; \
+ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 24); \
+print('Pillow', PIL.__version__)"
+
+# ---------- Login-shell PATH restore (Nolgia fork addition) ----------
+# The ENV PATH declared at the bottom of this file is what makes `python3`
+# resolve to the hermes venv — but Debian's /etc/profile unconditionally
+# resets PATH, and the agent's exec tool runs every command under a
+# login-shell environment (tools/environments/base.py captures a `bash -l`
+# env snapshot per session). Net effect on the fleet: agent commands saw
+# the bare distro PATH, `python3` fell back to the system interpreter, and
+# `import PIL` failed mid-run on pods whose venv had carried Pillow all
+# along (NOL-199, session 8050af4b on pod cust-f0d3d0be — verified live:
+# `bash -lc 'command -v python3'` returned /usr/bin/python3 while plain
+# `bash -c` returned the venv python). /etc/profile.d/ is empty in the base
+# image and is sourced after /etc/profile's PATH assignment, so a drop-in
+# snippet restores the intended PATH for root and the hermes user alike.
+# The asserts prove the whole NOL-199 toolchain — venv python3 with PIL,
+# bc, montage — is visible from exactly the shell shape the agent uses,
+# including the runtime user's (`su` sources the snippet via its own login
+# machinery; the inner `bash -lc` mirrors s6-setuidgid + bash -l at
+# runtime).
+COPY --chmod=0644 docker/profile.d/zz-hermes-path.sh /etc/profile.d/zz-hermes-path.sh
+RUN bash -lc 'test "$(command -v python3)" = /opt/hermes/.venv/bin/python3 && \
+        python3 -c "import PIL" && command -v bc >/dev/null && command -v montage >/dev/null' && \
+    su -s /bin/bash hermes -c 'bash -lc "test \"\$(command -v python3)\" = /opt/hermes/.venv/bin/python3 && \
+        python3 -c \"import PIL\" && command -v bc >/dev/null && command -v montage >/dev/null"'
+
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
 # --link decouples this layer from parents for cache purposes; --chmod bakes
