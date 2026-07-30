@@ -8,6 +8,7 @@ from agent.conversation_compression import (
 )
 from gateway.config import Platform
 from gateway.run import (
+    _gateway_provider_error_reply,
     _prepare_gateway_status_message,
     _sanitize_gateway_final_response,
 )
@@ -306,6 +307,47 @@ def test_telegram_final_response_redacts_auth_secrets():
     assert "authentication failed" in sanitized.lower()
     assert "check the configured credentials" in sanitized.lower()
     assert "sk-live" not in sanitized
+
+
+def test_telegram_final_response_distinguishes_validation_400_from_outage():
+    """A malformed-payload 400 (NOL-216) must NOT read as a provider outage.
+
+    The founder's wedged thread returned "The model provider failed after
+    retries" for what was really our own empty-user-message 400 — the provider
+    was fine, our payload was malformed. The non-retryable-validation-400 path
+    now surfaces truthful, actionable copy (internal request error, resend),
+    kept distinct from a genuine provider outage, with raw provider detail still
+    kept out of chat.
+    """
+    raw = (
+        "API call failed after 3 retries: HTTP 400 MoonshotException - Invalid "
+        "request: the message at position 715 with role 'user' must not be empty"
+    )
+
+    sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, raw)
+
+    low = sanitized.lower()
+    assert "internal error" in low or "malformed" in low
+    assert "resend" in low or "try again" in low
+    assert "provider failed after retries" not in low  # the misleading copy is gone
+    assert "must not be empty" not in low               # raw detail stays out of chat
+    assert "715" not in sanitized
+
+
+def test_provider_error_reply_validation_vs_outage_copy():
+    """Unit: the reply mapper separates validation 400s from genuine outages."""
+    validation = _gateway_provider_error_reply(
+        "HTTP 400: the message at position 12 with role 'user' must not be empty"
+    )
+    assert "provider failed after retries" not in validation.lower()
+    assert (
+        "malformed" in validation.lower() or "internal error" in validation.lower()
+    )
+
+    outage = _gateway_provider_error_reply(
+        "API call failed after 3 retries: HTTP 503 Service Unavailable"
+    )
+    assert "provider failed after retries" in outage.lower()
 
 
 def test_telegram_final_response_keeps_normal_answers():

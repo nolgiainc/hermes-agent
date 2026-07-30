@@ -3080,6 +3080,17 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     # preserved: strict thinking providers (Kimi/DeepSeek) require the
     # reasoning_content echo, and those turns are handled by
     # _is_thinking_only_assistant, not here.
+    #
+    # NOL-216: the identical permanent-wedge shape occurs on the USER side. An
+    # empty-content user message (content ``""`` / whitespace-only / an empty
+    # list) reaches here from an interrupted or aborted turn, a host-fed history,
+    # or a bare re-send. Moonshot rejects it with the SAME non-retryable HTTP 400
+    # ("the message at position N with role 'user' must not be empty"), which
+    # re-poisons every subsequent turn exactly like the assistant case. An empty
+    # user message is never legitimate to send, so drop it in this same pass —
+    # the adjacent-user merge below then repairs any ``user, user`` seam the drop
+    # leaves behind. Multimodal user turns whose text is empty but which carry
+    # image/other content parts are NOT empty and are kept.
     def _assistant_has_payload(m: Dict[str, Any]) -> bool:
         content = m.get("content")
         if isinstance(content, str):
@@ -3101,8 +3112,19 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 return True
         return False
 
+    def _user_has_content(m: Dict[str, Any]) -> bool:
+        content = m.get("content")
+        if isinstance(content, str):
+            return bool(content.strip())
+        if isinstance(content, list):
+            # Multimodal: any non-empty part (text, image, ...) counts.
+            return any(part for part in content)
+        # A non-str/non-list, non-empty content value (rare) is left as-is.
+        return content not in (None, "")
+
     kept: List[Dict[str, Any]] = []
     dropped_empty_assistants = 0
+    dropped_empty_users = 0
     for msg in messages:
         if (
             isinstance(msg, dict)
@@ -3111,8 +3133,15 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
         ):
             dropped_empty_assistants += 1
             continue
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "user"
+            and not _user_has_content(msg)
+        ):
+            dropped_empty_users += 1
+            continue
         kept.append(msg)
-    if dropped_empty_assistants:
+    if dropped_empty_assistants or dropped_empty_users:
         live_call_ids: set = set()
         for msg in kept:
             if isinstance(msg, dict) and msg.get("role") == "assistant":
@@ -3153,9 +3182,11 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             merged.append(msg)
         messages = merged
         _ra().logger.debug(
-            "Pre-call sanitizer: dropped %d empty assistant message(s), swept "
-            "their now-orphaned tool result(s), merged adjacent user turns",
+            "Pre-call sanitizer: dropped %d empty assistant + %d empty user "
+            "message(s), swept their now-orphaned tool result(s), merged "
+            "adjacent user turns",
             dropped_empty_assistants,
+            dropped_empty_users,
         )
 
     return messages
