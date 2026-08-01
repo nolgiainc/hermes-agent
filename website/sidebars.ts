@@ -295,6 +295,7 @@ const sidebars: SidebarsConfig = {
                   key: 'skills-bundled-social-media',
                   collapsed: true,
                   items: [
+                    'user-guide/skills/bundled/social-media/social-media-competitor-social-analysis',
                     'user-guide/skills/bundled/social-media/social-media-xurl',
                   ],
                 },

@@ -129,6 +129,7 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 
 | Skill | Description | Path |
 |-------|-------------|------|
+| [`competitor-social-analysis`](/docs/user-guide/skills/bundled/social-media/social-media-competitor-social-analysis) | Use when analyzing competitor social profiles: collect posts, score performance, break down creative style, propose Nolgia content ideas. | `social-media/competitor-social-analysis` |
 | [`xurl`](/docs/user-guide/skills/bundled/social-media/social-media-xurl) | X/Twitter via xurl CLI: raw post search, posting, DM, media. | `social-media/xurl` |
 
 ## software-development
