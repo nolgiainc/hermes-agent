@@ -18,7 +18,9 @@ no CI config change is required: ``scripts/ci/classify_changes.py`` already
 routes any ``skills/`` or ``optional-skills/`` edit into the ``python`` lane,
 and says why in its own docstring — "the skill-doc tests read that tree, so a
 doc-looking edit can still break Python". Editing a SKILL.md therefore runs
-this test.
+this test, and so does editing the generator itself — ``_py_irrelevant()``
+keeps the Python lane on for every ``.py`` path, including the ones under
+``website/``.
 
 When it fails, the fix is always the same:
 
@@ -43,6 +45,12 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GENERATOR = REPO_ROOT / "website" / "scripts" / "generate-skill-docs.py"
 SIDEBARS = REPO_ROOT / "website" / "sidebars.ts"
+SKILL_SOURCE_TREES = ("skills", "optional-skills")
+# The generator owns exactly one page per skill under these two subtrees.
+# Anything else under website/docs/user-guide/skills/ (e.g. the hand-written
+# google-workspace.md landing page) is authored, not generated.
+GENERATED_PAGES_ROOT = REPO_ROOT / "website" / "docs" / "user-guide" / "skills"
+GENERATED_PAGE_KINDS = ("bundled", "optional")
 
 REGEN_HINT = (
     "Run `python3 website/scripts/generate-skill-docs.py` and commit the result."
@@ -69,15 +77,20 @@ def sandbox(tmp_path_factory: pytest.TempPathFactory) -> Path:
     write there, so this test never dirties the working tree (and passes just
     as well on an already-dirty one).
 
-    ``skills/`` and ``optional-skills/`` are symlinked rather than copied:
-    together they are ~16MB, the generator only reads them, and it derives
-    every path with ``relative_to`` on unresolved paths, so symlinks behave
-    identically to real directories here.
+    ``skills/`` and ``optional-skills/`` are symlinked when the platform
+    allows it: together they are ~16MB, the generator only reads them, and it
+    derives every path with ``relative_to`` on unresolved paths, so symlinks
+    behave identically to real directories here. Native Windows refuses
+    directory symlinks without Developer Mode or an elevated process
+    (``WinError 1314``), so fall back to a plain copy there.
     """
     root = tmp_path_factory.mktemp("skill-docs-freshness")
 
-    for tree in ("skills", "optional-skills"):
-        (root / tree).symlink_to(REPO_ROOT / tree, target_is_directory=True)
+    for tree in SKILL_SOURCE_TREES:
+        try:
+            (root / tree).symlink_to(REPO_ROOT / tree, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            shutil.copytree(REPO_ROOT / tree, root / tree, symlinks=True)
 
     scripts_dir = root / "website" / "scripts"
     scripts_dir.mkdir(parents=True)
@@ -113,13 +126,47 @@ def _generated_outputs(sandbox: Path) -> list[Path]:
     )
 
 
-def test_generator_produced_output(sandbox: Path) -> None:
+def _source_skills() -> list[Path]:
+    """Every ``SKILL.md`` the generator discovers, as the generator globs it."""
+    return sorted(
+        p for tree in SKILL_SOURCE_TREES for p in (REPO_ROOT / tree).rglob("SKILL.md")
+    )
+
+
+def _per_skill_pages(root: Path) -> list[Path]:
+    """The generator-owned per-skill pages beneath a repo root.
+
+    Works on both the sandbox and the real tree: the generator writes to
+    ``website/docs/user-guide/skills/<kind>/<category>/<page-id>.md``, so the
+    two ``<kind>`` subtrees are exactly its output and nothing else.
+    """
+    pages_root = root / GENERATED_PAGES_ROOT.relative_to(REPO_ROOT)
+    return sorted(
+        p
+        for kind in GENERATED_PAGE_KINDS
+        for p in (pages_root / kind).rglob("*.md")
+        if p.is_file()
+    )
+
+
+def test_generator_emits_one_page_per_skill(sandbox: Path) -> None:
     """Guard the guard: if the sandbox produced nothing, the comparisons below
-    would pass vacuously and the drift check would be silently dead."""
-    outputs = _generated_outputs(sandbox)
-    assert len(outputs) > 100, (
-        f"expected the generator to emit a page per skill, got {len(outputs)} files. "
-        "The sandbox scaffold is probably wrong, not the docs."
+    would pass vacuously and the drift check would be silently dead.
+
+    Asserting the relationship (one page per discovered ``SKILL.md``) rather
+    than a fixed floor also catches a generator regression that silently drops
+    pages, without breaking when the skill count legitimately moves.
+    """
+    sources = _source_skills()
+    pages = _per_skill_pages(sandbox)
+    assert sources, (
+        "no SKILL.md found under skills/ or optional-skills/ — "
+        "the sandbox scaffold is wrong, not the docs."
+    )
+    assert len(pages) == len(sources), (
+        f"the generator discovered {len(sources)} skills but emitted "
+        f"{len(pages)} pages. Either it dropped skills, or two skills now "
+        "collide on the same page id and overwrote each other."
     )
 
 
@@ -137,6 +184,24 @@ def test_every_skill_has_a_committed_docs_page(sandbox: Path) -> None:
     assert not missing, (
         f"{len(missing)} generated docs file(s) are missing from the repo:\n"
         f"{_format_paths(missing)}\n{REGEN_HINT}"
+    )
+
+
+def test_no_orphaned_generated_pages(sandbox: Path) -> None:
+    """Deleting or renaming a skill must take its generated page with it.
+
+    Walking only the sandbox output cannot see this: an obsolete page has no
+    generated counterpart, so it stays published forever. `kanban-codex-lane`
+    survived that way after its skill was removed.
+    """
+    orphans = [
+        str(p.relative_to(REPO_ROOT))
+        for p in _per_skill_pages(REPO_ROOT)
+        if not (sandbox / p.relative_to(REPO_ROOT)).exists()
+    ]
+    assert not orphans, (
+        f"{len(orphans)} committed docs page(s) have no skill behind them "
+        f"anymore — delete them:\n{_format_paths(orphans)}"
     )
 
 
