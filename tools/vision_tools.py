@@ -175,11 +175,12 @@ def _reset_vision_timeout_streak() -> None:
 
 
 def _vision_timeout_analysis(exc: Exception, streak: int,
-                             timeout: float) -> str:
+                             timeout: float, *,
+                             probe_active: bool = False) -> str:
     """The analysis text for a timed-out vision call — streak-aware so the
     second consecutive burn says 'switch strategy', not just 'it failed'."""
     if streak >= _VISION_TIMEOUT_SWITCH_AT:
-        return (
+        text = (
             f"Vision request timed out after its {timeout:.0f}s per-attempt "
             f"budget — the {_ordinal(streak)} consecutive vision timeout. "
             "STOP: do not resize this image and retry — an image class that "
@@ -190,6 +191,14 @@ def _vision_timeout_analysis(exc: Exception, streak: int,
             "check as 'QC unavailable — vision timeout' and continue the "
             f"task. Error: {exc}"
         )
+        if probe_active:
+            text += (
+                " (Degraded mode is active: vision calls are running with a "
+                f"reduced {timeout:.0f}s probe budget so repeated failures "
+                "cannot burn run budget; the full budget restores "
+                "automatically after the next successful vision call.)"
+            )
+        return text
     return (
         f"Vision request timed out after its {timeout:.0f}s per-attempt "
         "budget. One more attempt on this image is reasonable (a smaller "
@@ -205,6 +214,57 @@ def _ordinal(n: int) -> str:
     else:
         suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
     return f"{n}{suffix}"
+
+
+def _current_vision_timeout_streak() -> int:
+    """Read the consecutive-timeout streak without mutating it."""
+    with _vision_timeout_streak_lock:
+        return _vision_timeout_streak
+
+
+# ---------------------------------------------------------------------------
+# Degraded-mode probe budget (NOL-253)
+# ---------------------------------------------------------------------------
+# The NOL-197 guard above rewrites the ERROR TEXT once the streak reaches
+# _VISION_TIMEOUT_SWITCH_AT, but the text is advisory: the NOL-151 live run
+# (session 8050af4b) drove the streak to 7, every member burning the full
+# per-attempt budget — ~7 minutes of a 16.6-minute post-generation tail on
+# calls that returned nothing.  This is the mechanical half of the guard:
+# once the streak is at or past the switch threshold, vision calls run with
+# a reduced probe budget instead of the full one.  A healthy route answers
+# a QC-sized request well inside the probe window (healthy analyses finish
+# in well under 20s — see the 60s-budget rationale above), so recovery is
+# still discovered, and any success resets the streak and restores the full
+# budget.  A route that stays degraded now costs probe-seconds per call,
+# not full-budget-seconds.
+#
+# Resolution: env HERMES_VISION_PROBE_TIMEOUT → config
+# auxiliary.vision.probe_timeout → 15.0.  Values <= 0 disable the cap
+# (degraded-mode calls keep the full budget).
+_VISION_DEFAULT_PROBE_TIMEOUT = 15.0
+
+
+def _resolve_vision_probe_timeout(
+    default: float = _VISION_DEFAULT_PROBE_TIMEOUT,
+) -> float:
+    """Resolve the degraded-mode per-attempt budget.  Best-effort: any
+    config read or parse failure falls back to *default*."""
+    try:
+        env_val = os.getenv("HERMES_VISION_PROBE_TIMEOUT", "").strip()
+        if env_val:
+            try:
+                return float(env_val)
+            except ValueError:
+                pass
+
+        from hermes_cli.config import cfg_get, load_config
+        cfg = load_config()
+        val = cfg_get(cfg, "auxiliary", "vision", "probe_timeout")
+        if val is not None:
+            return float(val)
+    except Exception:
+        pass
+    return default
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +761,44 @@ _EMBED_MAX_DIMENSION = 7900
 # Target size when auto-resizing on API failure (5 MB).  After a provider
 # rejects an image, we downscale to this target and retry once.
 _RESIZE_TARGET_BYTES = 5 * 1024 * 1024
+
+# Longest side (px) sent to the vision LLM (NOL-253).  Independent of the
+# 7900px EMBED ceiling above, which only guards Anthropic's hard 8000px
+# reject: this one is a performance cap.  Every cloud route we serve
+# downscales internally to roughly 2048px or less before the model sees the
+# image (OpenAI fits high-detail images inside 2048x2048; Anthropic caps
+# the long side around 1568), so pixels beyond ~2048 never reach the model
+# — they are pure upload bytes and provider-side tiling latency.  The
+# NOL-151 run measured the result on montage-built contact sheets shipped
+# at full resolution: 6 of 15 QC vision_analyze calls burned their whole
+# per-attempt budget and returned nothing.
+# Resolution: env HERMES_VISION_MAX_DIMENSION → config
+# auxiliary.vision.max_dimension → 2048.  Values <= 0 disable the cap
+# (full-resolution sends).
+_VISION_SEND_MAX_DIMENSION = 2048
+
+
+def _resolve_vision_max_dimension(
+    default: int = _VISION_SEND_MAX_DIMENSION,
+) -> int:
+    """Resolve the longest-side pixel cap for vision sends.  Best-effort:
+    any config read or parse failure falls back to *default*."""
+    try:
+        env_val = os.getenv("HERMES_VISION_MAX_DIMENSION", "").strip()
+        if env_val:
+            try:
+                return int(float(env_val))
+            except ValueError:
+                pass
+
+        from hermes_cli.config import cfg_get, load_config
+        cfg = load_config()
+        val = cfg_get(cfg, "auxiliary", "vision", "max_dimension")
+        if val is not None:
+            return int(float(val))
+    except Exception:
+        pass
+    return default
 
 
 def _is_image_size_error(error: Exception) -> bool:
@@ -1203,8 +1301,9 @@ async def vision_analyze_tool(
     Analyze an image from a URL or local file path using vision AI.
     
     This tool accepts either an HTTP/HTTPS URL or a local file path. For URLs,
-    it downloads the image first. In both cases, the image is converted to base64
-    and processed using Gemini 3 Flash Preview via OpenRouter API.
+    it downloads the image first. In both cases, the image is converted to
+    base64 (downscaled to the configured send cap when oversized) and processed
+    by the configured auxiliary vision route (``auxiliary.vision``).
     
     The user_prompt parameter is expected to be pre-formatted by the calling
     function (typically model_tools.py) to include both full description
@@ -1214,7 +1313,8 @@ async def vision_analyze_tool(
         image_url (str): The URL or local file path of the image to analyze.
                          Accepts http://, https:// URLs or absolute/relative file paths.
         user_prompt (str): The pre-formatted prompt for the vision model
-        model (str): The vision model to use (default: google/gemini-3-flash-preview)
+        model (str): The vision model to use (default: the configured
+                     auxiliary vision model)
     
     Returns:
         str: JSON string containing the analysis results with the following structure:
@@ -1251,7 +1351,11 @@ async def vision_analyze_tool(
     # Local files (e.g. from the image cache) should NOT be deleted.
     should_cleanup = True
     detected_mime_type = None
-    
+    # The per-attempt budget actually used for the LLM call (full or probe),
+    # so the timeout error text reports the budget that really applied.
+    effective_vision_timeout = None
+    probe_budget_active = False
+
     try:
         from tools.interrupt import is_interrupted
         if is_interrupted():
@@ -1303,31 +1407,57 @@ async def vision_analyze_tool(
             temp_image_path = normalized_path
             should_cleanup = True
 
-        # Convert image to base64 — send at full resolution first.
-        # If the provider rejects it as too large, we auto-resize and retry.
-        # Offloaded to the bounded vision CPU executor so a fan-out of encodes
-        # can't saturate every core and starve the event loop.
+        # Convert image to base64.  Offloaded to the bounded vision CPU
+        # executor so a fan-out of encodes can't saturate every core and
+        # starve the event loop.
         logger.info("Converting image to base64...")
         image_data_url = await _run_encode_on_cpu_executor(
             _image_to_base64_data_url, temp_image_path, mime_type=detected_mime_type)
         data_size_kb = len(image_data_url) / 1024
         logger.info("Image converted to base64 (%.1f KB)", data_size_kb)
 
-        # Hard limit (20 MB) — no provider accepts payloads this large.
-        if len(image_data_url) > _MAX_BASE64_BYTES:
-            # Try to resize down to 5 MB before giving up.
+        # Preflight send cap (NOL-253).  This path used to send full
+        # resolution first and downscale only after a provider SIZE
+        # rejection — but the failure mode that actually burns run budget is
+        # not a 413, it is a TIMEOUT: montage-built contact sheets shipped
+        # at full resolution made 6 of 15 QC calls burn their whole
+        # per-attempt budget in the NOL-151 run.  Cloud vision routes
+        # downscale internally to ~2048px anyway, so oversized sends buy no
+        # fidelity — only upload bytes and tiling latency.  Downscale BEFORE
+        # the first call whenever the payload exceeds the embed byte target
+        # or the send dimension cap.
+        _send_max_dim = _resolve_vision_max_dimension()
+        _over_bytes = len(image_data_url) > _EMBED_TARGET_BYTES
+        _over_dims = False
+        if _send_max_dim > 0:
+            _over_dims = await _run_encode_on_cpu_executor(
+                _image_exceeds_dimension, temp_image_path, _send_max_dim,
+            )
+        if _over_bytes or _over_dims:
             image_data_url = await _run_encode_on_cpu_executor(
                 _resize_image_for_vision,
-                temp_image_path, mime_type=detected_mime_type)
-            if len(image_data_url) > _MAX_BASE64_BYTES:
-                raise ValueError(
-                    f"Image too large for vision API: base64 payload is "
-                    f"{len(image_data_url) / (1024 * 1024):.1f} MB "
-                    f"(limit {_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB) "
-                    f"even after resizing. "
-                    f"Install Pillow (`pip install Pillow`) for better auto-resize, "
-                    f"or compress the image manually."
-                )
+                temp_image_path, mime_type=detected_mime_type,
+                max_base64_bytes=_EMBED_TARGET_BYTES,
+                max_dimension=_send_max_dim if _send_max_dim > 0 else None,
+            )
+            logger.info(
+                "Preflight-resized vision payload to %.1f KB "
+                "(max_dimension=%s)",
+                len(image_data_url) / 1024,
+                _send_max_dim if _send_max_dim > 0 else "off",
+            )
+
+        # Hard limit (20 MB) — no provider accepts payloads this large.
+        # Reached only when Pillow is unavailable or resizing failed.
+        if len(image_data_url) > _MAX_BASE64_BYTES:
+            raise ValueError(
+                f"Image too large for vision API: base64 payload is "
+                f"{len(image_data_url) / (1024 * 1024):.1f} MB "
+                f"(limit {_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB) "
+                f"even after resizing. "
+                f"Install Pillow (`pip install Pillow`) for better auto-resize, "
+                f"or compress the image manually."
+            )
 
         debug_call_data["image_size_bytes"] = image_size_bytes
         
@@ -1357,6 +1487,23 @@ async def vision_analyze_tool(
         
         # Call the vision API via centralized router.
         vision_timeout = _resolve_vision_timeout()
+        # Degraded mode (NOL-253): once the consecutive-timeout guard has
+        # ordered the strategy switch, spend probe-seconds discovering
+        # recovery, not full budgets.  Any success resets the streak and
+        # restores the full budget on the next call.
+        _streak_at_call = _current_vision_timeout_streak()
+        if _streak_at_call >= _VISION_TIMEOUT_SWITCH_AT:
+            _probe_timeout = _resolve_vision_probe_timeout()
+            if 0 < _probe_timeout < vision_timeout:
+                logger.info(
+                    "Vision degraded mode: %d consecutive timeouts — "
+                    "capping this attempt at %.0fs (probe budget, "
+                    "full budget %.0fs)",
+                    _streak_at_call, _probe_timeout, vision_timeout,
+                )
+                vision_timeout = _probe_timeout
+                probe_budget_active = True
+        effective_vision_timeout = vision_timeout
         vision_temperature = 0.1
         try:
             from hermes_cli.config import cfg_get, load_config
@@ -1399,10 +1546,20 @@ async def vision_analyze_tool(
         # Extract the analysis — fall back to reasoning if content is empty
         analysis = extract_content_or_reasoning(response)
 
-        # Retry once on empty content (reasoning-only response)
+        # Retry once on empty content (reasoning-only response) — but never
+        # with a second full budget (NOL-253): the first attempt already
+        # proved the route responsive (it returned, just empty), so the
+        # retry either succeeds quickly or is not worth another full burn.
         if not analysis:
-            logger.warning("Vision LLM returned empty content, retrying once")
-            response = await async_call_llm(**call_kwargs)
+            _retry_timeout = call_kwargs["timeout"]
+            _probe_timeout = _resolve_vision_probe_timeout()
+            if 0 < _probe_timeout < _retry_timeout:
+                _retry_timeout = _probe_timeout
+            logger.warning(
+                "Vision LLM returned empty content, retrying once "
+                "(timeout %.0fs)", _retry_timeout)
+            retry_kwargs = {**call_kwargs, "timeout": _retry_timeout}
+            response = await async_call_llm(**retry_kwargs)
             analysis = extract_content_or_reasoning(response)
 
         analysis_length = len(analysis)
@@ -1440,9 +1597,16 @@ async def vision_analyze_tool(
             # consecutive full-budget burn orders the strategy switch
             # instead of letting the model resize and resubmit a third
             # resolution of an image the route cannot analyze in budget.
+            # Reports the budget that actually applied to this attempt —
+            # the reduced probe budget when degraded mode was active
+            # (NOL-253), the full budget otherwise.
             streak = _record_vision_timeout()
             analysis = _vision_timeout_analysis(
-                e, streak, _resolve_vision_timeout())
+                e, streak,
+                effective_vision_timeout
+                if effective_vision_timeout is not None
+                else _resolve_vision_timeout(),
+                probe_active=probe_budget_active)
         elif any(hint in err_str for hint in (
             "402", "insufficient", "payment required", "credits", "billing",
         )):
