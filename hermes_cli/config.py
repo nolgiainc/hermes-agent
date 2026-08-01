@@ -1656,6 +1656,8 @@ DEFAULT_CONFIG = {
             "base_url": "",        # direct OpenAI-compatible endpoint (takes precedence over provider)
             "api_key": "",         # API key for base_url (falls back to OPENAI_API_KEY)
             "timeout": 60,         # seconds — per-attempt vision LLM call timeout (env: HERMES_VISION_TIMEOUT)
+            "probe_timeout": 15,   # seconds — reduced per-attempt budget while the consecutive-timeout guard is active (env: HERMES_VISION_PROBE_TIMEOUT; <= 0 disables)
+            "max_dimension": 2048, # px, longest side sent to the vision LLM — larger images are downscaled first (env: HERMES_VISION_MAX_DIMENSION; <= 0 disables)
             "extra_body": {},      # OpenAI-compatible provider-specific request fields
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections

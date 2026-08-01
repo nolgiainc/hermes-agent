@@ -1064,6 +1064,10 @@ auxiliary:
     base_url: ""               # Custom OpenAI-compatible endpoint (overrides provider)
     api_key: ""                # API key for base_url (falls back to OPENAI_API_KEY)
     timeout: 60                # seconds — per-attempt vision LLM call timeout (env: HERMES_VISION_TIMEOUT)
+    probe_timeout: 15          # seconds — reduced budget after consecutive vision timeouts
+                               # (env: HERMES_VISION_PROBE_TIMEOUT; <= 0 disables)
+    max_dimension: 2048        # px, longest side sent to the vision LLM — larger images are
+                               # downscaled first (env: HERMES_VISION_MAX_DIMENSION; <= 0 disables)
     download_timeout: 30       # seconds — image HTTP download; increase for slow connections
     max_concurrency: 8         # max concurrent image encode/resize bursts across the process
                                # (default: host CPU core count, no ceiling) — bounds only the
@@ -1147,7 +1151,7 @@ auxiliary:
 ```
 
 :::tip
-Each auxiliary task has a configurable `timeout` (in seconds). Defaults: vision 60s, web_extract 360s, approval 30s, compression 120s. Increase these if you use slow local models for auxiliary tasks. The vision timeout is per attempt and can also be set with `HERMES_VISION_TIMEOUT`; a vision call that times out is **not** retried on the same provider (it falls straight through to the fallback chain), so a stalled endpoint costs one budget rather than several. Vision also has a separate `download_timeout` (default 30s) for the HTTP image download — increase this for slow connections or self-hosted image servers.
+Each auxiliary task has a configurable `timeout` (in seconds). Defaults: vision 60s, web_extract 360s, approval 30s, compression 120s. Increase these if you use slow local models for auxiliary tasks. The vision timeout is per attempt and can also be set with `HERMES_VISION_TIMEOUT`; a vision call that times out is **not** retried on the same provider (it falls straight through to the fallback chain), so a stalled endpoint costs one budget rather than several. After two consecutive vision timeouts, `vision_analyze` additionally drops to a reduced `probe_timeout` budget (default 15s) until a call succeeds, so a degraded route cannot burn full budgets on every attempt. Vision also has a separate `download_timeout` (default 30s) for the HTTP image download — increase this for slow connections or self-hosted image servers.
 :::
 
 :::info

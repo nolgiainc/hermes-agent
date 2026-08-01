@@ -238,6 +238,11 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     # cached at import), so a developer shell that exports it silently
     # changes the timeout every vision/browser-vision test asserts on.
     "HERMES_VISION_TIMEOUT",
+    # Same per-call resolution as HERMES_VISION_TIMEOUT: the degraded-mode
+    # probe budget and the send dimension cap (NOL-253) would silently
+    # change what the vision QC tests assert on.
+    "HERMES_VISION_PROBE_TIMEOUT",
+    "HERMES_VISION_MAX_DIMENSION",
     "TERMINAL_CWD",
     "TERMINAL_ENV",
     "TERMINAL_CONTAINER_CPU",
