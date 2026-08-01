@@ -4251,8 +4251,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         import time as _time
         now = _time.monotonic()
-        last = self._telegram_lobby_reminder_ts.get(chat_id, 0.0)
-        if now - last < self._TELEGRAM_LOBBY_REMINDER_COOLDOWN_S:
+        # `None`, not 0.0, is the "never sent" sentinel: time.monotonic() is
+        # measured from an arbitrary origin (system boot on Linux), so on a
+        # freshly booted machine `now` itself is inside the cooldown window
+        # and a 0.0 default would swallow the very first reminder.
+        last = self._telegram_lobby_reminder_ts.get(chat_id)
+        if last is not None and now - last < self._TELEGRAM_LOBBY_REMINDER_COOLDOWN_S:
             return False
         self._telegram_lobby_reminder_ts[chat_id] = now
         return True
@@ -16392,8 +16396,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         import time as _time
         now = _time.monotonic()
-        last = self._telegram_capability_hint_ts.get(chat_id, 0.0)
-        if now - last < self._TELEGRAM_CAPABILITY_HINT_COOLDOWN_S:
+        # See _should_send_telegram_lobby_reminder: monotonic() has an
+        # arbitrary origin, so "never sent" must be None rather than 0.0.
+        last = self._telegram_capability_hint_ts.get(chat_id)
+        if last is not None and now - last < self._TELEGRAM_CAPABILITY_HINT_COOLDOWN_S:
             return False
         self._telegram_capability_hint_ts[chat_id] = now
         return True
