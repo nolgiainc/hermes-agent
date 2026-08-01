@@ -28,6 +28,9 @@ must never skip one a change could break:
   or a frontend-only package; an unrecognized path keeps it on.
 * ``skills/`` (incl. ``SKILL.md``) is python-relevant — the skill-doc tests
   read that tree, so a doc-looking edit can still break Python.
+* Any ``.py`` file is python-relevant even inside a prose/frontend tree —
+  ``website/scripts/generate-skill-docs.py`` is executed by the skill-docs
+  freshness test.
 """
 
 from __future__ import annotations
@@ -71,6 +74,12 @@ def _is_docs(p: str) -> bool:
 
 
 def _py_irrelevant(p: str) -> bool:
+    # Python sources are python-relevant wherever they live, including inside
+    # the otherwise-prose trees in _PY_SKIP. website/scripts/*.py is the case
+    # that matters: the skill-docs freshness test runs the real generator, so
+    # a generator-only edit changes what that test expects.
+    if p.endswith(".py"):
+        return False
     return _is_docs(p) or p in _ROOT_NPM or p.startswith(_PY_SKIP) or p.startswith(_DOCKER_META)
 
 

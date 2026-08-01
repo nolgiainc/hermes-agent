@@ -1122,6 +1122,28 @@ def test_lobby_reminder_is_debounced_per_chat(tmp_path):
     assert runner._should_send_telegram_lobby_reminder(other) is True
 
 
+def test_first_debounced_message_survives_small_monotonic_clock(tmp_path, monkeypatch):
+    """The first reminder/hint must fire even when monotonic() < the cooldown.
+
+    time.monotonic() counts from an arbitrary origin (system boot on Linux),
+    so on a freshly booted host it is a small number. A 0.0 "never sent"
+    default therefore looks like a send that just happened and silently
+    swallows the first message.
+    """
+    import time as _time
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    runner = _make_runner(session_db=db)
+    source = _make_source(thread_id=None)
+
+    monkeypatch.setattr(_time, "monotonic", lambda: 1.0)
+    assert runner._should_send_telegram_lobby_reminder(source) is True
+    assert runner._should_send_telegram_lobby_reminder(source) is False
+    assert runner._should_send_telegram_capability_hint(source) is True
+    assert runner._should_send_telegram_capability_hint(source) is False
+
+
 def test_binding_survives_session_deletion_via_cascade(tmp_path):
     """Deleting a session with a topic binding must not raise FK errors."""
     db = SessionDB(db_path=tmp_path / "state.db")
