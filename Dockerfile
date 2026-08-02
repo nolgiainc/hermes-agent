@@ -336,6 +336,56 @@ from PIL import Image, ImageDraw, ImageFont; \
 ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 24); \
 print('Pillow', PIL.__version__)"
 
+# ---------- Overlay compositor deps (Nolgia fork addition) ----------
+# NOL-249: `nolgia_pipeline.overlay` — the compositor that burns in the hook
+# pill, timed captions and the CTA end-card — and its driver
+# `nolgia_pipeline.ugc` need numpy and cv2. Neither was on the fleet, so on
+# the prod pod BOTH modules raised ModuleNotFoundError and the entire
+# compositor was dead:
+#
+#   overlay.py:9  import numpy as np  -> No module named 'numpy'
+#   ugc.py:14     import cv2          -> No module named 'cv2'
+#
+# `pipeline/pyproject.toml` declared them all along, but the pipeline is
+# shipped to pods as SOURCE on the PYTHONPATH (nolgia-agent
+# scripts/apply-admin-overlay.sh), never installed as a package — so its
+# declared dependencies were never resolved by anything. The visible
+# symptom was not an error: the 2026-07-31 `ugc-ad` run (session d87ed5e0)
+# delivered a technically-fine video with no captions and no CTA end-card,
+# because the only tool that draws them could not import and nothing
+# downstream refused the delivery. That is the NOL-196 failure shape one
+# layer down — a dead tool reading as a merely incomplete result.
+#
+# Baked into the image rather than installed by the deploy script for the
+# same reason as bc/ImageMagick above (NOL-199): an install step that runs
+# per-pod can silently fail or be skipped, and is lost the moment a pod is
+# re-provisioned onto a fresh volume. The compositor also ships to
+# CUSTOMERS — `ugc` is a studio-tier marketplace ability — so these belong
+# to every agent, not to the company pod's deploy path.
+#
+# Pins: numpy is held at the version hermes' own uv.lock already resolves
+# for the [voice] extra, so this layer can never present a second numpy to
+# the venv. opencv-python-headless (NOT opencv-python) because pods are
+# headless — the GUI build pulls libGL/X11 that a pod has no use for and
+# would fail to load anyway.
+#
+# The self-test exercises the exact API surface nolgia_pipeline.ugc uses
+# rather than a bare `import cv2`. VideoWriter_fourcc in particular is a
+# legacy spelling that a future OpenCV major is liable to drop (5.0 still
+# carries it alongside the newer VideoWriter.fourcc) — pinning it here
+# means an incompatible bump fails THIS BUILD instead of shipping pods
+# whose compositor imports fine and then dies mid-production.
+RUN uv pip install --python /opt/hermes/.venv/bin/python3 \
+        opencv-python-headless==5.0.0.93 numpy==2.4.3 && \
+    /opt/hermes/.venv/bin/python3 -c "import cv2, numpy as np; \
+from PIL import Image; \
+assert hasattr(cv2, 'VideoWriter_fourcc'), 'cv2.VideoWriter_fourcc gone — nolgia_pipeline.ugc would break'; \
+cv2.VideoWriter_fourcc(*'mp4v'); \
+a = np.zeros((8, 8, 3), dtype=np.uint8); \
+cv2.cvtColor(a, cv2.COLOR_BGR2RGB); \
+cv2.cvtColor(np.array(Image.fromarray(a).convert('RGB')), cv2.COLOR_RGB2BGR); \
+print('cv2', cv2.__version__, '/ numpy', np.__version__)"
+
 # ---------- Login-shell PATH restore (Nolgia fork addition) ----------
 # The ENV PATH declared at the bottom of this file is what makes `python3`
 # resolve to the hermes venv — but Debian's /etc/profile unconditionally
@@ -354,11 +404,16 @@ print('Pillow', PIL.__version__)"
 # including the runtime user's (`su` sources the snippet via its own login
 # machinery; the inner `bash -lc` mirrors s6-setuidgid + bash -l at
 # runtime).
+#
+# cv2 and numpy join the assert for the same reason (NOL-249): the agent
+# invokes `python3 -m nolgia_pipeline ugc` through the exec tool, i.e. from
+# this login shell. Baking them into the venv above is only half the fix —
+# they also have to be the packages this shell's `python3` can see.
 COPY --chmod=0644 docker/profile.d/zz-hermes-path.sh /etc/profile.d/zz-hermes-path.sh
 RUN bash -lc 'test "$(command -v python3)" = /opt/hermes/.venv/bin/python3 && \
-        python3 -c "import PIL" && command -v bc >/dev/null && command -v montage >/dev/null' && \
+        python3 -c "import PIL, cv2, numpy" && command -v bc >/dev/null && command -v montage >/dev/null' && \
     su -s /bin/bash hermes -c 'bash -lc "test \"\$(command -v python3)\" = /opt/hermes/.venv/bin/python3 && \
-        python3 -c \"import PIL\" && command -v bc >/dev/null && command -v montage >/dev/null"'
+        python3 -c \"import PIL, cv2, numpy\" && command -v bc >/dev/null && command -v montage >/dev/null"'
 
 # ---------- /opt/data/bin on the login-shell PATH (Nolgia fork addition) ----------
 # gh and the pinned nolgia CLI (NOL-80) are provisioned into /opt/data/bin at
