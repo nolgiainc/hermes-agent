@@ -650,20 +650,83 @@ class TestAdvertisedRuntimeCwd:
         for task_id, cwd in captured.items():
             assert cwd == str(pod_home / "tmp" / f"session-{task_id[4:12]}")
 
-    def test_bind_advertises_cd_state_over_scratch(self, pod_home, tmp_path):
-        """Seed-only semantics extend to the advertised cwd: a continuing
-        session's `cd` state wins over the scratch workspace."""
+    def test_bind_advertises_surface_pin_over_scratch(self, pod_home, tmp_path):
+        """A surface-registered workspace (ACP/TUI project root) is the
+        session's durable workspace and is what gets advertised."""
         from agent.runtime_cwd import resolve_agent_cwd
 
-        cd_target = tmp_path / "project"
-        cd_target.mkdir()
+        project = tmp_path / "project"
+        project.mkdir()
         sid = "cafe0005-aaaa-bbbb-cccc-ddddeeeeffff"
+        terminal_tool.register_task_env_overrides(sid, {"cwd": str(project)})
+        try:
+            tokens = APIServerAdapter._bind_api_server_session(
+                chat_id=sid, session_key=sid, session_id=sid
+            )
+            try:
+                assert str(resolve_agent_cwd()) == str(project)
+            finally:
+                clear_session_vars(tokens)
+        finally:
+            terminal_tool.clear_task_env_overrides(sid)
+
+    def test_runs_shape_prefers_durable_session_over_approval_key(
+        self, pod_home, tmp_path
+    ):
+        """The real /v1/runs caller shape: ``session_key`` is the run's
+        approval key (a fresh run id per request), the durable conversation
+        id arrives separately as ``session_id``/``chat_id``. The advertised
+        cwd must come from the DURABLE identity — reading the per-run
+        approval key first would shadow a continuing session's pinned
+        workspace with this run's scratch root."""
+        from agent.runtime_cwd import resolve_agent_cwd
+
+        project = tmp_path / "project"
+        project.mkdir()
+        sid = "cafe0007-aaaa-bbbb-cccc-ddddeeeeffff"
+        run_key = "run_0123456789abcdef0123456789abcdef"
+        terminal_tool.register_task_env_overrides(sid, {"cwd": str(project)})
+        try:
+            tokens = APIServerAdapter._bind_api_server_session(
+                chat_id=sid, session_key=run_key, session_id=sid
+            )
+            try:
+                assert str(resolve_agent_cwd()) == str(project)
+            finally:
+                clear_session_vars(tokens)
+        finally:
+            terminal_tool.clear_task_env_overrides(sid)
+
+    def test_cd_state_does_not_move_the_advertised_cwd(self, pod_home, tmp_path):
+        """Prompt-cache safety: the advertised cwd is STABLE for the life of
+        the conversation. A `cd` mid-session changes the mutable cwd record
+        (which is what commands and relative paths keep resolving against)
+        but must NOT change what the system prompt was told, or the stored
+        prompt's cwd line goes stale and the whole prompt gets rebuilt."""
+        from agent.runtime_cwd import resolve_agent_cwd
+
+        sid = "cafe0008-aaaa-bbbb-cccc-ddddeeeeffff"
+        workspace = pod_home / "tmp" / f"session-{sid[:8]}"
+        cd_target = tmp_path / "elsewhere"
+        cd_target.mkdir()
+
+        tokens = APIServerAdapter._bind_api_server_session(
+            chat_id=sid, session_key=sid, session_id=sid
+        )
+        try:
+            assert str(resolve_agent_cwd()) == str(workspace)
+        finally:
+            clear_session_vars(tokens)
+
+        # Turn 2, after the model `cd`'d somewhere during turn 1.
         terminal_tool.record_session_cwd(sid, str(cd_target))
         tokens = APIServerAdapter._bind_api_server_session(
             chat_id=sid, session_key=sid, session_id=sid
         )
         try:
-            assert str(resolve_agent_cwd()) == str(cd_target)
+            assert str(resolve_agent_cwd()) == str(workspace)
+            # The mutable record is untouched — `cd` still governs commands.
+            assert terminal_tool.get_session_cwd(sid) == str(cd_target)
         finally:
             clear_session_vars(tokens)
 
@@ -683,6 +746,106 @@ class TestAdvertisedRuntimeCwd:
             assert runtime_cwd._session_cwd_override() == ""
         finally:
             clear_session_vars(tokens)
+
+    def _stub_agent(self, stored_prompt):
+        """Minimal agent for the real ``_restore_or_build_system_prompt``.
+
+        Only the collaborators that function touches are stubbed (the
+        session-DB row and the prompt builder); the restore/rebuild DECISION
+        — the thing under test — runs for real.
+        """
+        from agent.runtime_cwd import resolve_agent_cwd
+
+        agent = MagicMock()
+        agent.session_id = "sess-1"
+        agent.model = "hermes-4"
+        agent.provider = "nolgia"
+        agent.platform = "api_server"
+        agent._use_prompt_caching = False
+        agent._cached_system_prompt = None
+        agent._session_db.get_session.return_value = {
+            "system_prompt": stored_prompt
+        }
+        agent._build_system_prompt.side_effect = lambda *_a, **_k: (
+            f"User home directory: {os.path.expanduser('~')}\n"
+            f"Current working directory: {resolve_agent_cwd()}\n"
+            "Model: hermes-4\nProvider: nolgia\nPlatform: api_server"
+        )
+        return agent
+
+    @staticmethod
+    def _persisted_prompt(cwd) -> str:
+        return (
+            f"User home directory: {os.path.expanduser('~')}\n"
+            f"Current working directory: {cwd}\n"
+            "Model: hermes-4\nProvider: nolgia\nPlatform: api_server"
+        )
+
+    def test_legacy_shared_home_prompt_is_rebuilt_for_the_workspace(
+        self, pod_home
+    ):
+        """Upgrade path: a session persisted BEFORE this fix carries a
+        ``Current working directory: <shared home>`` line. Reusing it verbatim
+        would keep telling the model to write at the shared home even though
+        the resolver now returns the isolated workspace, so the real
+        restoration path must rebuild it exactly once — and the rebuild must
+        advertise the session workspace."""
+        from agent.conversation_loop import _restore_or_build_system_prompt
+
+        sid = "cafe0009-aaaa-bbbb-cccc-ddddeeeeffff"
+        workspace = pod_home / "tmp" / f"session-{sid[:8]}"
+        agent = self._stub_agent(self._persisted_prompt(pod_home))
+
+        tokens = APIServerAdapter._bind_api_server_session(
+            chat_id=sid, session_key=sid, session_id=sid
+        )
+        try:
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "hi"}]
+            )
+        finally:
+            clear_session_vars(tokens)
+
+        assert agent._build_system_prompt.called
+        assert (
+            f"Current working directory: {workspace}"
+            in agent._cached_system_prompt
+        )
+        assert f"Current working directory: {pod_home}\n" not in (
+            agent._cached_system_prompt
+        )
+        # The rebuild is persisted, so the next turn restores it verbatim.
+        agent._session_db.update_system_prompt.assert_called_once_with(
+            "sess-1", agent._cached_system_prompt
+        )
+
+    def test_workspace_prompt_survives_a_cd_without_rebuild(self, pod_home, tmp_path):
+        """Prompt caching is sacred: once a session's prompt advertises its
+        workspace, a mid-conversation `cd` must not invalidate it. The stored
+        prompt is reused verbatim on the next turn."""
+        from agent.conversation_loop import _restore_or_build_system_prompt
+
+        sid = "cafe000a-aaaa-bbbb-cccc-ddddeeeeffff"
+        workspace = pod_home / "tmp" / f"session-{sid[:8]}"
+        stored = self._persisted_prompt(workspace)
+        agent = self._stub_agent(stored)
+
+        cd_target = tmp_path / "elsewhere"
+        cd_target.mkdir()
+        terminal_tool.record_session_cwd(sid, str(cd_target))
+
+        tokens = APIServerAdapter._bind_api_server_session(
+            chat_id=sid, session_key=sid, session_id=sid
+        )
+        try:
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "hi"}]
+            )
+        finally:
+            clear_session_vars(tokens)
+
+        assert not agent._build_system_prompt.called
+        assert agent._cached_system_prompt == stored
 
     def test_context_cwd_ignores_only_the_scratch_workspace(self, pod_home):
         """resolve_context_cwd skips a session cwd equal to the bound scratch
