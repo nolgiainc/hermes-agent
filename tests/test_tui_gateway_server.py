@@ -667,6 +667,13 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
     monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
     monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    # The build thread's tail writes to process-wide surfaces: _emit puts a
+    # JSON-RPC frame on the real stdout and _start_notification_poller spawns
+    # a thread this test never stops. Both would outlive the test and corrupt
+    # whatever a LATER test does with stdout (a stray frame lands in the
+    # patched sink of test_write_json_serializes_concurrent_writes).
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
 
     ready = threading.Event()
     sid = "test-sid"
@@ -680,6 +687,10 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     try:
         server._start_agent_build(sid, session)
         assert built.wait(timeout=2)
+        # `built` only marks _make_agent's return, mid-_build. Wait for
+        # agent_ready (set last, in _build's finally) so the thread is gone
+        # before the session is dropped and monkeypatch unwinds.
+        assert ready.wait(timeout=10)
     finally:
         server._sessions.pop(sid, None)
 
@@ -722,6 +733,11 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
     monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
     monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    # Same containment as the MCP-discovery build test above: keep the build
+    # thread's frame emission and notification poller off process-wide state
+    # so nothing from this test survives into the next one.
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
 
     ready = threading.Event()
     sid = "test-secret-sid"
@@ -735,6 +751,7 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     try:
         server._start_agent_build(sid, session)
         assert built.wait(timeout=2)
+        assert ready.wait(timeout=10)
     finally:
         server._sessions.pop(sid, None)
 
