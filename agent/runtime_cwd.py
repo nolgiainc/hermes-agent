@@ -57,6 +57,25 @@ def _session_cwd_override() -> str:
     return str(value).strip()
 
 
+def _session_scratch_dir() -> str:
+    """The turn's bound session scratch workspace, if any (NOL-414).
+
+    Read from the ``HERMES_SESSION_SCRATCH_DIR`` session contextvar the API
+    server binds alongside ``cwd`` (gateway/session_context.py). Used by
+    ``resolve_context_cwd`` to tell "the session cwd IS the per-session
+    scratch workspace" apart from a real configured workspace: the former
+    must not re-anchor context-file discovery (an empty scratch dir carries
+    no AGENTS.md/.hermes.md, and following it would silently drop the
+    home-workspace doctrine from the system prompt).
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        return str(get_session_env("HERMES_SESSION_SCRATCH_DIR", "") or "").strip()
+    except Exception:
+        return ""
+
+
 def resolve_agent_cwd() -> Path:
     override = _session_cwd_override()
     if override:
@@ -82,7 +101,17 @@ def resolve_context_cwd() -> Path | None:
     # source tree itself, which is a legitimate workspace when the user is
     # developing Hermes (per-surface policy for fallback-picked directories
     # lives in build_context_files_prompt; see #64590).
+    #
+    # Exception (NOL-414): a session cwd equal to the turn's bound scratch
+    # workspace is a per-session ISOLATION surface, not a configured project
+    # workspace. The agent works there (resolve_agent_cwd, the prompt's
+    # "Current working directory" line, tool cwd records all agree), but
+    # doctrine discovery must keep anchoring where it did before the bind —
+    # the TERMINAL_CWD/home fallback below — or every API-server turn on a
+    # session-workspace deployment silently loses its workspace AGENTS.md.
     override = _session_cwd_override()
+    if override and override == _session_scratch_dir():
+        override = ""
     if override:
         p = Path(override).expanduser()
         if not p.is_dir():

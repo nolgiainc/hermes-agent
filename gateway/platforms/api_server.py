@@ -6294,14 +6294,31 @@ class APIServerAdapter(BasePlatformAdapter):
         UUID) falling back to the session identity, and enforces it as the
         turn's DEFAULT write surface: it becomes the terminal/file-tool cwd
         seed and the subprocess TMPDIR — so concurrent turns from different
-        sessions stop sharing one scratch directory. Deliberately NOT bound
-        as the runtime cwd (``set_session_vars(cwd=...)``): that resolver
-        also anchors context-file discovery (AGENTS.md/.hermes.md via
-        ``resolve_context_cwd``), and re-anchoring it to an empty scratch
-        dir would silently drop workspace doctrine from the system prompt.
-        Absolute paths are not fenced either: shared read-only resources
-        (git checkouts, config, skills) stay reachable exactly as before.
-        Deployments where workspaces do not apply bind exactly as before:
+        sessions stop sharing one scratch directory.
+
+        The session's STABLE workspace (a surface-registered workspace pin
+        for the durable conversation identity when one exists, else the
+        seeded scratch workspace) is ALSO bound as the runtime cwd
+        (``set_session_vars(cwd=...)``). This is what the system prompt's
+        "Current working directory" line reports (``resolve_agent_cwd``):
+        without it the prompt advertises the TERMINAL_CWD fallback — the
+        shared home on the pod — and a model asked to work "in its current
+        working directory" writes ABSOLUTE shared-home paths that bypass the
+        seeded record entirely (the NOL-414 live smoke: two concurrent runs
+        both wrote ``/opt/data/marker.txt`` while their seeded workspaces sat
+        empty). The bind is deliberately NOT the mutable cwd record: `cd`
+        state must stay out of the cached system prompt (advertising it would
+        rebuild the whole prompt on every directory change), so the terminal
+        keeps resolving commands against the record while the prompt names a
+        directory that is stable for the life of the conversation.
+        Context-file discovery is NOT re-anchored by this bind:
+        ``resolve_context_cwd`` explicitly ignores a session cwd equal to
+        the bound scratch workspace (agent/runtime_cwd.py), so workspace
+        doctrine (e.g. the pod's ``/opt/data`` AGENTS.md) keeps resolving
+        exactly as before. Absolute paths are not fenced either: shared
+        read-only resources (git checkouts, config, skills) stay reachable
+        exactly as before. Deployments where workspaces do not apply bind
+        exactly as before — no scratch dir, no runtime-cwd bind:
         ``gateway.session_workspaces.mode: off``, an operator-pinned
         ``terminal.cwd``, or a non-local terminal backend (docker/ssh/modal/
         daytona/singularity/vercel — commands there execute where a
@@ -6323,6 +6340,7 @@ class APIServerAdapter(BasePlatformAdapter):
         scratch_dir = ensure_session_workspace(
             workspace_id or session_id or chat_id or session_key
         )
+        session_cwd = ""
         if scratch_dir:
             # Seed the per-session cwd RECORD (the terminal/file tools'
             # first-rung cwd resolver) so commands without an explicit
@@ -6346,6 +6364,44 @@ class APIServerAdapter(BasePlatformAdapter):
                         and not resolve_task_overrides(key).get("cwd")
                     ):
                         record_session_cwd(key, scratch_dir)
+
+                # The turn's ADVERTISED working directory (NOL-414 live fix):
+                # bind a STABLE, session-scoped directory so the system
+                # prompt's "Current working directory" line names the session
+                # workspace — not the shared-home TERMINAL_CWD fallback the
+                # model would otherwise echo back as absolute write paths.
+                #
+                # Two properties this read must have, in this order:
+                #
+                #  * DURABLE over per-run. ``session_key`` on /v1/runs is the
+                #    run's approval key (a fresh run id every request — an
+                #    authorization namespace, not a workspace), so it is read
+                #    LAST. A surface-pinned workspace is registered against
+                #    the durable conversation identity, and reading the
+                #    approval key first would shadow it with this run's
+                #    scratch root on every continuing turn.
+                #  * STABLE across turns. The mutable cwd RECORD is
+                #    deliberately not read: it changes whenever the model
+                #    `cd`s, and advertising it would flip the prompt's cwd
+                #    line mid-conversation, tripping
+                #    ``_stored_prompt_matches_runtime`` and rebuilding the
+                #    whole system prompt (prompt-cache death, AGENTS.md
+                #    "per-conversation prompt caching is sacred"). The
+                #    terminal keeps its mutable cwd separately: the record is
+                #    still what commands and relative file paths resolve
+                #    against, so `cd` behaves exactly as before.
+                #
+                # A surface-registered workspace pin (ACP/TUI project root)
+                # is stable by contract, so it is what gets advertised when
+                # present; otherwise the session's own scratch workspace is.
+                for key in (session_id, chat_id, session_key):
+                    if not key:
+                        continue
+                    pinned = str(resolve_task_overrides(key).get("cwd") or "").strip()
+                    if pinned:
+                        session_cwd = pinned
+                        break
+                session_cwd = session_cwd or scratch_dir
             except Exception:
                 logger.debug(
                     "session workspace cwd seeding failed", exc_info=True
@@ -6356,6 +6412,7 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            cwd=session_cwd,
             scratch_dir=scratch_dir or "",
             async_delivery=False,
             nolgia_token=nolgia_token,
