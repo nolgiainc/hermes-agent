@@ -21702,6 +21702,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         acceptance can still cause durable at-least-once replay.
         """
         source = self._build_process_event_source(evt)
+        # Run-scoped Nolgia credential of the turn that SPAWNED this work
+        # (async-delegation completions only, in-memory events only — see
+        # tools.async_delegation._attach_origin_nolgia_token). Handed to the
+        # api_server self-post so the continuation turn attributes its CLI work
+        # to that run instead of the session's most recent one (NOL-413).
+        origin_nolgia_token = str(evt.get("origin_nolgia_token") or "")
+        # Multiplex profile that served the turn which spawned this work
+        # (HERMES_SESSION_PROFILE, captured at dispatch/registration). A
+        # multiplexed session lives in its profile's runtime and its retained
+        # credential in that profile's scope, so the api_server self-post must
+        # re-enter through /p/<profile>/... — the unprefixed route would resume
+        # under the DEFAULT profile, which has neither (NOL-413).
+        origin_profile = str(evt.get("origin_profile") or "").strip()
         if not source:
             # API-server-originated sessions bind a RAW session key (the
             # X-Hermes-Session-Id value — see _bind_api_server_session), not a
@@ -21725,7 +21738,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "session %s via self-post",
                             raw_sid,
                         )
-                        await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                        await deliver_wake(
+                            adapter,
+                            text=synth_text,
+                            session_id=raw_sid,
+                            nolgia_token=origin_nolgia_token,
+                            profile=origin_profile,
+                        )
                         return True
                     except Exception as e:
                         logger.warning(
@@ -21768,7 +21787,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "%s via self-post",
                     raw_sid,
                 )
-                await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                await deliver_wake(
+                    adapter,
+                    text=synth_text,
+                    session_id=raw_sid,
+                    nolgia_token=origin_nolgia_token,
+                    profile=origin_profile,
+                )
                 return True
             except Exception as e:
                 logger.warning(
@@ -22101,6 +22126,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_id = watcher.get("user_id", "")
         user_name = watcher.get("user_name", "")
         message_id = str(watcher.get("message_id") or "").strip() or None
+        # Profile that owns the spawning session — the wake self-post has to
+        # re-enter through that profile's /p/<profile>/ route (NOL-413).
+        watcher_profile = str(watcher.get("profile") or "").strip()
         agent_notify = watcher.get("notify_on_complete", False)
         notify_mode = self._load_background_notifications_mode()
 
@@ -22160,6 +22188,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "session_id": session_id,
                         "session_key": session_key,
                         "platform": platform_name,
+                        "origin_profile": watcher_profile,
                         "chat_type": watcher.get("chat_type", ""),
                         "chat_id": chat_id,
                         "thread_id": thread_id,

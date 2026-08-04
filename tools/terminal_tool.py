@@ -2845,6 +2845,12 @@ def terminal_tool(
                             proc_session.watcher_user_name = _gw_user_name
                             proc_session.watcher_thread_id = _gw_thread_id
                             proc_session.watcher_message_id = _gw_message_id
+                            # Profile that owns this session — the wake
+                            # self-post must re-enter through its
+                            # /p/<profile>/ route (NOL-413).
+                            proc_session.watcher_profile = _gse(
+                                "HERMES_SESSION_PROFILE", ""
+                            )
 
                 # Mutual exclusion: if both notify_on_complete and watch_patterns
                 # are set, drop watch_patterns. The combination produces duplicate
@@ -2882,6 +2888,7 @@ def terminal_tool(
                             "user_name": proc_session.watcher_user_name,
                             "thread_id": proc_session.watcher_thread_id,
                             "message_id": proc_session.watcher_message_id,
+                            "profile": proc_session.watcher_profile,
                             "notify_on_complete": True,
                         })
 

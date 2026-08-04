@@ -114,7 +114,7 @@ def test_apiserver_sub_wakes_real_session_via_self_post(tmp_path, monkeypatch):
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, **_kw):
         posts.append({"text": text, "session_id": session_id})
 
     import gateway.wake as wake_mod

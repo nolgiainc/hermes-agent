@@ -289,8 +289,10 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
-        posts.append({"text": text, "session_id": session_id})
+    async def fake_self_post(adapter, *, text, session_id, nolgia_token="", **_kw):
+        posts.append({
+            "text": text, "session_id": session_id, "nolgia_token": nolgia_token,
+        })
 
     import gateway.wake as wake_mod
     monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
@@ -304,7 +306,14 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
     assert result is True
     api_adapter.handle_message.assert_not_awaited()
     assert posts == [
-        {"text": "[SYSTEM: subagent finished]", "session_id": "raw-hq-session-id"}
+        {
+            "text": "[SYSTEM: subagent finished]",
+            "session_id": "raw-hq-session-id",
+            # No dispatch-time run credential on this event: the wake carries
+            # none and the API server falls back to the session's retained
+            # token / the pod bearer (NOL-413).
+            "nolgia_token": "",
+        }
     ]
 
 
@@ -322,7 +331,7 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, nolgia_token="", **_kw):
         posts.append(session_id)
 
     import gateway.wake as wake_mod
@@ -336,3 +345,38 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
     result = await runner._inject_watch_notification("[SYSTEM: done]", evt)
     assert result is True
     assert posts == ["raw-origin-sid"]
+
+
+@pytest.mark.asyncio
+async def test_inject_watch_notification_carries_origin_run_credential(
+    monkeypatch, tmp_path
+):
+    """origin_nolgia_token (stamped at dispatch time by async_delegation, in
+    memory only) rides the wake self-post, so the continuation turn's CLI work
+    attributes to the run that spawned the delegation rather than to whichever
+    turn the session ran most recently (NOL-413)."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    api_adapter = SimpleNamespace(
+        supports_async_delivery=False,
+        handle_message=AsyncMock(),
+        _host="127.0.0.1", _port=8642, _api_key="k", _model_name="m",
+    )
+    runner.adapters[Platform.API_SERVER] = api_adapter
+
+    posts = []
+
+    async def fake_self_post(adapter, *, text, session_id, nolgia_token="", **_kw):
+        posts.append(nolgia_token)
+
+    import gateway.wake as wake_mod
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
+
+    evt = {
+        "session_id": "proc_watch",
+        "session_key": "",
+        "origin_session_id": "raw-origin-sid",
+        "origin_nolgia_token": "nolt_origin_run",
+    }
+    result = await runner._inject_watch_notification("[SYSTEM: done]", evt)
+    assert result is True
+    assert posts == ["nolt_origin_run"]

@@ -1071,6 +1071,45 @@ def _rpc_poll_loop(
             stop_event.wait(poll_interval)
 
 
+def _remote_scoped_nolgia_token() -> str:
+    """Turn-scoped NOLGIA_TOKEN for a REMOTE sandbox script, or ``""``.
+
+    Non-local backends (Docker, SSH, Modal, ...) never build a scrubbed child
+    env — the sandbox script inherits the backend's own runtime environment,
+    which carries the POD-wide bearer — so the local path's
+    ``apply_run_scoped_nolgia_token`` substitution cannot reach them and a
+    sandbox script spawning the nolgia CLI uploads unattributed (NOL-413).
+
+    Same substitution-only semantics as the local path: a value is returned
+    only when the sandbox's own grant policy already lets ``NOLGIA_TOKEN``
+    through (skill/config env passthrough) AND a run token is bound in this
+    task's context. A sandbox the policy withheld the credential from never
+    receives one here either.
+    """
+    # The grant check has to resolve the credential the same way the child env
+    # would: under multiplexing the pod bearer lives in the active profile's
+    # secret scope, not in ``os.environ``, so gating on the process-global
+    # value first would decide "no credential at all" for exactly the
+    # profile-scoped deployments this substitution exists for. Feed the
+    # process value in as the pre-scope fallback and let ``_scrub_child_env``
+    # (i.e. ``resolve_passthrough_value``) produce the effective one; an
+    # unscoped multiplex read fails closed and yields no override.
+    try:
+        granted = _scrub_child_env(
+            {"NOLGIA_TOKEN": os.environ.get("NOLGIA_TOKEN", "")}
+        )
+    except Exception:
+        return ""
+    if not str(granted.get("NOLGIA_TOKEN") or "").strip():
+        return ""
+    try:
+        from gateway.session_context import get_session_env
+
+        return get_session_env("HERMES_SESSION_NOLGIA_TOKEN", "").strip()
+    except Exception:
+        return ""
+
+
 def _execute_remote(
     code: str,
     task_id: Optional[str],
@@ -1162,13 +1201,42 @@ def _execute_remote(
         tz = os.getenv("HERMES_TIMEZONE", "").strip()
         if tz:
             env_prefix += f" TZ={shlex.quote(tz)}"
+        # Attribution for a granted credential on a remote backend: override
+        # NOLGIA_TOKEN for THIS script's process only. The value is handed to
+        # the sandbox shell on STDIN, never as a command-prefix assignment: an
+        # assignment lands in the wrapping shell's argv, which any co-tenant
+        # process in the sandbox can read out of /proc (and which backends are
+        # free to log). `read` keeps it in shell memory instead, and the
+        # backend's shared shell snapshot already excludes NOLGIA_TOKEN, so the
+        # export cannot outlive this command. Mirrors the local path's
+        # substitution; see _remote_scoped_nolgia_token.
+        scoped_nolgia_token = _remote_scoped_nolgia_token()
+        # Heredoc/payload-folding backends splice stdin back into the command
+        # text, which would reintroduce exactly the argv exposure above — those
+        # keep their pod-wide bearer rather than gain a better-attributed but
+        # leaked credential.
+        stdin_capable = getattr(env, "_stdin_mode", "pipe") in ("pipe", "payload")
+        script_stdin = None
+        token_preamble = ""
+        if scoped_nolgia_token and stdin_capable:
+            script_stdin = scoped_nolgia_token + "\n"
+            # `;` rather than `&&` after the read: a backend that never
+            # delivers stdin degrades to the pod credential instead of
+            # failing the whole execution.
+            token_preamble = (
+                "IFS= read -r __hermes_nolgia_token; "
+                'if [ -n "$__hermes_nolgia_token" ]; then '
+                'export NOLGIA_TOKEN="$__hermes_nolgia_token"; fi; '
+                "unset __hermes_nolgia_token; "
+            )
 
         # Execute the script on the remote backend
         logger.info("Executing code on %s backend (task %s)...",
                      env_type, effective_task_id[:8])
         script_result = env.execute(
-            f"cd {quoted_sandbox_dir} && {env_prefix} python3 script.py",
+            f"cd {quoted_sandbox_dir} && {token_preamble}{env_prefix} python3 script.py",
             timeout=timeout,
+            stdin_data=script_stdin,
         )
 
         stdout_text = script_result.get("output", "") or ""

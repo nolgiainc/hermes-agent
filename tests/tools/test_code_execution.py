@@ -125,7 +125,7 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
             def get_temp_dir(self):
                 return "/data/data/com.termux/files/usr/tmp"
 
-            def execute(self, command, cwd=None, timeout=None):
+            def execute(self, command, cwd=None, timeout=None, **kwargs):
                 self.commands.append((command, cwd, timeout))
                 if "command -v python3" in command:
                     return {"output": "OK\n"}
@@ -163,7 +163,7 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
             def get_temp_dir(self):
                 return "/tmp"
 
-            def execute(self, command, cwd=None, timeout=None):
+            def execute(self, command, cwd=None, timeout=None, **kwargs):
                 self.commands.append((command, cwd, timeout))
                 if "command -v python3" in command:
                     return {"output": "OK\n"}
@@ -671,7 +671,7 @@ class TestHeadTailTruncation(unittest.TestCase):
             def get_temp_dir(self):
                 return "/tmp"
 
-            def execute(self, command, cwd=None, timeout=None):
+            def execute(self, command, cwd=None, timeout=None, **kwargs):
                 self.commands.append((command, cwd, timeout))
                 if "command -v python3" in command:
                     return {"output": "OK\n"}
