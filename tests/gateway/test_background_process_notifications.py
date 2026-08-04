@@ -289,7 +289,7 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id, nolgia_token=""):
+    async def fake_self_post(adapter, *, text, session_id, nolgia_token="", **_kw):
         posts.append({
             "text": text, "session_id": session_id, "nolgia_token": nolgia_token,
         })
@@ -331,7 +331,7 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id, nolgia_token=""):
+    async def fake_self_post(adapter, *, text, session_id, nolgia_token="", **_kw):
         posts.append(session_id)
 
     import gateway.wake as wake_mod
@@ -365,7 +365,7 @@ async def test_inject_watch_notification_carries_origin_run_credential(
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id, nolgia_token=""):
+    async def fake_self_post(adapter, *, text, session_id, nolgia_token="", **_kw):
         posts.append(nolgia_token)
 
     import gateway.wake as wake_mod

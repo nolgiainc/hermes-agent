@@ -116,6 +116,7 @@ class ProcessSession:
     watcher_user_name: str = ""
     watcher_thread_id: str = ""
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
+    watcher_profile: str = ""                   # Multiplex profile that owns the spawning session ("" = default)
     watcher_interval: int = 0                   # 0 = no watcher configured
     notify_on_complete: bool = False             # Queue agent notification on exit
     # Watch patterns — trigger agent notification when output matches any pattern
@@ -321,6 +322,10 @@ class ProcessRegistry:
                     "type": "watch_disabled",
                     "suppressed": session._watch_suppressed,
                     "platform": session.watcher_platform,
+                    # Profile that owns the spawning session: the gateway wake
+                    # self-post must re-enter through its /p/<profile>/ route
+                    # (NOL-413).
+                    "origin_profile": session.watcher_profile,
                     "chat_id": session.watcher_chat_id,
                     "user_id": session.watcher_user_id,
                     "user_name": session.watcher_user_name,
@@ -354,6 +359,8 @@ class ProcessRegistry:
             "output": output,
             "suppressed": suppressed,
             "platform": session.watcher_platform,
+            # See the watch_disabled event above (NOL-413).
+            "origin_profile": session.watcher_profile,
             "chat_id": session.watcher_chat_id,
             "user_id": session.watcher_user_id,
             "user_name": session.watcher_user_name,
@@ -1201,6 +1208,8 @@ class ProcessRegistry:
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
+                # See the watch events above (NOL-413).
+                "origin_profile": session.watcher_profile,
                 "command": session.command,
                 "exit_code": session.exit_code,
                 "completion_reason": session.completion_reason,
@@ -2081,6 +2090,7 @@ class ProcessRegistry:
                             "watcher_user_name": s.watcher_user_name,
                             "watcher_thread_id": s.watcher_thread_id,
                             "watcher_message_id": s.watcher_message_id,
+                            "watcher_profile": s.watcher_profile,
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
@@ -2159,6 +2169,7 @@ class ProcessRegistry:
                 watcher_user_name=entry.get("watcher_user_name", ""),
                 watcher_thread_id=entry.get("watcher_thread_id", ""),
                 watcher_message_id=entry.get("watcher_message_id", ""),
+                watcher_profile=entry.get("watcher_profile", ""),
                 watcher_interval=entry.get("watcher_interval", 0),
                 notify_on_complete=entry.get("notify_on_complete", False),
                 watch_patterns=entry.get("watch_patterns", []),
@@ -2180,6 +2191,7 @@ class ProcessRegistry:
                     "user_name": session.watcher_user_name,
                     "thread_id": session.watcher_thread_id,
                     "message_id": session.watcher_message_id,
+                    "profile": session.watcher_profile,
                     "notify_on_complete": session.notify_on_complete,
                 })
 

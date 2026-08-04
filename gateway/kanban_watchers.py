@@ -656,6 +656,11 @@ class GatewayKanbanWatchersMixin:
                                     adapter,
                                     text=_synth,
                                     session_id=_session_key,
+                                    # Same profile the subscription recorded:
+                                    # the self-post must re-enter through that
+                                    # profile's /p/<profile>/ route, whose
+                                    # runtime owns the session (NOL-413).
+                                    profile=str(sub_profile or ""),
                                 )
                                 logger.info(
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",

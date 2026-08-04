@@ -65,6 +65,12 @@ from typing import Any, Dict, List, Optional
 # (no prefix / multiplexing off → handle as the default profile).
 _PROFILE_REJECTED = object()
 
+# Wire spelling of the default profile in a /p/<profile>/ prefix. ``/v1/...``
+# and ``/p/default/v1/...`` are aliases for the same runtime, so anything that
+# uses the profile as an identity (see _session_run_token_key) must treat this
+# name and ``""`` as one scope.
+_DEFAULT_PROFILE_NAME = "default"
+
 # Profile selected by the /p/<profile>/ URL prefix for the current request.
 # Set by the profile-prefix middleware; read by handlers / _run_agent.
 _api_request_profile: ContextVar[Optional[str]] = ContextVar(
@@ -1620,14 +1626,19 @@ class APIServerAdapter(BasePlatformAdapter):
         # Keyed by (profile, session_id) — see _session_run_token_key: session
         # ids are caller-controlled and in multiplex mode every
         # ``/p/<profile>/...`` route shares this adapter, so the profile scope
-        # is part of the identity, never just the id. Values are
-        # (token, monotonic-deadline, live-holder-count): the entry cannot
-        # expire while its originating run is still executing, and the deadline
-        # is a settle grace applied once the last holder finishes (see
-        # _SESSION_RUN_TOKEN_SETTLE_GRACE_S). The token is copied into a
+        # is part of the identity, never just the id. Each value is the LIST of
+        # that key's live credentials, oldest first — one entry per submitted
+        # run, ``(token, monotonic-deadline, live-holder-count)``. Holder counts
+        # belong to the run that owns the token, never to the key: concurrent
+        # runs on one session settle in arbitrary order, so a shared counter
+        # would keep an already-settled run's token "live" (and past its
+        # server-side grace, expired) for as long as a sibling run executes.
+        # An entry cannot expire while its own run still holds it, and its
+        # deadline is a settle grace applied when that run releases (see
+        # _SESSION_RUN_TOKEN_SETTLE_GRACE_S). Tokens are copied into a
         # task-local ContextVar at bind time, so concurrent turns never share a
         # mutable slot.
-        self._session_run_tokens: Dict[tuple, tuple] = {}
+        self._session_run_tokens: Dict[tuple, List[tuple]] = {}
         self._session_run_tokens_lock = threading.Lock()
 
     def active_agent_work_count(self) -> int:
@@ -6179,6 +6190,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: str = "",
         nolgia_token: str = "",
         workspace_id: str = "",
+        profile: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -6217,6 +6229,14 @@ class APIServerAdapter(BasePlatformAdapter):
         (git checkouts, config, skills) stay reachable exactly as before.
         Disabled deployments (operator-pinned TERMINAL_CWD, or
         HERMES_SESSION_WORKSPACES=0) bind exactly as before.
+
+        ``profile`` is the multiplex profile serving THIS request
+        (``_api_request_profile``, captured on the request task — the ContextVar
+        does not follow ``run_in_executor`` threads, so callers must pass it
+        explicitly). Bound as ``HERMES_SESSION_PROFILE`` so background work this
+        turn spawns records the profile that owns it and its later wake
+        self-posts through ``/p/<profile>/...`` instead of the default-profile
+        route (NOL-413).
         """
         from gateway.session_context import set_session_vars
         from gateway.session_workspace import ensure_session_workspace
@@ -6260,6 +6280,7 @@ class APIServerAdapter(BasePlatformAdapter):
             scratch_dir=scratch_dir or "",
             async_delivery=False,
             nolgia_token=nolgia_token,
+            profile=profile,
             cron_session="",
         )
 
@@ -6291,18 +6312,30 @@ class APIServerAdapter(BasePlatformAdapter):
         *profile* must be passed explicitly by callers that resolved it on the
         request task (``_api_request_profile``): it is a ContextVar that does
         NOT follow ``run_in_executor`` threads, so an implicit read there would
-        silently resolve the DEFAULT profile's key. ``""`` is the default
-        profile.
+        silently resolve the DEFAULT profile's key.
+
+        The default profile has TWO wire spellings — an unprefixed ``/v1/...``
+        request resolves ``""`` while ``/p/default/v1/...`` resolves
+        ``"default"`` — and they address the same runtime. Both canonicalize to
+        ``""`` here, so a run submitted through one alias (or woken through the
+        unprefixed internal self-post) still recovers its retained credential.
         """
-        return (str(profile or ""), session_id)
+        canonical = str(profile or "").strip()
+        if canonical == _DEFAULT_PROFILE_NAME:
+            canonical = ""
+        return (canonical, session_id)
 
     def _prune_session_run_tokens_locked(self, now: float) -> None:
         """Drop settled entries past their grace. Caller holds the lock."""
-        for key in [
-            k for k, (_token, deadline, holders) in self._session_run_tokens.items()
-            if holders <= 0 and deadline <= now
-        ]:
-            del self._session_run_tokens[key]
+        for key, entries in list(self._session_run_tokens.items()):
+            live = [
+                entry for entry in entries
+                if entry[2] > 0 or entry[1] > now
+            ]
+            if live:
+                self._session_run_tokens[key] = live
+            else:
+                del self._session_run_tokens[key]
 
     def _retain_session_run_token(
         self, session_id: str, nolgia_token: str, *, profile: str = "",
@@ -6311,59 +6344,76 @@ class APIServerAdapter(BasePlatformAdapter):
 
         Called by the /v1/runs submission path and paired with
         :meth:`_release_session_run_token` when that run settles: the run is
-        counted as a live HOLDER, and a held entry never expires. Retention is
-        therefore bounded by the originating run's lifecycle plus a settle
-        grace, not by a fixed window from request receipt.
+        counted as a live HOLDER of ITS OWN entry, and a held entry never
+        expires. Retention is therefore bounded by the originating run's
+        lifecycle plus a settle grace, not by a fixed window from request
+        receipt, and a run's liveness never props up a sibling run's token.
 
-        A newer run for the same (profile, session) overwrites the token, so a
+        A newer run for the same (profile, session) is appended, so a
         continuation that carries no credential of its own attributes to the
-        most recent platform-submitted turn. Continuations that must attribute
-        to a SPECIFIC originating run carry that run's credential explicitly
-        (gateway.wake) instead of reading this map. Settled entries past their
-        grace are pruned here so the map cannot grow past the set of
-        recently-active sessions.
+        most recent live platform-submitted turn. Continuations that must
+        attribute to a SPECIFIC originating run carry that run's credential
+        explicitly (gateway.wake) instead of reading this map. Settled entries
+        past their grace are pruned here so the map cannot grow past the set of
+        recently-active runs.
         """
         if not session_id or not nolgia_token:
             return
         key = self._session_run_token_key(session_id, profile)
         now = time.monotonic()
+        deadline = now + self._SESSION_RUN_TOKEN_SETTLE_GRACE_S
         with self._session_run_tokens_lock:
             self._prune_session_run_tokens_locked(now)
-            previous = self._session_run_tokens.get(key)
-            holders = (previous[2] if previous else 0) + 1
-            self._session_run_tokens[key] = (
-                nolgia_token,
-                now + self._SESSION_RUN_TOKEN_SETTLE_GRACE_S,
-                holders,
-            )
+            entries = self._session_run_tokens.setdefault(key, [])
+            # A resubmission of the SAME credential (retry, duplicate run of one
+            # platform turn) shares the turn's entry: one more holder on it, not
+            # a second copy that could be released out from under the other.
+            for index, (token, _deadline, holders) in enumerate(entries):
+                if token == nolgia_token:
+                    entries[index] = (token, deadline, holders + 1)
+                    break
+            else:
+                entries.append((nolgia_token, deadline, 1))
 
-    def _release_session_run_token(self, session_id: str, *, profile: str = "") -> None:
-        """Release one holder of this (profile, session)'s retained token.
+    def _release_session_run_token(
+        self, session_id: str, nolgia_token: str = "", *, profile: str = "",
+    ) -> None:
+        """Release the settling run's own hold on its retained credential.
 
-        Starts (or restarts) the settle grace: once no run holds the entry, it
-        survives ``_SESSION_RUN_TOKEN_SETTLE_GRACE_S`` longer so late
-        continuations still find it, then ages out.
+        *nolgia_token* identifies the OWNER — the credential the settling run
+        retained. Releasing by key alone would decrement whichever entry the
+        key currently points at, so a short run settling first would hand its
+        hold to a longer-running sibling's token (and keep its own alive past
+        the server-side grace). Starts the settle grace on that entry only:
+        once its own run no longer holds it, it survives
+        ``_SESSION_RUN_TOKEN_SETTLE_GRACE_S`` longer so late continuations
+        still find it, then ages out.
         """
         if not session_id:
             return
         key = self._session_run_token_key(session_id, profile)
         now = time.monotonic()
         with self._session_run_tokens_lock:
-            entry = self._session_run_tokens.get(key)
-            if not entry:
-                return
-            token, _deadline, holders = entry
-            self._session_run_tokens[key] = (
-                token,
-                now + self._SESSION_RUN_TOKEN_SETTLE_GRACE_S,
-                max(0, holders - 1),
-            )
+            entries = self._session_run_tokens.get(key)
+            if entries:
+                for index, (token, _deadline, holders) in enumerate(entries):
+                    if nolgia_token and token != nolgia_token:
+                        continue
+                    entries[index] = (
+                        token,
+                        now + self._SESSION_RUN_TOKEN_SETTLE_GRACE_S,
+                        max(0, holders - 1),
+                    )
+                    break
             self._prune_session_run_tokens_locked(now)
 
     def _retained_session_run_token(self, session_id: str, *, profile: str = "") -> str:
         """Return this (profile, session)'s live retained run token, or ``""``.
 
-        Read-only: a continuation turn neither extends the grace nor becomes a
+        The most recently retained STILL-LIVE entry wins: a run that already
+        settled past its grace never shadows an older run that is still
+        executing (its credential is the only one the platform still honors).
+        Read-only: a continuation turn neither extends a grace nor becomes a
         holder — only a platform submission (which carries a fresh credential)
         does.
         """
@@ -6371,13 +6421,12 @@ class APIServerAdapter(BasePlatformAdapter):
             return ""
         key = self._session_run_token_key(session_id, profile)
         with self._session_run_tokens_lock:
-            entry = self._session_run_tokens.get(key)
-        if not entry:
-            return ""
-        token, deadline, holders = entry
-        if holders <= 0 and deadline <= time.monotonic():
-            return ""
-        return token
+            entries = list(self._session_run_tokens.get(key) or ())
+        now = time.monotonic()
+        for token, deadline, holders in reversed(entries):
+            if holders > 0 or deadline > now:
+                return token
+        return ""
 
     async def _run_agent(
         self,
@@ -6459,6 +6508,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
                     nolgia_token=effective_nolgia_token,
+                    profile=str(request_profile or ""),
                 )
                 agent = None
                 try:
@@ -7072,6 +7122,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_id=session_id or "",
                                 nolgia_token=nolgia_token,
                                 workspace_id=workspace_id,
+                                profile=str(request_profile or ""),
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             # /v1/runs runs its own agent lifecycle (no
@@ -7275,15 +7326,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     _put_event_if_active(None)
                 except Exception:
                     pass
-                # This run no longer holds its session's retained credential:
-                # the settle grace starts here, so retention tracks the run's
-                # real lifecycle instead of a fixed window from request receipt
-                # (a foreground turn can legitimately run for hours). Late
+                # This run no longer holds ITS OWN retained credential: the
+                # settle grace starts here, so retention tracks the run's real
+                # lifecycle instead of a fixed window from request receipt (a
+                # foreground turn can legitimately run for hours). The token is
+                # passed so the release lands on the entry this run retained and
+                # not on a concurrent sibling run's newer credential. Late
                 # continuations still resolve the token for the grace period.
                 if nolgia_token:
                     try:
                         self._release_session_run_token(
-                            session_id, profile=str(request_profile or ""),
+                            session_id,
+                            nolgia_token,
+                            profile=str(request_profile or ""),
                         )
                     except Exception:
                         logger.debug(

@@ -129,6 +129,66 @@ def test_deliver_wake_carries_the_originating_runs_credential():
     assert "nolgia_token" not in seen["body"]
 
 
+def test_deliver_wake_targets_the_originating_profiles_route(monkeypatch):
+    """A multiplexed session lives in ITS profile's runtime (own HERMES_HOME /
+    state.db / secret scope / retained-credential scope), so the self-post must
+    re-enter through /p/<profile>/... with THAT profile's API_SERVER_KEY —
+    posting to the unprefixed route would run the continuation in the default
+    profile, where neither the session history nor its retained credential
+    exists (NOL-413)."""
+    from aiohttp import web
+    import gateway.wake as wake
+
+    seen = {}
+
+    async def handler(request):
+        seen["path"] = request.path
+        seen["auth"] = request.headers.get("Authorization")
+        seen["session_id"] = request.headers.get("X-Hermes-Session-Id")
+        return web.json_response({"choices": []})
+
+    async def serve_both(handler):
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", handler)
+        app.router.add_post("/p/alpha/v1/chat/completions", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        return runner, site._server.sockets[0].getsockname()[1]
+
+    async def run(profile):
+        runner, port = await serve_both(handler)
+        try:
+            adapter = ApiServerLikeAdapter(port=port, key="listener-key")
+            await deliver_wake(
+                adapter, text="done", session_id="sid-p", profile=profile
+            )
+        finally:
+            await runner.cleanup()
+
+    monkeypatch.setattr(wake, "_profile_scoped_api_key", lambda _p: "alpha-key")
+    asyncio.run(run("alpha"))
+    assert seen["path"] == "/p/alpha/v1/chat/completions"
+    assert seen["auth"] == "Bearer alpha-key"
+    assert seen["session_id"] == "sid-p"
+
+    # The default profile has no prefixed route of its own to prefer.
+    for default_spelling in ("", "default"):
+        seen.clear()
+        asyncio.run(run(default_spelling))
+        assert seen["path"] == "/v1/chat/completions"
+        assert seen["auth"] == "Bearer listener-key"
+
+    # No usable profile-scoped key: fall back to the unprefixed route rather
+    # than post an unauthenticated (guaranteed-401) request.
+    seen.clear()
+    monkeypatch.setattr(wake, "_profile_scoped_api_key", lambda _p: "")
+    asyncio.run(run("alpha"))
+    assert seen["path"] == "/v1/chat/completions"
+    assert seen["auth"] == "Bearer listener-key"
+
+
 def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
     """HTTP 429 (max_concurrent_runs cap) is transient — retried with backoff."""
     from aiohttp import web

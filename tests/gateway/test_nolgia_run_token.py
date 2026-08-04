@@ -534,22 +534,34 @@ class TestRetentionLifecycle:
     settle grace, and scoped by profile — never by a fixed window from request
     receipt, and never by session id alone."""
 
-    def test_grace_and_overwrite(self):
+    @staticmethod
+    def _holders(adapter, key) -> dict:
+        return {token: holders for token, _deadline, holders in adapter._session_run_tokens[key]}
+
+    @staticmethod
+    def _expire(adapter, key, *tokens) -> None:
+        """Age out the named entries' graces (all of them when none given)."""
+        adapter._session_run_tokens[key] = [
+            (token, time.monotonic() - 1 if not tokens or token in tokens else deadline, holders)
+            for token, deadline, holders in adapter._session_run_tokens[key]
+        ]
+
+    def test_grace_and_newest_submission_wins(self):
         adapter = _make_adapter()
         key = adapter._session_run_token_key("sess-1")
         adapter._retain_session_run_token("sess-1", "nolt_first")
         assert adapter._retained_session_run_token("sess-1") == "nolt_first"
-        # A newer run for the same session overwrites — a continuation that
-        # carries no credential of its own follows the most recent submission.
+        # A newer run for the same session takes over the fallback — a
+        # continuation that carries no credential of its own follows the most
+        # recent submission.
         adapter._retain_session_run_token("sess-1", "nolt_second")
         assert adapter._retained_session_run_token("sess-1") == "nolt_second"
-        # Both runs settle; the entry then ages out on the grace and does not
+        # Both runs settle; the entries then age out on the grace and do not
         # survive the next write's prune.
-        adapter._release_session_run_token("sess-1")
-        adapter._release_session_run_token("sess-1")
-        token, _deadline, holders = adapter._session_run_tokens[key]
-        assert (token, holders) == ("nolt_second", 0)
-        adapter._session_run_tokens[key] = ("nolt_second", time.monotonic() - 1, 0)
+        adapter._release_session_run_token("sess-1", "nolt_first")
+        adapter._release_session_run_token("sess-1", "nolt_second")
+        assert self._holders(adapter, key) == {"nolt_first": 0, "nolt_second": 0}
+        self._expire(adapter, key)
         assert adapter._retained_session_run_token("sess-1") == ""
         adapter._retain_session_run_token("sess-2", "nolt_other")
         assert key not in adapter._session_run_tokens
@@ -567,18 +579,75 @@ class TestRetentionLifecycle:
         key = adapter._session_run_token_key("sess-long")
         adapter._retain_session_run_token("sess-long", "nolt_long")
         # Simulate a run executing far longer than the settle grace.
-        adapter._session_run_tokens[key] = ("nolt_long", time.monotonic() - 1, 1)
+        self._expire(adapter, key)
+        assert self._holders(adapter, key) == {"nolt_long": 1}
         assert adapter._retained_session_run_token("sess-long") == "nolt_long"
         # A sibling session's write must not prune a held entry either.
         adapter._retain_session_run_token("sess-other", "nolt_other")
         assert key in adapter._session_run_tokens
-        # Releasing the last holder restarts the grace, then it ages out.
-        adapter._release_session_run_token("sess-long")
+        # Releasing the holder restarts the grace, then it ages out.
+        adapter._release_session_run_token("sess-long", "nolt_long")
         assert adapter._retained_session_run_token("sess-long") == "nolt_long"
-        token, _deadline, holders = adapter._session_run_tokens[key]
-        assert holders == 0
-        adapter._session_run_tokens[key] = (token, time.monotonic() - 1, 0)
+        assert self._holders(adapter, key) == {"nolt_long": 0}
+        self._expire(adapter, key)
         assert adapter._retained_session_run_token("sess-long") == ""
+
+    def test_release_settles_only_the_owning_runs_entry(self):
+        """Holder counts belong to the run that retained the credential. A
+        short run settling first must not decrement (or extend) a concurrent
+        sibling run's entry — releasing by key alone would hand its hold to
+        whichever token the key happened to point at."""
+        adapter = _make_adapter()
+        key = adapter._session_run_token_key("sess-two")
+        adapter._retain_session_run_token("sess-two", "nolt_short")
+        adapter._retain_session_run_token("sess-two", "nolt_long")
+        adapter._release_session_run_token("sess-two", "nolt_short")
+        assert self._holders(adapter, key) == {"nolt_short": 0, "nolt_long": 1}
+        # Once the settled run's grace elapses, the still-executing sibling's
+        # credential is the live answer — not the aged-out newer/older entry.
+        self._expire(adapter, key, "nolt_short")
+        assert adapter._retained_session_run_token("sess-two") == "nolt_long"
+        # Releasing the sibling settles it too; the already-aged-out entry is
+        # pruned by that write rather than lingering in the map.
+        adapter._release_session_run_token("sess-two", "nolt_long")
+        assert self._holders(adapter, key) == {"nolt_long": 0}
+
+    def test_same_credential_resubmitted_shares_one_entry(self):
+        """A retry/duplicate run of ONE platform turn holds the same entry, so
+        the first release cannot settle it out from under the second run."""
+        adapter = _make_adapter()
+        key = adapter._session_run_token_key("sess-retry")
+        adapter._retain_session_run_token("sess-retry", "nolt_same")
+        adapter._retain_session_run_token("sess-retry", "nolt_same")
+        assert self._holders(adapter, key) == {"nolt_same": 2}
+        adapter._release_session_run_token("sess-retry", "nolt_same")
+        assert self._holders(adapter, key) == {"nolt_same": 1}
+        self._expire(adapter, key)
+        assert adapter._retained_session_run_token("sess-retry") == "nolt_same"
+        adapter._release_session_run_token("sess-retry", "nolt_same")
+        self._expire(adapter, key)
+        assert adapter._retained_session_run_token("sess-retry") == ""
+
+    def test_default_profile_spellings_are_one_scope(self):
+        """The default profile has two wire spellings — unprefixed ``/v1/...``
+        resolves ``""`` while ``/p/default/v1/...`` resolves ``"default"`` —
+        addressing ONE runtime. A run submitted through either alias must be
+        recoverable through the other (the internal wake self-post falls back
+        to the unprefixed route), so both canonicalize to one key."""
+        adapter = _make_adapter()
+        assert (
+            adapter._session_run_token_key("sess-d", "default")
+            == adapter._session_run_token_key("sess-d", "")
+        )
+        adapter._retain_session_run_token("sess-d", "nolt_default", profile="default")
+        assert adapter._retained_session_run_token("sess-d") == "nolt_default"
+        assert adapter._retained_session_run_token("sess-d", profile="default") == "nolt_default"
+        # Still not a catch-all: a named profile keeps its own scope.
+        assert adapter._retained_session_run_token("sess-d", profile="alpha") == ""
+        # Release through the other spelling reaches the same entry.
+        adapter._release_session_run_token("sess-d", "nolt_default", profile="")
+        key = adapter._session_run_token_key("sess-d")
+        assert self._holders(adapter, key) == {"nolt_default": 0}
 
     def test_retention_is_scoped_by_profile(self):
         """In multiplex mode every /p/<profile>/... route shares one adapter
@@ -594,7 +663,7 @@ class TestRetentionLifecycle:
         assert adapter._retained_session_run_token("sess-x", profile="alpha") == "nolt_profile_a"
         assert adapter._retained_session_run_token("sess-x", profile="beta") == "nolt_profile_b"
         # Releasing one profile's holder leaves the other's entry untouched.
-        adapter._release_session_run_token("sess-x", profile="beta")
+        adapter._release_session_run_token("sess-x", "nolt_profile_b", profile="beta")
         assert adapter._retained_session_run_token("sess-x", profile="alpha") == "nolt_profile_a"
 
 
@@ -634,6 +703,44 @@ class TestDelegationOriginCredential:
         replayed: dict = {"type": "async_delegation", "delegation_id": "d1"}
         _attach_origin_nolgia_token(replayed, {})
         assert "origin_nolgia_token" not in replayed
+
+    def test_stale_dispatch_credential_is_dropped(self):
+        """A detached delegation can finish arbitrarily long after its
+        originating turn settled. Past the credential's validity bound the wake
+        must fall back to the retained token / pod bearer instead of presenting
+        an expired token (which fails the upload outright)."""
+        from tools.async_delegation import (
+            _ORIGIN_NOLGIA_TOKEN_MAX_AGE_S,
+            _attach_origin_nolgia_token,
+        )
+
+        fresh: dict = {"type": "async_delegation", "delegation_id": "d-fresh"}
+        _attach_origin_nolgia_token(fresh, {
+            "origin_nolgia_token": "nolt_origin_run",
+            "origin_nolgia_token_at": time.monotonic() - 5,
+        })
+        assert fresh["origin_nolgia_token"] == "nolt_origin_run"
+
+        stale: dict = {"type": "async_delegation", "delegation_id": "d-stale"}
+        _attach_origin_nolgia_token(stale, {
+            "origin_nolgia_token": "nolt_origin_run",
+            "origin_nolgia_token_at": (
+                time.monotonic() - _ORIGIN_NOLGIA_TOKEN_MAX_AGE_S - 1
+            ),
+        })
+        assert "origin_nolgia_token" not in stale
+
+    def test_dispatch_reads_the_origin_profile(self):
+        """Routing metadata, not a secret: the wake self-post has to re-enter
+        through the profile that served the originating turn."""
+        from tools.async_delegation import _current_origin_profile
+
+        tokens = set_session_vars(platform="api_server", profile="alpha")
+        try:
+            assert _current_origin_profile() == "alpha"
+        finally:
+            clear_session_vars(tokens)
+        assert _current_origin_profile() == ""
 
 
 class TestExecuteCodeSandboxCredential:
@@ -742,3 +849,107 @@ class TestExecuteCodeRemoteSandboxCredential:
             assert _remote_scoped_nolgia_token() == ""
         finally:
             clear_session_vars(tokens)
+
+    def test_profile_scoped_pod_credential_is_resolved_not_read_from_environ(
+        self, monkeypatch,
+    ):
+        """Under multiplexing the pod bearer lives in the ACTIVE PROFILE's
+        secret scope, not in os.environ. Gating on the process-global value
+        would decide 'this sandbox has no credential' for exactly the scoped
+        deployments the substitution exists for, so the grant check resolves
+        through the same passthrough path the child env uses."""
+        import tools.env_passthrough as ep
+        from tools.code_execution_tool import _remote_scoped_nolgia_token
+
+        monkeypatch.delenv("NOLGIA_TOKEN", raising=False)
+        monkeypatch.setattr(ep, "is_env_passthrough", lambda name: name == "NOLGIA_TOKEN")
+        monkeypatch.setattr(
+            ep, "resolve_passthrough_value", lambda _n, _fallback: "profile-scoped-pod",
+        )
+        tokens = set_session_vars(platform="api_server", nolgia_token="nolt_run")
+        try:
+            assert _remote_scoped_nolgia_token() == "nolt_run"
+        finally:
+            clear_session_vars(tokens)
+
+    def test_unscoped_multiplex_read_fails_closed(self, monkeypatch):
+        """An unscoped read while multiplexing raises; no override is produced."""
+        import tools.env_passthrough as ep
+        from tools.code_execution_tool import _remote_scoped_nolgia_token
+
+        def _boom(_name, _fallback):
+            raise RuntimeError("unscoped secret read")
+
+        monkeypatch.setenv("NOLGIA_TOKEN", "pod-wide")
+        monkeypatch.setattr(ep, "is_env_passthrough", lambda name: name == "NOLGIA_TOKEN")
+        monkeypatch.setattr(ep, "resolve_passthrough_value", _boom)
+        tokens = set_session_vars(platform="api_server", nolgia_token="nolt_run")
+        try:
+            assert _remote_scoped_nolgia_token() == ""
+        finally:
+            clear_session_vars(tokens)
+
+
+class _FakeRemoteEnv:
+    """Minimal remote-backend stand-in recording every (command, stdin) pair."""
+
+    _stdin_mode = "pipe"
+
+    def __init__(self, stdin_mode: str = "pipe"):
+        self._stdin_mode = stdin_mode
+        self.calls: list = []
+
+    def get_temp_dir(self) -> str:
+        return "/tmp"
+
+    def execute(self, command, cwd="", *, timeout=None, stdin_data=None, **_kw):
+        self.calls.append((command, stdin_data))
+        output = "OK" if "command -v python3" in command else ""
+        return {"output": output, "returncode": 0}
+
+
+class TestRemoteSandboxCredentialDelivery:
+    """How the granted credential reaches a remote sandbox script. A
+    ``VAR=value cmd`` prefix lands in the wrapping shell's argv, which any
+    co-tenant process in the sandbox can read out of /proc (and which backends
+    are free to log), so the value travels on stdin instead."""
+
+    def _script_call(self, env) -> tuple:
+        script_calls = [c for c in env.calls if "python3 script.py" in c[0]]
+        assert len(script_calls) == 1, script_calls
+        return script_calls[0]
+
+    def _run(self, monkeypatch, env, token="nolt_run"):
+        import tools.code_execution_tool as cet
+
+        monkeypatch.setattr(cet, "_get_or_create_env", lambda _tid: (env, "docker"))
+        monkeypatch.setattr(cet, "_remote_scoped_nolgia_token", lambda: token)
+        monkeypatch.setattr(cet, "_rpc_poll_loop", lambda *_a, **_kw: None)
+        cet._execute_remote("print(1)", "task-remote", ["read_file"])
+
+    def test_credential_travels_on_stdin_not_in_the_command(self, monkeypatch):
+        env = _FakeRemoteEnv()
+        self._run(monkeypatch, env)
+        command, stdin_data = self._script_call(env)
+        assert stdin_data == "nolt_run\n"
+        assert "NOLGIA_TOKEN" in command, "the script still gets the override"
+        # Not in this command, and not in any other command of the execution.
+        assert all("nolt_run" not in cmd for cmd, _stdin in env.calls)
+
+    def test_unavailable_credential_leaves_the_command_untouched(self, monkeypatch):
+        env = _FakeRemoteEnv()
+        self._run(monkeypatch, env, token="")
+        command, stdin_data = self._script_call(env)
+        assert stdin_data is None
+        assert "NOLGIA_TOKEN" not in command
+
+    def test_heredoc_backend_keeps_its_pod_credential(self, monkeypatch):
+        """Heredoc backends splice stdin back INTO the command text, which would
+        reintroduce the same argv exposure — they keep the pod-wide bearer
+        rather than gain a better-attributed but leaked credential."""
+        env = _FakeRemoteEnv(stdin_mode="heredoc")
+        self._run(monkeypatch, env)
+        command, stdin_data = self._script_call(env)
+        assert stdin_data is None
+        assert "NOLGIA_TOKEN" not in command
+        assert all("nolt_run" not in cmd for cmd, _stdin in env.calls)

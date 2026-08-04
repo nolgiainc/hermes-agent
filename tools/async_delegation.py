@@ -698,6 +698,25 @@ def _current_origin_nolgia_token() -> str:
         return ""
 
 
+def _current_origin_profile() -> str:
+    """Multiplex profile of the ORIGINATING turn, or ``""`` (default profile).
+
+    Carried on the completion event so the wake self-post re-enters through
+    that profile's ``/p/<profile>/...`` route: a multiplexed session lives in
+    its own profile runtime (own ``HERMES_HOME``/state, own secret scope, own
+    retained-credential scope), and the unprefixed route would resume the
+    continuation under the DEFAULT profile instead (NOL-413). Not a secret, so
+    unlike the credential it may ride the persisted event and survive a durable
+    replay.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        return (get_session_env("HERMES_SESSION_PROFILE", "") or "").strip()
+    except Exception:
+        return ""
+
+
 def dispatch_async_delegation(
     *,
     goal: str,
@@ -770,6 +789,12 @@ def dispatch_async_delegation(
         "origin_session_id": origin_session_id,
         # In-memory only — never persisted (see _current_origin_nolgia_token).
         "origin_nolgia_token": _current_origin_nolgia_token(),
+        # Capture time of that credential: a detached delegation has no
+        # wall-clock bound, so a late completion must not present a token whose
+        # server-side validity has since lapsed (see
+        # _attach_origin_nolgia_token).
+        "origin_nolgia_token_at": time.monotonic(),
+        "origin_profile": _current_origin_profile(),
         "parent_session_id": parent_session_id,
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -886,6 +911,18 @@ def _finish_finalization(delegation_id: str, status: str) -> None:
         _prune_completed_locked()
 
 
+# A dispatch-time turn credential is only worth carrying while the platform
+# still honors it. nolgia-api keeps a turn credential valid while its turn is
+# pending and for agentTurnCredentialSettleGrace (2h) after it settles, and the
+# originating turn was pending at dispatch — so a token is certainly still
+# valid up to 2h past dispatch, whenever its turn settled. This bound stays
+# inside that window with room for the wake turn's own runtime. Past it the
+# field is dropped: the wake then falls back to the session's retained token or
+# the pod bearer (unattributed, but authenticated) instead of presenting an
+# expired credential that _run_agent would PREFER over both and fail auth with.
+_ORIGIN_NOLGIA_TOKEN_MAX_AGE_S = 90 * 60
+
+
 def _attach_origin_nolgia_token(
     evt: Dict[str, Any], record: Dict[str, Any],
 ) -> None:
@@ -895,10 +932,27 @@ def _attach_origin_nolgia_token(
     disk. The gateway hands it to the wake self-post (gateway.wake) so the
     continuation turn runs under the credential of the run that spawned the
     delegation.
+
+    A credential older than ``_ORIGIN_NOLGIA_TOKEN_MAX_AGE_S`` is dropped: a
+    detached delegation can finish arbitrarily long after its originating turn
+    settled, and a stale token is worse than none.
     """
     token = str(record.get("origin_nolgia_token") or "")
-    if token:
-        evt["origin_nolgia_token"] = token
+    if not token:
+        return
+    captured_at = record.get("origin_nolgia_token_at")
+    if isinstance(captured_at, (int, float)):
+        age = time.monotonic() - float(captured_at)
+        if age > _ORIGIN_NOLGIA_TOKEN_MAX_AGE_S:
+            logger.info(
+                "Async delegation %s: dropping the originating run credential "
+                "(%.0fs old, past the %ds validity bound); the wake will fall "
+                "back to the session's retained token",
+                record.get("delegation_id"), age,
+                _ORIGIN_NOLGIA_TOKEN_MAX_AGE_S,
+            )
+            return
+    evt["origin_nolgia_token"] = token
 
 
 def _push_completion_event(
@@ -932,6 +986,9 @@ def _push_completion_event(
         "session_key": record.get("session_key", ""),
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
         "origin_session_id": record.get("origin_session_id", ""),
+        # Routing metadata, not a secret: the wake self-post must re-enter
+        # through the originating profile's route (see _current_origin_profile).
+        "origin_profile": record.get("origin_profile", ""),
         "parent_session_id": record.get("parent_session_id"),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
@@ -1033,6 +1090,12 @@ def dispatch_async_delegation_batch(
         "origin_session_id": origin_session_id,
         # In-memory only — never persisted (see _current_origin_nolgia_token).
         "origin_nolgia_token": _current_origin_nolgia_token(),
+        # Capture time of that credential: a detached delegation has no
+        # wall-clock bound, so a late completion must not present a token whose
+        # server-side validity has since lapsed (see
+        # _attach_origin_nolgia_token).
+        "origin_nolgia_token_at": time.monotonic(),
+        "origin_profile": _current_origin_profile(),
         "parent_session_id": parent_session_id,
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -1145,6 +1208,8 @@ def _push_batch_completion_event(
         "session_key": event_record.get("session_key", ""),
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
         "origin_session_id": event_record.get("origin_session_id", ""),
+        # See _current_origin_profile — routing metadata, not a secret.
+        "origin_profile": event_record.get("origin_profile", ""),
         "parent_session_id": event_record.get("parent_session_id"),
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
