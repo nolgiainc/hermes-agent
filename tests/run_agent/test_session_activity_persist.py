@@ -94,7 +94,7 @@ def test_touch_activity_accepts_named_provenance(monkeypatch):
     )
 
     agent._session_db.touch_session_activity.reset_mock()
-    agent._session_activity_last_persist_mono = 0.0
+    agent._session_activity_last_persist_mono = float("-inf")
     agent._touch_activity("starting API call #1")
     assert agent._last_activity_provenance is ActivityProvenance.UNKNOWN
     agent._session_db.touch_session_activity.assert_called_once_with(

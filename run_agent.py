@@ -3732,7 +3732,13 @@ class AIAgent:
         )
 
         now_mono = time.monotonic()
-        last_mono = getattr(self, "_session_activity_last_persist_mono", 0.0)
+        # -inf default, not 0.0: monotonic() counts from boot, so on a
+        # freshly-booted host with uptime below the heartbeat interval a 0.0
+        # "never persisted" sentinel reads as "just persisted" and swallows
+        # the session's first durable stamp. -inf is always due.
+        last_mono = getattr(
+            self, "_session_activity_last_persist_mono", float("-inf")
+        )
         if (now_mono - last_mono) < SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS:
             return
         self._session_activity_last_persist_mono = now_mono

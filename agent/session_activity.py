@@ -67,9 +67,17 @@ def reset_session_activity_persist_window(agent: Any) -> None:
     write through even if a stamp landed within the last 60s. Used for
     terminal compression labels that must not stay stuck on mid-compress
     text (e.g. "context compression in progress" after /compress).
+
+    ``-inf``, not ``0.0``: the due-check is ``time.monotonic() - last >=
+    interval`` and ``time.monotonic()`` counts from an arbitrary origin
+    (boot on Linux). On a freshly-booted host (or CI microVM) with uptime
+    below the interval, ``0.0`` reads as "a stamp just landed" and the
+    forced write is silently dropped — the exact terminal-label stick this
+    helper exists to prevent. ``-inf`` makes the next check due on any
+    clock.
     """
     try:
-        agent._session_activity_last_persist_mono = 0.0
+        agent._session_activity_last_persist_mono = float("-inf")
     except Exception:
         pass
 
