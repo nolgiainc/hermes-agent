@@ -1577,6 +1577,23 @@ class APIServerAdapter(BasePlatformAdapter):
         # Shutdown counts this reservation so the request cannot slip through
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
+        # Run-scoped Nolgia platform tokens retained per session (NOL-413).
+        # A /v1/runs submission binds its ``nolgia_token`` for the run's own
+        # turn, but pod-INTERNAL continuation turns of the same session —
+        # gateway.wake's self-POST to /v1/chat/completions after a background
+        # delegation completes — enter through _run_agent(), which has no
+        # request token to bind. Their tool subprocesses then fall back to the
+        # pod-wide NOLGIA_TOKEN and every ``nolgia assets upload`` they make
+        # lands UNATTRIBUTED (no agent_session_id stamp). Retaining the most
+        # recent run token per session lets those continuations authenticate
+        # as the turn whose work they are finishing. Keyed per session id and
+        # copied into a task-local ContextVar at bind time — concurrent turns
+        # of different sessions never share a mutable slot. Values are
+        # (token, monotonic-deadline); see _SESSION_RUN_TOKEN_TTL_S for why
+        # the client-side TTL always sits inside the credential's server-side
+        # validity window.
+        self._session_run_tokens: Dict[str, tuple] = {}
+        self._session_run_tokens_lock = threading.Lock()
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -4306,7 +4323,30 @@ class APIServerAdapter(BasePlatformAdapter):
             # Platform-relay mode (this endpoint is the relay's legacy
             # fallback): upload MEDIA:-tagged files as platform assets
             # instead of inlining 5MB base64 blobs into the transcript.
-            final_response = await _resolve_media_tags_to_platform_assets(raw_final_response)
+            #
+            # This hop runs on the request task AFTER _run_agent cleared the
+            # executor thread's session binding, so re-bind the session's
+            # retained run token (wake/session-chat continuations of a
+            # /v1/runs-submitted session — see NOL-413) for these uploads to
+            # attribute to the causing turn. Mirrors the /v1/runs egress hop.
+            # Look up by the REQUEST session id first — that is the key the
+            # /v1/runs submission retained (a mid-turn compression rotation
+            # changes result["session_id"] but not the retained key).
+            _nolgia_token_reset = None
+            _retained_token = self._retained_session_run_token(
+                str(session_id or result.get("session_id") or "")
+            )
+            if _retained_token:
+                from gateway.session_context import set_session_nolgia_token
+
+                _nolgia_token_reset = set_session_nolgia_token(_retained_token)
+            try:
+                final_response = await _resolve_media_tags_to_platform_assets(raw_final_response)
+            finally:
+                if _nolgia_token_reset is not None:
+                    from gateway.session_context import reset_session_nolgia_token
+
+                    reset_session_nolgia_token(_nolgia_token_reset)
         else:
             final_response = _resolve_media_to_data_urls(raw_final_response)
         is_partial = bool(result.get("partial"))
@@ -6113,6 +6153,57 @@ class APIServerAdapter(BasePlatformAdapter):
             cron_session="",
         )
 
+    # Client-side lifetime of a retained per-session run token (NOL-413).
+    # Chosen to always sit INSIDE the credential's server-side validity:
+    # nolgia-api keeps a turn credential valid while its turn is pending and
+    # for agentTurnCredentialSettleGrace (2h) after it settles, so even a
+    # token whose turn settled the moment after binding stays valid for 2h —
+    # 90 minutes from bind can never present an already-expired credential.
+    # Past the TTL, continuation turns fall back to the pod-wide bearer
+    # (today's behavior: unattributed, never failing).
+    _SESSION_RUN_TOKEN_TTL_S = 90 * 60
+
+    def _retain_session_run_token(self, session_id: str, nolgia_token: str) -> None:
+        """Remember *nolgia_token* as *session_id*'s current run credential.
+
+        Called by the /v1/runs submission path (the only entry that receives
+        a token). Pod-internal continuation turns of the same session read it
+        back via :meth:`_retained_session_run_token`. A newer run for the
+        same session overwrites the entry, so attribution follows the most
+        recent platform-submitted turn. Expired siblings are pruned here so
+        the map cannot grow past the set of recently-active sessions.
+        """
+        if not session_id or not nolgia_token:
+            return
+        now = time.monotonic()
+        with self._session_run_tokens_lock:
+            for key in [
+                k for k, (_, deadline) in self._session_run_tokens.items()
+                if deadline <= now
+            ]:
+                del self._session_run_tokens[key]
+            self._session_run_tokens[session_id] = (
+                nolgia_token,
+                now + self._SESSION_RUN_TOKEN_TTL_S,
+            )
+
+    def _retained_session_run_token(self, session_id: str) -> str:
+        """Return *session_id*'s live retained run token, or ``""``.
+
+        Read-only: a continuation turn must not extend the TTL — only a fresh
+        platform submission (which carries a fresh credential) does.
+        """
+        if not session_id:
+            return ""
+        with self._session_run_tokens_lock:
+            entry = self._session_run_tokens.get(session_id)
+        if not entry:
+            return ""
+        token, deadline = entry
+        if deadline <= time.monotonic():
+            return ""
+        return token
+
     async def _run_agent(
         self,
         user_message: str,
@@ -6165,6 +6256,18 @@ class APIServerAdapter(BasePlatformAdapter):
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
 
+        # Continuation turns for a platform-submitted session — gateway.wake's
+        # self-POST to /v1/chat/completions after a background delegation
+        # completes, and native session-chat turns — arrive here with NO
+        # request credential (only /v1/runs carries one). Without a binding,
+        # every tool subprocess of the continuation falls back to the pod-wide
+        # NOLGIA_TOKEN and its uploads land unattributed (NOL-413: the
+        # "sibling upload lost the turn credential" hole). Re-bind the
+        # session's retained run token so the continuation authenticates as
+        # the turn whose work it is finishing; sessions never submitted via
+        # /v1/runs resolve "" and keep today's behavior byte-for-byte.
+        retained_nolgia_token = self._retained_session_run_token(session_id or "")
+
         def _run():
             from gateway.session_context import clear_session_vars
 
@@ -6173,6 +6276,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    nolgia_token=retained_nolgia_token,
                 )
                 agent = None
                 try:
@@ -6619,6 +6723,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = session_id or run_id
+        # Retain the run credential for this session BEFORE the run starts:
+        # a background delegation the run dispatches can complete (and wake
+        # the session via self-POST) while the run itself is still executing,
+        # and that continuation must find the token already retained. See
+        # _retain_session_run_token / _run_agent's retained-token re-bind
+        # (NOL-413).
+        if nolgia_token:
+            self._retain_session_run_token(session_id, nolgia_token)
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
