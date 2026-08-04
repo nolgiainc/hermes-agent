@@ -14,7 +14,7 @@ Exposes an HTTP server with endpoints:
 - GET  /api/sessions/{session_id}/messages — read session message history
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
-- POST /v1/runs                    — start a run, returns run_id immediately (202)
+- POST /v1/runs                    — start a run, returns run_id immediately (202; Idempotency-Key replay returns the original run_id)
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
@@ -1303,6 +1303,30 @@ class _IdempotencyCache:
         while len(self._store) > self._max:
             self._store.popitem(last=False)
 
+    def get(self, key: str, fingerprint: str):
+        """Return the cached response for (key, fingerprint), or None.
+
+        Pure probe with no compute side: lets a handler short-circuit a
+        replay before request gates (e.g. the /v1/runs concurrency limit)
+        that must not bounce an idempotent retry of already-admitted work.
+        """
+        self._purge()
+        item = self._store.get(key)
+        if item and item["fp"] == fingerprint:
+            return item["resp"]
+        return None
+
+    def put(self, key: str, fingerprint: str, resp) -> None:
+        """Store a response for (key, fingerprint) without a compute step.
+
+        For handlers whose "computation" is synchronous registration work
+        with no suspension point between their ``get()`` probe and this
+        store — there the ``get_or_set()`` in-flight machinery has nothing
+        to dedupe, and the probe/store pair is atomic on the event loop.
+        """
+        self._store[key] = {"resp": resp, "fp": fingerprint, "ts": time.time()}
+        self._purge()
+
     async def get_or_set(self, key: str, fingerprint: str, compute_coro):
         self._purge()
         item = self._store.get(key)
@@ -1338,6 +1362,24 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     from hashlib import sha256
     subset = {k: body.get(k) for k in keys}
     return sha256(repr(subset).encode("utf-8")).hexdigest()
+
+
+# Body fields that define a POST /v1/runs submission for Idempotency-Key
+# replay detection. ``nolgia_token`` is deliberately excluded: it is a
+# short-lived per-attempt credential a supervisor may re-mint on retry, and
+# a rotated token must still match the original submission (a fingerprint
+# miss would re-execute the run — the exact double-billing this header
+# exists to prevent).
+_RUNS_IDEMPOTENCY_FINGERPRINT_KEYS = [
+    "input",
+    "instructions",
+    "previous_response_id",
+    "conversation_history",
+    "session_id",
+    "model",
+    "provider",
+    "model_options",
+]
 
 
 def _derive_chat_session_id(
@@ -3124,6 +3166,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
+                # POST /v1/runs honors Idempotency-Key: replaying a key with
+                # an identical body returns the ORIGINAL run_id without
+                # starting a second run. The platform relay gates widening
+                # its submit-retry classes (ambiguous 502/504, lost 202) on
+                # this flag — pods roll gradually, so it must not retry
+                # broadly against a pod that would double-execute.
+                "run_idempotency": True,
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
@@ -6429,22 +6478,54 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
-        """POST /v1/runs — start an agent run, return run_id immediately."""
+        """POST /v1/runs — start an agent run, return run_id immediately.
+
+        Supports ``Idempotency-Key``: replaying a key (within the cache TTL,
+        with an identical submission body) returns the ORIGINAL run_id
+        instead of starting — and billing — a second run, so supervisors can
+        safely retry a submit whose 202 was lost to an ambiguous 502/504 or
+        transport failure.
+        """
         # Long-term memory scope header (see chat_completions for details).
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        # Idempotent replay short-circuit. Probed BEFORE the concurrency gate
+        # on purpose (unlike /v1/chat/completions and /v1/responses, where the
+        # cache wraps the in-request computation): the original run may itself
+        # hold the last concurrency slot, and bouncing its own replay with 429
+        # until it finishes could outlive the idempotency TTL — re-executing
+        # exactly the work the retry was trying not to duplicate. A replay
+        # returns the original 202 payload and consumes no run slot.
+        idempotency_key = request.headers.get("Idempotency-Key")
+        idem_fp = None
+        if idempotency_key:
+            idem_fp = _make_request_fingerprint(
+                body, keys=_RUNS_IDEMPOTENCY_FINGERPRINT_KEYS
+            )
+            replayed = _idem_cache.get(idempotency_key, idem_fp)
+            if replayed is not None:
+                return web.json_response(
+                    replayed,
+                    status=202,
+                    headers=(
+                        {"X-Hermes-Session-Key": gateway_session_key}
+                        if gateway_session_key
+                        else {}
+                    ),
+                )
 
         # Enforce concurrency limit (shared across all agent-serving
         # endpoints; configurable via gateway.api_server.max_concurrent_runs).
         limited = self._concurrency_limited_response()
         if limited is not None:
             return limited
-
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response(_openai_error("Invalid JSON"), status=400)
 
         raw_input = body.get("input")
         if not raw_input:
@@ -6894,11 +6975,22 @@ class APIServerAdapter(BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
+        run_payload = {"run_id": run_id, "status": "started"}
+        if idempotency_key:
+            # Record the submission for replay only once the run is fully
+            # registered (streams, status, task): a submission that raised
+            # above caches nothing, so its retry re-submits. The handler has
+            # no suspension point between the cache probe at the top and this
+            # store, so two same-key submissions cannot interleave — the
+            # first stores its run_id, the second replays it. (Do not add an
+            # await between probe and store without revisiting this.)
+            _idem_cache.put(idempotency_key, idem_fp, run_payload)
+
         response_headers = (
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
         )
         return web.json_response(
-            {"run_id": run_id, "status": "started"},
+            run_payload,
             status=202,
             headers=response_headers,
         )
