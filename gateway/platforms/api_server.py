@@ -3264,6 +3264,19 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        # Derived from the EFFECTIVE configuration, never hardcoded: the
+        # platform raises per-user concurrency on this flag, so a deployment
+        # whose session workspaces are off (mode off, an operator-pinned
+        # terminal.cwd, a non-local terminal backend) or whose scratch base
+        # is not writable must not advertise isolation it cannot provide.
+        try:
+            from gateway.session_workspace import session_workspaces_active
+
+            session_workspaces = session_workspaces_active()
+        except Exception:
+            logger.debug("session workspace capability probe failed", exc_info=True)
+            session_workspaces = False
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -3313,8 +3326,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 # the workspace identity explicitly (the platform session
                 # UUID aligns the scratch dir with the relayed
                 # attachment-staging dir). NOL-414; the platform gates the
-                # per-user concurrency bump on this flag.
-                "session_workspaces": True,
+                # per-user concurrency bump on this flag, so it reports the
+                # EFFECTIVE state (gateway.session_workspaces config +
+                # provisionable scratch base) rather than a constant.
+                "session_workspaces": session_workspaces,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -6286,8 +6301,13 @@ class APIServerAdapter(BasePlatformAdapter):
         dir would silently drop workspace doctrine from the system prompt.
         Absolute paths are not fenced either: shared read-only resources
         (git checkouts, config, skills) stay reachable exactly as before.
-        Disabled deployments (operator-pinned TERMINAL_CWD, or
-        HERMES_SESSION_WORKSPACES=0) bind exactly as before.
+        Deployments where workspaces do not apply bind exactly as before:
+        ``gateway.session_workspaces.mode: off``, an operator-pinned
+        ``terminal.cwd``, or a non-local terminal backend (docker/ssh/modal/
+        daytona/singularity/vercel — commands there execute where a
+        gateway-host workspace path does not exist and the ``TMPDIR`` bridge
+        is LocalEnvironment-only, so ``ensure_session_workspace`` returns
+        None instead of pointing the turn's ``cd`` at a missing directory).
 
         ``profile`` is the multiplex profile serving THIS request
         (``_api_request_profile``, captured on the request task — the ContextVar

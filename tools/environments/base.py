@@ -20,7 +20,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import deque
 from pathlib import Path
-from typing import IO, Callable, Iterable, Protocol
+from typing import IO, Callable, Iterable, Optional, Protocol
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -473,23 +473,70 @@ def _cwd_marker(session_id: str) -> str:
 # credential — and its causal attribution — to every sibling run's later
 # commands. The pod-wide value keeps flowing to children through plain env
 # inheritance regardless; only snapshot PERSISTENCE is suppressed.
-# TMPDIR (exact name) is excluded for the same reason (NOL-414): with
-# session-scoped scratch workspaces the bridge points each command's TMPDIR
-# at its own session dir, and a snapshot capturing one session's override
-# would redirect every sibling session's later scratch writes into a FOREIGN
-# session's workspace — the exact cross-session artifact leak the override
-# exists to close. A process-level TMPDIR still reaches children through
-# plain env inheritance; only snapshot persistence (an in-shell `export
-# TMPDIR=...` carrying across commands) is suppressed.
+_SNAPSHOT_EXCLUDED_ENV_PATTERNS = (
+    "HERMES_SESSION_",
+    "HERMES_UI_SESSION_ID",
+    "HERMES_CRON_AUTO_DELIVER_",
+    "HERMES_CRON_SESSION",
+    "NOLGIA_TOKEN=",
+)
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION|NOLGIA_TOKEN=|TMPDIR=)"
+    "^declare -x (" + "|".join(_SNAPSHOT_EXCLUDED_ENV_PATTERNS) + ")"
+)
+
+# TMPDIR is excluded ONLY for turns whose TMPDIR Hermes itself owns — i.e. a
+# turn bound to a session-scoped scratch workspace (NOL-414), where the
+# per-command bridge points TMPDIR at that session's dir. Snapshotting that
+# value would redirect every sibling session's later scratch writes into a
+# FOREIGN session's workspace, the exact cross-session leak the override
+# exists to close. It must NOT be excluded unconditionally: TMPDIR is a
+# normal user-controlled shell variable, and stripping it from every
+# snapshot would make a plain `export TMPDIR=/custom` in the CLI (or any
+# deployment with session workspaces disabled) silently vanish on the next
+# command.
+_SCOPED_TMPDIR_SNAPSHOT_ENV_REGEX = (
+    "^declare -x ("
+    + "|".join(_SNAPSHOT_EXCLUDED_ENV_PATTERNS + ("TMPDIR=",))
+    + ")"
 )
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _session_scoped_tmpdir_active() -> bool:
+    """True when the gateway bound a per-session scratch workspace for THIS turn.
+
+    Read from the session ContextVar (not os.environ) so a sibling session's
+    stale process-global can never make this turn suppress the user's own
+    TMPDIR. Unbound (CLI, single-session hosts, deployments with session
+    workspaces off) → TMPDIR is the user's variable and persists normally.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        return bool(get_session_env("HERMES_SESSION_SCRATCH_DIR"))
+    except Exception:
+        return False
+
+
+def snapshot_excluded_env_regex(scoped_tmpdir: Optional[bool] = None) -> str:
+    """Python-side contract for the snapshot exclusion set.
+
+    ``scoped_tmpdir`` defaults to whether this turn owns a session-scoped
+    TMPDIR (see :func:`_session_scoped_tmpdir_active`).
+    """
+    if scoped_tmpdir is None:
+        scoped_tmpdir = _session_scoped_tmpdir_active()
+    return (
+        _SCOPED_TMPDIR_SNAPSHOT_ENV_REGEX
+        if scoped_tmpdir
+        else _SNAPSHOT_EXCLUDED_ENV_REGEX
+    )
 
 
 def _export_dump_excluding_session_vars(
     tmp_path: str,
     excluded_names: Iterable[str] = (),
+    scoped_tmpdir: Optional[bool] = None,
 ) -> str:
     """Return a shell snippet that dumps ``export -p`` to *tmp_path* minus the
     per-session bridged vars (see ``_SNAPSHOT_EXCLUDED_ENV_REGEX``) and any
@@ -511,6 +558,10 @@ def _export_dump_excluding_session_vars(
     potentially inconsistently with the parent that expands the follow-up
     ``mv``. The brace-group redirect is expanded in the current shell,
     keeping both expansions consistent.
+
+    ``scoped_tmpdir`` adds TMPDIR to the unset list; it defaults to whether
+    this turn's TMPDIR is Hermes-owned (a bound session workspace), so a
+    user's own ``export TMPDIR=/custom`` keeps persisting everywhere else.
     """
     # ${!PREFIX*} is bash 3.2+ name-prefix expansion; empty matches are fine
     # because ``unset`` with only missing names is ignored under 2>/dev/null.
@@ -520,13 +571,17 @@ def _export_dump_excluding_session_vars(
         name for name in excluded_names
         if isinstance(name, str) and name
     }
+    if scoped_tmpdir is None:
+        scoped_tmpdir = _session_scoped_tmpdir_active()
+    if scoped_tmpdir:
+        safe_names.add("TMPDIR")
     extra_unset = " ".join(shlex.quote(name) for name in sorted(safe_names))
     if extra_unset:
         extra_unset = f" {extra_unset}"
     return (
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        f"HERMES_UI_SESSION_ID NOLGIA_TOKEN TMPDIR{extra_unset} 2>/dev/null; "
+        f"HERMES_UI_SESSION_ID NOLGIA_TOKEN{extra_unset} 2>/dev/null; "
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"
@@ -814,13 +869,31 @@ class BaseEnvironment(ABC):
         parts = []
         passthrough_names = self._snapshot_excluded_passthrough_names()
 
+        # Read the ContextVar once so the restore list below and the re-dump
+        # further down agree on whether this turn owns its TMPDIR.
+        scoped_tmpdir = _session_scoped_tmpdir_active()
+
         # A shared snapshot may contain the previous profile's value. Save
         # the current process environment before sourcing it, then restore the
         # current profile's value (or unset the name) immediately afterwards.
         # Values stay in environment memory and never enter the shell command
         # string, so secrets are not exposed through process arguments/logs.
+        #
+        # TMPDIR joins that list for session-scoped turns (NOL-414). Excluding
+        # it from the RE-DUMP only stops this turn from publishing its value;
+        # a snapshot written EARLIER by an unscoped turn (a CLI/messaging
+        # `export TMPDIR=/custom`, or any turn before workspaces engaged) still
+        # carries a `declare -x TMPDIR=…` line, and sourcing that would
+        # overwrite the per-command bridge's session scratch dir: it would
+        # silently send this run's temp artifacts back to the shared/foreign
+        # directory the workspace exists to replace. Save-and-restore around
+        # the source keeps the bound workspace authoritative.
+        restore_names = list(passthrough_names)
+        if scoped_tmpdir and "TMPDIR" not in restore_names:
+            restore_names.append("TMPDIR")
+
         saved_names: list[tuple[str, str, str]] = []
-        for name in passthrough_names:
+        for name in restore_names:
             marker = f"_HERMES_RUNTIME_PASSTHROUGH_{name}"
             present = f"{marker}_PRESENT"
             value = f"{marker}_VALUE"
@@ -870,7 +943,7 @@ class BaseEnvironment(ABC):
         if self._snapshot_ready:
             parts.append(
                 f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) && "
-                f"{{ {_export_dump_excluding_session_vars(_snap_tmp, passthrough_names)} "
+                f"{{ {_export_dump_excluding_session_vars(_snap_tmp, passthrough_names, scoped_tmpdir=scoped_tmpdir)} "
                 f"&& mv -f {_snap_tmp} {_quoted_snap}; }} "
                 f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
             )
