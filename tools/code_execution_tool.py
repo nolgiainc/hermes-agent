@@ -1071,6 +1071,34 @@ def _rpc_poll_loop(
             stop_event.wait(poll_interval)
 
 
+def _remote_scoped_nolgia_token() -> str:
+    """Turn-scoped NOLGIA_TOKEN for a REMOTE sandbox script, or ``""``.
+
+    Non-local backends (Docker, SSH, Modal, ...) never build a scrubbed child
+    env — the sandbox script inherits the backend's own runtime environment,
+    which carries the POD-wide bearer — so the local path's
+    ``apply_run_scoped_nolgia_token`` substitution cannot reach them and a
+    sandbox script spawning the nolgia CLI uploads unattributed (NOL-413).
+
+    Same substitution-only semantics as the local path: a value is returned
+    only when the sandbox's own grant policy already lets ``NOLGIA_TOKEN``
+    through (skill/config env passthrough) AND a run token is bound in this
+    task's context. A sandbox the policy withheld the credential from never
+    receives one here either.
+    """
+    pod_value = os.environ.get("NOLGIA_TOKEN")
+    if not pod_value:
+        return ""
+    if "NOLGIA_TOKEN" not in _scrub_child_env({"NOLGIA_TOKEN": pod_value}):
+        return ""
+    try:
+        from gateway.session_context import get_session_env
+
+        return get_session_env("HERMES_SESSION_NOLGIA_TOKEN", "").strip()
+    except Exception:
+        return ""
+
+
 def _execute_remote(
     code: str,
     task_id: Optional[str],
@@ -1162,6 +1190,14 @@ def _execute_remote(
         tz = os.getenv("HERMES_TIMEZONE", "").strip()
         if tz:
             env_prefix += f" TZ={shlex.quote(tz)}"
+        # Attribution for a granted credential on a remote backend: override
+        # NOLGIA_TOKEN for THIS script's process only (a command prefix, so it
+        # is never exported into the backend's shared shell snapshot — which
+        # excludes NOLGIA_TOKEN for exactly this reason). Mirrors the local
+        # path's substitution; see _remote_scoped_nolgia_token.
+        scoped_nolgia_token = _remote_scoped_nolgia_token()
+        if scoped_nolgia_token:
+            env_prefix += f" NOLGIA_TOKEN={shlex.quote(scoped_nolgia_token)}"
 
         # Execute the script on the remote backend
         logger.info("Executing code on %s backend (task %s)...",

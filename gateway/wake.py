@@ -59,6 +59,7 @@ async def deliver_wake(
     text: str,
     session_id: str = "",
     source: Any = None,
+    nolgia_token: str = "",
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
 
@@ -66,6 +67,16 @@ async def deliver_wake(
     ``state.db`` key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` used to build the synthetic event — required for
     push-capable adapters.
+
+    ``nolgia_token`` is the run-scoped Nolgia credential of the ORIGINATING
+    turn (the run whose detached work this wake reports). Carried on the
+    self-post so the continuation's CLI work attributes to that run rather than
+    to whichever turn the session ran most recently — same-session concurrent
+    runs are supported, and a detached delegation has no wall-clock bound, so
+    the two can differ (NOL-413). Empty means "no run scoping"; the API server
+    then falls back to the session's retained token. Push-capable adapters
+    ignore it: their wake re-enters through the normal message pipeline, which
+    binds its own session context.
 
     Raises on failure (bad arguments, exhausted retries, HTTP error) so the
     caller can rewind/retry instead of treating the wake as delivered.
@@ -91,11 +102,13 @@ async def deliver_wake(
             "deliver_wake: non-push adapter (supports_async_delivery=False) "
             "requires the raw session id to self-post the wake turn"
         )
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id)
+    await _self_post_chat_completion(
+        adapter, text=text, session_id=session_id, nolgia_token=nolgia_token,
+    )
 
 
 async def _self_post_chat_completion(
-    adapter: Any, *, text: str, session_id: str
+    adapter: Any, *, text: str, session_id: str, nolgia_token: str = ""
 ) -> None:
     """POST the wake text to the in-pod API server as a normal session turn.
 
@@ -132,6 +145,12 @@ async def _self_post_chat_completion(
         "messages": [{"role": "user", "content": text}],
         "stream": False,
     }
+    if nolgia_token:
+        # Attribution for the continuation turn: the ORIGINATING run's
+        # credential, so its tool subprocesses (nolgia CLI uploads) name the
+        # turn whose work this wake finishes. Loopback POST on the in-pod API
+        # server, gated by the same bearer as every other request; never logged.
+        payload["nolgia_token"] = nolgia_token
 
     last_err: Optional[BaseException] = None
     attempts = 1 + len(_RETRY_DELAYS_SECONDS)

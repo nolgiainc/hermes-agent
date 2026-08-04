@@ -98,6 +98,37 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
     ]
 
 
+def test_deliver_wake_carries_the_originating_runs_credential():
+    """The self-post carries the run-scoped Nolgia credential of the turn whose
+    detached work the wake reports, so the continuation's CLI uploads attribute
+    to that run instead of the session's latest turn (NOL-413). Absent one, the
+    field is omitted entirely and the API server falls back to its retained
+    token / the pod bearer."""
+    from aiohttp import web
+
+    seen = {}
+
+    async def handler(request):
+        seen["body"] = await request.json()
+        return web.json_response({"choices": []})
+
+    async def run(token):
+        runner, port = await _serve(handler)
+        try:
+            adapter = ApiServerLikeAdapter(port=port)
+            await deliver_wake(
+                adapter, text="done", session_id="sid", nolgia_token=token
+            )
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run("nolt_origin_run"))
+    assert seen["body"]["nolgia_token"] == "nolt_origin_run"
+
+    asyncio.run(run(""))
+    assert "nolgia_token" not in seen["body"]
+
+
 def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
     """HTTP 429 (max_concurrent_runs cap) is transient — retried with backoff."""
     from aiohttp import web
