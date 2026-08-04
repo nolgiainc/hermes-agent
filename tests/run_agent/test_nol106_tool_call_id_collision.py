@@ -285,27 +285,40 @@ class TestAssemblyGuardEmptyAssistant:
         out = AIAgent._sanitize_api_messages(history)
         assert any(m.get("role") == "assistant" for m in out)
 
-    def test_user_empty_assistant_user_leaves_no_adjacent_users(self):
-        """Dropping an empty assistant between two users must merge the users.
+    def test_user_empty_assistant_user_is_healed_without_empty_content(self):
+        """A ``user -> empty assistant -> user`` history must not reach the
+        provider carrying an empty-content turn or a same-role adjacency.
 
-        A host-fed/legacy ``user -> empty assistant -> user`` history would
-        otherwise become ``user, user`` — a same-role adjacency strict providers
-        reject — because the downstream merge pass only runs when it itself drops
-        a thinking-only turn.
+        Mechanism (post upstream sync): ``repair_empty_non_final_messages``
+        substitutes an honest ``[response interrupted]`` placeholder into the
+        empty non-final assistant turn — preserving role alternation — rather
+        than dropping it and merging the newly-adjacent users. Either shape is
+        provider-safe; the invariants below are what actually matter.
         """
         history = [
             {"role": "user", "content": "first"},
-            {"role": "assistant", "content": ""},  # no payload — dropped
+            {"role": "assistant", "content": ""},  # no payload — healed
             {"role": "user", "content": "second"},
         ]
         out = AIAgent._sanitize_api_messages(history)
 
-        assert all(m.get("role") != "assistant" for m in out)
+        # No empty-content message survives to the wire.
+        for m in out:
+            if m.get("role") in ("user", "assistant") and not m.get("tool_calls"):
+                content = m.get("content")
+                assert isinstance(content, str) and content.strip(), (
+                    f"empty-content {m.get('role')} turn reached the payload"
+                )
+        # No same-role user adjacency for strict providers.
         roles = [m.get("role") for m in out]
         assert not any(
             roles[i] == "user" and roles[i + 1] == "user"
             for i in range(len(roles) - 1)
         )
-        merged = [m for m in out if m.get("role") == "user"]
-        assert len(merged) == 1
-        assert "first" in merged[0]["content"] and "second" in merged[0]["content"]
+        # Both real user turns survive, in order.
+        user_contents = [m["content"] for m in out if m.get("role") == "user"]
+        assert user_contents == ["first", "second"]
+        # The healed assistant turn carries the documented placeholder.
+        assistants = [m for m in out if m.get("role") == "assistant"]
+        assert len(assistants) == 1
+        assert assistants[0]["content"] == "[response interrupted]"

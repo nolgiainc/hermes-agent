@@ -3318,7 +3318,14 @@ def repair_empty_non_final_messages(
             and isinstance(msg, dict)
             # tool results are validated by their own orphan/pairing pass; an
             # empty tool result is a separate (and rarer) concern.
-            and msg.get("role") in ("assistant", "user")
+            #
+            # Assistant turns ONLY: an empty USER message is never legitimate
+            # to send (NOL-216), so the empty-turn drop pass later in
+            # ``sanitize_api_messages`` removes it outright and merges any
+            # ``user, user`` seam the drop leaves behind. Substituting a
+            # placeholder here would make that pass see non-empty content and
+            # ship a user turn the user never wrote.
+            and msg.get("role") == "assistant"
             and not _msg_has_payload(msg)
         ):
             # Shallow-copy so stored history / prompt caching stays byte-stable.
