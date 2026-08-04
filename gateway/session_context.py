@@ -138,6 +138,16 @@ _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_
 # excluded from the shared shell snapshot (_SNAPSHOT_EXCLUDED_ENV_REGEX).
 _SESSION_NOLGIA_TOKEN: ContextVar = ContextVar("HERMES_SESSION_NOLGIA_TOKEN", default=_UNSET)
 
+# Session-scoped scratch workspace (NOL-414). Bound by the API server to the
+# per-session directory (gateway.session_workspace, ``<base>/session-<id8>/``)
+# that is this turn's default write surface. Read by the subprocess env bridge
+# (tools/environments/local.py), which also redirects the child's TMPDIR to it
+# so concurrent runs from different sessions stop sharing one scratch dir.
+# The HERMES_SESSION_ prefix is load-bearing: task-scoped (no sibling-run
+# leak: _UNSET strips) and excluded from the shared shell snapshot
+# (_SNAPSHOT_EXCLUDED_ENV_REGEX).
+_SESSION_SCRATCH_DIR: ContextVar = ContextVar("HERMES_SESSION_SCRATCH_DIR", default=_UNSET)
+
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
@@ -157,6 +167,7 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
     "HERMES_SESSION_NOLGIA_TOKEN": _SESSION_NOLGIA_TOKEN,
+    "HERMES_SESSION_SCRATCH_DIR": _SESSION_SCRATCH_DIR,
 }
 
 
@@ -232,6 +243,7 @@ def set_session_vars(
     async_delivery: bool = True,
     ui_session_id: str = "",
     nolgia_token: str = "",
+    scratch_dir: str = "",
     cron_session: Any = _UNSET,
 ) -> list:
     """Set all session context variables and return reset tokens.
@@ -243,6 +255,11 @@ def set_session_vars(
     only for API compatibility.
 
     ``cwd`` pins the logical working directory for this context.
+
+    ``scratch_dir`` binds the session-scoped scratch workspace
+    (``HERMES_SESSION_SCRATCH_DIR``, see gateway.session_workspace): the
+    subprocess env bridge points child TMPDIRs at it so concurrent turns
+    from different sessions don't share one scratch surface.
 
     ``async_delivery`` declares whether this session's channel can route a
     background completion back to the agent after the turn ends (see
@@ -275,6 +292,7 @@ def set_session_vars(
         _CRON_SESSION.set(cron_session),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
         _SESSION_NOLGIA_TOKEN.set(nolgia_token),
+        _SESSION_SCRATCH_DIR.set(scratch_dir),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -311,6 +329,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
         _SESSION_NOLGIA_TOKEN,
+        _SESSION_SCRATCH_DIR,
         _CRON_SESSION,
     ):
         var.set("")

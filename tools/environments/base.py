@@ -473,8 +473,16 @@ def _cwd_marker(session_id: str) -> str:
 # credential — and its causal attribution — to every sibling run's later
 # commands. The pod-wide value keeps flowing to children through plain env
 # inheritance regardless; only snapshot PERSISTENCE is suppressed.
+# TMPDIR (exact name) is excluded for the same reason (NOL-414): with
+# session-scoped scratch workspaces the bridge points each command's TMPDIR
+# at its own session dir, and a snapshot capturing one session's override
+# would redirect every sibling session's later scratch writes into a FOREIGN
+# session's workspace — the exact cross-session artifact leak the override
+# exists to close. A process-level TMPDIR still reaches children through
+# plain env inheritance; only snapshot persistence (an in-shell `export
+# TMPDIR=...` carrying across commands) is suppressed.
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION|NOLGIA_TOKEN=)"
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION|NOLGIA_TOKEN=|TMPDIR=)"
 )
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -518,7 +526,7 @@ def _export_dump_excluding_session_vars(
     return (
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        f"HERMES_UI_SESSION_ID NOLGIA_TOKEN{extra_unset} 2>/dev/null; "
+        f"HERMES_UI_SESSION_ID NOLGIA_TOKEN TMPDIR{extra_unset} 2>/dev/null; "
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"
