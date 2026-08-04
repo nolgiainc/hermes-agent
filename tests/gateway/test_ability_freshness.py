@@ -147,6 +147,30 @@ def test_install_flip_keeps_previous_version(tmp_path):
     assert installer.installed_version("short-film") == "1.2.0"
 
 
+def test_install_retention_ignores_directory_mtimes(tmp_path):
+    """Retention keeps the version the flip replaced, whatever the mtimes say.
+
+    Version dir timestamps are not a reliable install order: three installs can
+    land inside one filesystem timestamp tick, and a filesystem that only keeps
+    second-resolution timestamps ties them all. Here 1.0.0 is stamped NEWER
+    than 1.1.0 to stand in for that lost ordering — retention must still drop
+    1.0.0 and keep 1.1.0, the tree an in-flight turn may be reading.
+    """
+    installer = AbilityInstaller(home=tmp_path)
+    installer.install("short-film", "1.0.0", _tar_gz({"SKILL.md": "# v1"}))
+    installer.install("short-film", "1.1.0", _tar_gz({"SKILL.md": "# v2"}))
+
+    store = tmp_path / "ability-versions" / "short-film"
+    os.utime(store / "1.1.0", (1_000_000, 1_000_000))
+    os.utime(store / "1.0.0", (2_000_000, 2_000_000))
+
+    installer.install("short-film", "1.2.0", _tar_gz({"SKILL.md": "# v3"}))
+
+    assert not (store / "1.0.0").exists()
+    assert (store / "1.1.0" / "SKILL.md").read_text() == "# v2"
+    assert (store / "1.2.0" / "SKILL.md").read_text() == "# v3"
+
+
 def test_install_migrates_legacy_real_dir(tmp_path):
     """The pre-NOL-416 layout (real dir from rmtree+rename) migrates to a
     symlink on the first push install."""

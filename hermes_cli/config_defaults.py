@@ -2454,6 +2454,29 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # Per-session scratch workspaces (NOL-414). On a host serving many
+        # concurrent sessions (the API server), every turn used to share one
+        # default cwd and one TMPDIR, so two runs could overwrite each
+        # other's fixed-path files. When engaged, each session's turns get
+        # <scratch_base>/session-<id8>/ as their default cwd + subprocess
+        # TMPDIR.
+        #   mode: "auto" engages unless terminal.cwd pins a real project
+        #     workspace (an explicit "all my turns work here" choice);
+        #     "on" forces it, "off" disables it. Only the local terminal
+        #     backend is affected — a container/SSH backend executes where a
+        #     host workspace path does not exist.
+        #   scratch_base: base directory for the per-session dirs; empty
+        #     means $HERMES_HOME/tmp.
+        #   retention_hours: how long an idle workspace survives before a
+        #     throttled sweep deletes it (stateless requests mint one per
+        #     call, and $HERMES_HOME/tmp usually has no tmp cleaner). 0
+        #     disables the sweep.
+        "session_workspaces": {
+            "mode": "auto",
+            "scratch_base": "",
+            "retention_hours": 48,
+        },
+
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored

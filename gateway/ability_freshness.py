@@ -72,7 +72,8 @@ VERSIONS_DIRNAME = "ability-versions"
 
 # How many versions to retain per slug (current + previous): the previous
 # version stays on disk so an in-flight turn that resolved real paths through
-# the pre-flip link keeps a working tree.
+# the pre-flip link keeps a working tree. Which tree that is comes from the
+# marker read before the flip, never from directory mtimes.
 KEEP_VERSIONS = 2
 
 _STATE_FILENAME = "ability-events-last-id"
@@ -191,6 +192,9 @@ class AbilityInstaller:
 
         # 2. Flip the link. The symlink target is RELATIVE so the layout
         # survives the volume being mounted at a different absolute path.
+        # Read the outgoing version BEFORE the flip: it is the tree retention
+        # has to keep alive for in-flight turns (see _prune_old_versions).
+        previous = self.installed_version(slug)
         link_path = self.skills_dir / slug
         target = os.path.join("..", VERSIONS_DIRNAME, slug, version)
         tmp_link = self.skills_dir / f".{slug}.link.tmp"
@@ -225,24 +229,31 @@ class AbilityInstaller:
         if legacy_aside is not None:
             shutil.rmtree(legacy_aside, ignore_errors=True)
 
-        self._prune_old_versions(slug, keep=version)
+        self._prune_old_versions(slug, keep=version, previous=previous)
         logger.info("ability %s: installed %s (symlink flip)", slug, version)
 
-    def _prune_old_versions(self, slug: str, keep: str) -> None:
-        """Retain the active version plus the newest KEEP_VERSIONS-1 others."""
+    def _prune_old_versions(self, slug: str, keep: str, previous: str = "") -> None:
+        """Retain KEEP_VERSIONS trees: the just-installed version and the one
+        it replaced (``previous``, read from the marker before the flip).
+
+        Retention is NOT ordered by directory mtime. Several installs can land
+        inside a single filesystem timestamp tick, and a filesystem that only
+        keeps second-resolution timestamps ties every version dir outright; a
+        tie falls through to ``os.listdir`` order, which would keep an ancient
+        tree and delete the very version an in-flight turn is still reading
+        through its pre-flip realpath.
+        """
         slug_store = self.versions_dir / slug
+        retain = {keep}
+        if previous:
+            retain.add(previous)
         try:
-            candidates = [
-                entry
-                for entry in os.listdir(slug_store)
-                if not entry.startswith(".") and entry != keep
-            ]
+            entries = os.listdir(slug_store)
         except OSError:
             return
-        candidates.sort(
-            key=lambda entry: (slug_store / entry).stat().st_mtime, reverse=True
-        )
-        for stale in candidates[KEEP_VERSIONS - 1 :]:
+        for stale in entries:
+            if stale.startswith(".") or stale in retain:
+                continue
             shutil.rmtree(slug_store / stale, ignore_errors=True)
 
 
