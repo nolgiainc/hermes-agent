@@ -1920,6 +1920,12 @@ class TestStreamTtsTempfileFallback:
         import tools.voice_mode as vm
         from tools.tts_tool import stream_tts_to_speaker
 
+        # This test asserts real playback-path behavior (temp-WAV fallback
+        # invoking the player), so it must opt out of the suite-wide audio
+        # kill-switch (conftest sets HERMES_DISABLE_AUDIO_PLAYBACK=1). No
+        # sound results: play_audio_file is stubbed below.
+        monkeypatch.setenv("HERMES_DISABLE_AUDIO_PLAYBACK", "0")
+
         # Fake registry streamer so resolve_streaming_provider yields chunked
         # PCM regardless of which real providers are configured in the env.
         class _FakeStreamer:

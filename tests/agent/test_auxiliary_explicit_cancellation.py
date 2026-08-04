@@ -495,6 +495,12 @@ def test_bedrock_silent_nonstream_request_is_isolated_without_close_wakeup() -> 
     runtime_client = _BedrockRuntimeClient(started, release)
     reset_client_cache()
     _bedrock_runtime_client_cache["us-test-1"] = runtime_client
+    # NOL-135: a budgeted call (timeout=30 in _invoke_generic's request) gets
+    # its own client cached under "region#t<seconds>" so botocore's fixed
+    # connect/read timeouts match the caller's per-attempt budget. Seed that
+    # key too, or the adapter constructs a REAL boto3 client and the request
+    # never reaches the fake transport.
+    _bedrock_runtime_client_cache["us-test-1#t30"] = runtime_client
     client = aux.BedrockAuxiliaryClient("us-test-1", "bedrock-test")
     try:
         exc, elapsed = _cancel_silent_request(client, started, _invoke_generic)
