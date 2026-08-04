@@ -7,6 +7,10 @@ def test_play_audio_file_scrubbed_env(tmp_path, monkeypatch):
     audio = tmp_path / "t.mp3"
     audio.write_bytes(b"ID3fake")
 
+    # Asserts real player-spawn behavior, so opt out of the suite-wide audio
+    # kill-switch (conftest sets HERMES_DISABLE_AUDIO_PLAYBACK=1); Popen is
+    # stubbed below, so no sound results.
+    monkeypatch.setenv("HERMES_DISABLE_AUDIO_PLAYBACK", "0")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "secret-token")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
 

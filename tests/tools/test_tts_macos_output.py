@@ -81,6 +81,10 @@ def _run_stream_offmac(monkeypatch):
     """Like _run_stream but tolerant of the sounddevice import being attempted."""
     import tools.tts_tool as tts
 
+    # Asserts the real speaker path attempts the sounddevice import, so opt
+    # out of the suite-wide audio kill-switch (conftest sets
+    # HERMES_DISABLE_AUDIO_PLAYBACK=1); everything below is mocked.
+    monkeypatch.setenv("HERMES_DISABLE_AUDIO_PLAYBACK", "0")
     monkeypatch.setattr("tools.tts_tool.platform.system", lambda: "Linux")
     monkeypatch.setattr("tools.tts_tool.get_env_value",
                         lambda name, default=None: "fake-key"
