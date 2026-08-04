@@ -471,9 +471,11 @@ def _inject_session_context_env(env: dict) -> None:
     # mktemp/tempfile writes from concurrent runs land in their own session
     # dir instead of one shared scratch surface. Unbound leaves TMPDIR
     # untouched (single-session/CLI behavior). Safe against the
-    # shared-snapshot leak channel exactly like NOLGIA_TOKEN above: TMPDIR
-    # is excluded from the shared shell snapshot
-    # (tools/environments/base._SNAPSHOT_EXCLUDED_ENV_REGEX), so one
+    # shared-snapshot leak channel exactly like NOLGIA_TOKEN above: for
+    # turns that carry a bound scratch dir — and ONLY those, so a user's own
+    # `export TMPDIR=/custom` still persists elsewhere — TMPDIR is dropped
+    # from the shared shell snapshot
+    # (tools/environments/base.snapshot_excluded_env_regex), so one
     # session's override can never persist into a sibling session's
     # commands. The mkdir re-creates the dir if a tmp cleaner removed it
     # mid-session; on failure the inherited TMPDIR is kept.

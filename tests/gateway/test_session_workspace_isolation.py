@@ -27,6 +27,7 @@ cross-visibility and no shared-path collisions.
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -50,7 +51,9 @@ from gateway.session_context import (  # noqa: E402
 )
 from gateway.session_workspace import (  # noqa: E402
     ensure_session_workspace,
+    prune_session_workspaces,
     resolve_session_workspace,
+    session_workspaces_active,
     session_workspaces_enabled,
     workspace_dirname,
 )
@@ -85,7 +88,25 @@ def scratch_base(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_SCRATCH_BASE", str(base))
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
     monkeypatch.delenv("HERMES_SESSION_WORKSPACES", raising=False)
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
     return base
+
+
+def _visible_entries(path: str) -> list:
+    """Directory contents minus Hermes' internal dot-files."""
+    return sorted(name for name in os.listdir(path) if not name.startswith("."))
+
+
+def _write_config(mapping: dict) -> Path:
+    """Write config.yaml under the test-isolated HERMES_HOME."""
+    import yaml
+
+    from hermes_cli.config import get_config_path
+
+    path = get_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(mapping), encoding="utf-8")
+    return path
 
 
 def _make_adapter() -> APIServerAdapter:
@@ -157,10 +178,46 @@ class TestWorkspaceDerivation:
         monkeypatch.delenv("HERMES_SESSION_SCRATCH_BASE", raising=False)
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
         monkeypatch.delenv("HERMES_SESSION_WORKSPACES", raising=False)
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        assert resolve_session_workspace("abcd1234-x") == str(
+        assert resolve_session_workspace("abcd1234-0000-4000-8000-000000000001") == str(
             tmp_path / "tmp" / "session-abcd1234"
         )
+
+
+class TestNameCollisionResistance:
+    """Distinct identities must never resolve to one scratch directory."""
+
+    def test_prefix_sharing_non_uuid_ids_get_distinct_dirs(self):
+        one = workspace_dirname("aaaaaaaa-one")
+        two = workspace_dirname("aaaaaaaa-two")
+        assert one != two
+        assert one.startswith("session-aaaaaaaa-")
+        assert two.startswith("session-aaaaaaaa-")
+
+    def test_derivation_is_deterministic(self):
+        assert workspace_dirname("aaaaaaaa-one") == workspace_dirname("aaaaaaaa-one")
+
+    def test_convention_shaped_ids_keep_the_staging_name(self):
+        """The suffix must not break nolgia-api#249 alignment for the ids the
+        staging convention actually covers (platform UUIDs, run hex)."""
+        assert (
+            workspace_dirname("5eca4c05-8374-413d-bc1d-6c05552daf0c")
+            == "session-5eca4c05"
+        )
+        assert workspace_dirname("run_74753356deadbeef") == "session-74753356"
+
+    def test_uuid_prefix_collision_falls_back_to_a_distinct_dir(self, scratch_base):
+        """Two DIFFERENT session UUIDs sharing the first 8 hex chars both
+        derive session-aaaaaaaa; the second must not inherit the first's
+        scratch dir."""
+        first = ensure_session_workspace("aaaaaaaa-1111-4000-8000-000000000001")
+        second = ensure_session_workspace("aaaaaaaa-2222-4000-8000-000000000002")
+        assert first == str(scratch_base / "session-aaaaaaaa")
+        assert second and second != first
+        assert Path(second).name.startswith("session-aaaaaaaa-")
+        # Re-binding the original identity still lands in the claimed dir.
+        assert ensure_session_workspace("aaaaaaaa-1111-4000-8000-000000000001") == first
 
 
 class TestEnablementGate:
@@ -198,6 +255,146 @@ class TestEnablementGate:
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
         monkeypatch.setenv("HERMES_SESSION_WORKSPACES", "0")
         assert session_workspaces_enabled() is False
+
+    @pytest.mark.parametrize(
+        "backend", ["docker", "ssh", "modal", "daytona", "singularity", "vercel_sandbox"]
+    )
+    def test_non_local_backend_never_engages(self, monkeypatch, backend):
+        """A gateway-host scratch dir does not exist inside a remote backend,
+        and the TMPDIR bridge is LocalEnvironment-only — binding one would
+        just make every command `cd` into a missing path (exit 126). Even a
+        forced-on config must stay off there."""
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        monkeypatch.setenv("TERMINAL_ENV", backend)
+        monkeypatch.setenv("HERMES_SESSION_WORKSPACES", "1")
+        assert session_workspaces_enabled() is False
+        assert resolve_session_workspace("abcd1234") is None
+        assert ensure_session_workspace("abcd1234") is None
+
+    def test_local_backend_engages(self, monkeypatch):
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_WORKSPACES", raising=False)
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        assert session_workspaces_enabled() is True
+
+
+class TestConfigYamlSettings:
+    """The operator-facing surface is config.yaml; HERMES_* is an internal bridge."""
+
+    def test_mode_off_from_config_disables(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("HERMES_SESSION_WORKSPACES", raising=False)
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+        _write_config({"gateway": {"session_workspaces": {"mode": "off"}}})
+        assert session_workspaces_enabled() is False
+
+    def test_scratch_base_from_config(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("HERMES_SESSION_SCRATCH_BASE", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_WORKSPACES", raising=False)
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+        base = tmp_path / "cfg-scratch"
+        _write_config(
+            {"gateway": {"session_workspaces": {"scratch_base": str(base)}}}
+        )
+        assert resolve_session_workspace("abcd1234-0000-4000-8000-000000000001") == str(
+            base / "session-abcd1234"
+        )
+
+    def test_env_bridge_overrides_config(self, monkeypatch, tmp_path):
+        """Child processes only see env; the bridge must keep winning."""
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+        _write_config({"gateway": {"session_workspaces": {"mode": "off"}}})
+        monkeypatch.setenv("HERMES_SESSION_WORKSPACES", "1")
+        assert session_workspaces_enabled() is True
+
+
+class TestCapabilityReflectsEffectiveConfig:
+    """The platform raises per-user concurrency on this flag — it must not be
+    advertised by a deployment that still shares one cwd/TMPDIR surface."""
+
+    def test_active_when_base_is_writable(self, scratch_base):
+        assert session_workspaces_active() is True
+
+    def test_inactive_when_disabled(self, monkeypatch, scratch_base):
+        monkeypatch.setenv("HERMES_SESSION_WORKSPACES", "0")
+        assert session_workspaces_active() is False
+
+    def test_inactive_when_base_cannot_be_provisioned(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_WORKSPACES", raising=False)
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("x", encoding="utf-8")
+        monkeypatch.setenv("HERMES_SESSION_SCRATCH_BASE", str(blocker / "scratch"))
+        assert session_workspaces_active() is False
+
+    @pytest.mark.asyncio
+    async def test_capabilities_endpoint_tracks_effective_state(
+        self, monkeypatch, scratch_base
+    ):
+        adapter = _make_adapter()
+        app = web.Application()
+        app["api_server_adapter"] = adapter
+        app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+
+        async with TestClient(TestServer(app)) as cli:
+            data = await (await cli.get("/v1/capabilities")).json()
+            assert data["features"]["session_workspaces"] is True
+
+            monkeypatch.setenv("HERMES_SESSION_WORKSPACES", "0")
+            data = await (await cli.get("/v1/capabilities")).json()
+            assert data["features"]["session_workspaces"] is False
+
+
+class TestRetention:
+    """Ephemeral workspaces (stateless calls, session-less runs) are bounded."""
+
+    def test_idle_workspaces_are_pruned_and_fresh_ones_kept(self, tmp_path):
+        base = tmp_path / "scratch"
+        base.mkdir()
+        stale = base / "session-deadbeef"
+        stale.mkdir()
+        (stale / "huge.bin").write_text("x", encoding="utf-8")
+        fresh = base / "session-cafe0001"
+        fresh.mkdir()
+        unrelated = base / "keep-me"
+        unrelated.mkdir()
+
+        old = time.time() - 72 * 3600
+        os.utime(stale / "huge.bin", (old, old))
+        os.utime(stale, (old, old))
+        os.utime(unrelated, (old, old))
+
+        removed = prune_session_workspaces(base=base, retention_hours=48)
+        assert removed == 1
+        assert not stale.exists()
+        assert fresh.is_dir()
+        # Only session-* directories are ever touched.
+        assert unrelated.is_dir()
+
+    def test_retention_zero_disables_the_sweep(self, tmp_path):
+        base = tmp_path / "scratch"
+        base.mkdir()
+        stale = base / "session-deadbeef"
+        stale.mkdir()
+        old = time.time() - 999 * 3600
+        os.utime(stale, (old, old))
+        assert prune_session_workspaces(base=base, retention_hours=0) == 0
+        assert stale.is_dir()
+
+    def test_active_workspace_is_refreshed_on_bind(self, scratch_base):
+        """A long-lived session that writes nothing this turn must not look
+        idle to the sweep."""
+        sid = "cafe0009-0000-4000-8000-000000000009"
+        path = Path(ensure_session_workspace(sid))
+        old = time.time() - 999 * 3600
+        os.utime(path, (old, old))
+        assert ensure_session_workspace(sid) == str(path)
+        assert path.stat().st_mtime > old
+        assert prune_session_workspaces(base=scratch_base, retention_hours=1) == 0
+        assert path.is_dir()
 
 
 # ---------------------------------------------------------------------------
@@ -281,10 +478,10 @@ class TestSubprocessBridge:
             clear_session_vars(tokens)
         assert env["TMPDIR"] == "/tmp"
 
-    def test_snapshot_excludes_tmpdir_and_scratch_var(self):
-        """One session's TMPDIR override must never persist into the shared
-        bash snapshot a sibling session's later commands source."""
-        pattern = re.compile(env_base._SNAPSHOT_EXCLUDED_ENV_REGEX)
+    def test_snapshot_excludes_tmpdir_for_scoped_turns(self):
+        """One session's Hermes-owned TMPDIR must never persist into the
+        shared bash snapshot a sibling session's later commands source."""
+        pattern = re.compile(env_base.snapshot_excluded_env_regex(scoped_tmpdir=True))
         assert pattern.match('declare -x TMPDIR="/opt/data/tmp/session-aaaa1111"')
         assert pattern.match(
             'declare -x HERMES_SESSION_SCRATCH_DIR="/opt/data/tmp/session-aaaa1111"'
@@ -294,6 +491,39 @@ class TestSubprocessBridge:
         assert not pattern.match('declare -x TMPDIRS="/x"')
         assert not pattern.match('declare -x PATH="/usr/bin"')
         assert not pattern.match('declare -x TMP="/x"')
+
+    def test_user_tmpdir_export_persists_outside_scoped_turns(self):
+        """TMPDIR is a normal user-controlled shell variable: with no session
+        workspace bound (CLI, workspaces disabled) an `export TMPDIR=/custom`
+        must keep surviving into the next command."""
+        pattern = re.compile(env_base.snapshot_excluded_env_regex(scoped_tmpdir=False))
+        assert not pattern.match('declare -x TMPDIR="/custom"')
+        assert pattern.match('declare -x HERMES_SESSION_ID="abc"')
+
+        unscoped = env_base._export_dump_excluding_session_vars(
+            '"$snap"', scoped_tmpdir=False
+        )
+        assert "TMPDIR" not in unscoped
+        scoped = env_base._export_dump_excluding_session_vars(
+            '"$snap"', scoped_tmpdir=True
+        )
+        assert "TMPDIR" in scoped
+
+    def test_scoped_tmpdir_detection_follows_the_bound_session(self, scratch_base):
+        """The default (no explicit flag) tracks whether THIS turn owns its
+        TMPDIR, so the suppression is scoped instead of global."""
+        assert env_base._session_scoped_tmpdir_active() is False
+        assert "TMPDIR" not in env_base._export_dump_excluding_session_vars('"$snap"')
+
+        sid = "cafe0005-aaaa-bbbb-cccc-ddddeeeeffff"
+        tokens = APIServerAdapter._bind_api_server_session(
+            chat_id=sid, session_key=sid, session_id=sid
+        )
+        try:
+            assert env_base._session_scoped_tmpdir_active() is True
+            assert "TMPDIR" in env_base._export_dump_excluding_session_vars('"$snap"')
+        finally:
+            clear_session_vars(tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -404,8 +634,9 @@ class TestConcurrentSessionIsolation:
         content_b = Path(b["artifact"]).read_text(encoding="utf-8")
         assert content_a == f"artifact-from-{session_a}"
         assert content_b == f"artifact-from-{session_b}"
-        assert os.listdir(a["cwd"]) == ["render.mp4"]
-        assert os.listdir(b["cwd"]) == ["render.mp4"]
+        # (Hermes' own dot-prefixed workspace-ownership marker aside.)
+        assert _visible_entries(a["cwd"]) == ["render.mp4"]
+        assert _visible_entries(b["cwd"]) == ["render.mp4"]
         assert Path(b["artifact"]).parent != Path(a["artifact"]).parent
         # And nothing landed at the shared base root itself.
         assert sorted(p.name for p in scratch_base.iterdir()) == [
