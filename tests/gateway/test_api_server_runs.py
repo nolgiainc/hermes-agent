@@ -2,6 +2,7 @@
 
 Covers:
 - POST /v1/runs — start a run (202)
+- POST /v1/runs — Idempotency-Key replay returns the original run_id
 - GET /v1/runs/{run_id} — poll run status
 - GET /v1/runs/{run_id}/events — SSE event stream
 - POST /v1/runs/{run_id}/stop — interrupt a running agent
@@ -22,6 +23,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     _approval_event_choices,
+    _IdempotencyCache,
     cors_middleware,
     security_headers_middleware,
 )
@@ -259,6 +261,216 @@ class TestStartRun:
         assert kwargs["requested_model"] == "MiniMax-M3"
         assert kwargs["requested_provider"] == "minimax"
         assert kwargs["model_options"] == model_options
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/runs — Idempotency-Key replay (NOL-397)
+# ---------------------------------------------------------------------------
+
+
+def _make_completed_agent(final_response: str = "done") -> MagicMock:
+    mock_agent = MagicMock()
+    mock_agent.run_conversation.return_value = {"final_response": final_response}
+    mock_agent.session_prompt_tokens = 10
+    mock_agent.session_completion_tokens = 5
+    mock_agent.session_total_tokens = 15
+    return mock_agent
+
+
+async def _wait_terminal(cli: TestClient, run_id: str) -> dict:
+    """Poll GET /v1/runs/{run_id} until the run reaches a terminal status."""
+    status: dict = {}
+    for _ in range(60):
+        status_resp = await cli.get(f"/v1/runs/{run_id}")
+        status = await status_resp.json()
+        if status.get("status") in {"completed", "failed", "cancelled"}:
+            break
+        await asyncio.sleep(0.05)
+    return status
+
+
+class TestRunsIdempotency:
+    """A replayed Idempotency-Key must return the ORIGINAL run_id and the
+    run must execute (and bill) exactly once — the contract that lets a
+    supervisor retry a submit whose 202 was lost to an ambiguous 502/504
+    or transport failure."""
+
+    @pytest.mark.asyncio
+    async def test_replayed_key_returns_original_run_id_and_executes_once(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.platforms.api_server._idem_cache", _IdempotencyCache()):
+                with patch.object(adapter, "_create_agent") as mock_create:
+                    mock_create.return_value = _make_completed_agent()
+
+                    body = {"input": "hello", "session_id": "idem-sid"}
+                    headers = {"Idempotency-Key": "idem-nol397-replay"}
+
+                    first = await cli.post("/v1/runs", json=body, headers=headers)
+                    assert first.status == 202
+                    run_id = (await first.json())["run_id"]
+
+                    status = await _wait_terminal(cli, run_id)
+                    assert status["status"] == "completed"
+
+                    # Replay after the run settled (lost-202 salvage): the
+                    # original run_id comes back and nothing re-executes.
+                    replay = await cli.post("/v1/runs", json=body, headers=headers)
+                    assert replay.status == 202
+                    replay_data = await replay.json()
+                    assert replay_data["run_id"] == run_id
+
+                    assert mock_create.call_count == 1
+                    assert mock_create.return_value.run_conversation.call_count == 1
+
+                    # The replayed run_id still resolves to the settled result.
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    assert status["status"] == "completed"
+                    assert status["output"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_replay_of_running_submission_bypasses_concurrency_cap(self, adapter):
+        """The original run may hold the last concurrency slot; its own
+        replay must short-circuit to the cached run_id instead of bouncing
+        with 429 until the run finishes (which could outlive the cache TTL
+        and re-execute the work the retry was trying not to duplicate)."""
+        adapter._max_concurrent_runs = 1
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.platforms.api_server._idem_cache", _IdempotencyCache()):
+                with patch.object(adapter, "_create_agent") as mock_create:
+                    mock_agent, agent_ready, interrupted = _make_slow_agent()
+                    mock_create.return_value = mock_agent
+
+                    headers = {"Idempotency-Key": "idem-nol397-capped"}
+                    try:
+                        first = await cli.post(
+                            "/v1/runs", json={"input": "slow"}, headers=headers
+                        )
+                        assert first.status == 202
+                        run_id = (await first.json())["run_id"]
+                        assert agent_ready.wait(timeout=3.0)
+
+                        # The running agent holds the only slot: a fresh
+                        # submission is capped...
+                        fresh = await cli.post("/v1/runs", json={"input": "slow"})
+                        assert fresh.status == 429
+
+                        # ...but replaying the in-flight submission's key is
+                        # admitted and returns the original run_id.
+                        replay = await cli.post(
+                            "/v1/runs", json={"input": "slow"}, headers=headers
+                        )
+                        assert replay.status == 202
+                        assert (await replay.json())["run_id"] == run_id
+                        assert mock_create.call_count == 1
+                    finally:
+                        interrupted.set()
+                    status = await _wait_terminal(cli, run_id)
+                    assert status["status"] in {"completed", "cancelled"}
+                    assert mock_agent.run_conversation.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_distinct_or_absent_keys_start_distinct_runs(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.platforms.api_server._idem_cache", _IdempotencyCache()):
+                with patch.object(adapter, "_create_agent") as mock_create:
+                    mock_create.side_effect = lambda **kwargs: _make_completed_agent()
+
+                    body = {"input": "hello"}
+                    run_ids = []
+                    for headers in (
+                        {"Idempotency-Key": "idem-nol397-a"},
+                        {"Idempotency-Key": "idem-nol397-b"},
+                        {},
+                    ):
+                        resp = await cli.post("/v1/runs", json=body, headers=headers)
+                        assert resp.status == 202
+                        run_id = (await resp.json())["run_id"]
+                        run_ids.append(run_id)
+                        status = await _wait_terminal(cli, run_id)
+                        assert status["status"] == "completed"
+
+        assert len(set(run_ids)) == 3
+        assert mock_create.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_same_key_different_body_is_not_replayed(self, adapter):
+        """Key reuse with a different submission body is a different request
+        (fingerprint mismatch): it starts a new run, mirroring the
+        /v1/chat/completions and /v1/responses fingerprint semantics."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.platforms.api_server._idem_cache", _IdempotencyCache()):
+                with patch.object(adapter, "_create_agent") as mock_create:
+                    mock_create.side_effect = lambda **kwargs: _make_completed_agent()
+
+                    headers = {"Idempotency-Key": "idem-nol397-fp"}
+
+                    first = await cli.post(
+                        "/v1/runs", json={"input": "hello"}, headers=headers
+                    )
+                    assert first.status == 202
+                    first_id = (await first.json())["run_id"]
+                    status = await _wait_terminal(cli, first_id)
+                    assert status["status"] == "completed"
+
+                    second = await cli.post(
+                        "/v1/runs", json={"input": "different"}, headers=headers
+                    )
+                    assert second.status == 202
+                    second_id = (await second.json())["run_id"]
+                    status = await _wait_terminal(cli, second_id)
+                    assert status["status"] == "completed"
+
+        assert second_id != first_id
+        assert mock_create.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_rotated_nolgia_token_still_replays(self, adapter):
+        """nolgia_token is a short-lived per-attempt credential a supervisor
+        may re-mint on retry; it must not participate in the fingerprint, or
+        a rotated token would miss the cache and re-execute the run."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.platforms.api_server._idem_cache", _IdempotencyCache()):
+                with patch.object(adapter, "_create_agent") as mock_create:
+                    mock_create.return_value = _make_completed_agent()
+
+                    headers = {"Idempotency-Key": "idem-nol397-token"}
+
+                    first = await cli.post(
+                        "/v1/runs",
+                        json={"input": "hello", "nolgia_token": "tok-attempt-1"},
+                        headers=headers,
+                    )
+                    assert first.status == 202
+                    run_id = (await first.json())["run_id"]
+                    status = await _wait_terminal(cli, run_id)
+                    assert status["status"] == "completed"
+
+                    replay = await cli.post(
+                        "/v1/runs",
+                        json={"input": "hello", "nolgia_token": "tok-attempt-2"},
+                        headers=headers,
+                    )
+                    assert replay.status == 202
+                    assert (await replay.json())["run_id"] == run_id
+                    assert mock_create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_capabilities_advertises_run_idempotency(self, adapter):
+        """Supervisors gate widening their submit-retry classes on this
+        flag, so pods that replay Idempotency-Key must advertise it."""
+        app = _create_runs_app(adapter)
+        app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/capabilities")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["features"]["run_idempotency"] is True
 
 
 # ---------------------------------------------------------------------------
