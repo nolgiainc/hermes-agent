@@ -33,6 +33,20 @@ name: Commit Attribution Check
 # Prevention only. Existing history is deliberately left alone — stripping the
 # trailers already merged would mean force-pushing the default branch and
 # invalidating every clone for a cosmetic gain.
+#
+# The same reasoning bounds the range: the check walks the PR's FIRST-PARENT
+# path, i.e. the commits this branch itself authors, not everything a merge on
+# that path drags in. This fork syncs from NousResearch/hermes-agent, and an
+# upstream sync PR imports thousands of other people's commits through a single
+# merge; 60 of them carried a Claude trailer at the 2026-08-04 sync (NOL-390).
+# Rewording those would mean rewriting upstream history inside the fork: every
+# imported SHA changes, contributor authorship is mangled, and every later
+# sync's merge base is destroyed. That is not a cosmetic price, and those
+# trailers are not ours to police. Merge commits on the path are still
+# inspected (a hand-rolled merge body can carry a trailer), so the only thing
+# that escapes is a commit an author buried behind a side-branch merge into
+# their own PR. This gate exists against discipline decay, not against a
+# determined evader.
 
 on:
   workflow_call:
@@ -84,8 +98,10 @@ jobs:
           fi
 
           # No --no-merges: a hand-rolled merge commit can carry a trailer in
-          # its body just like any other commit.
-          COMMITS=$(git log --format=%H "$RANGE_START..$TIP")
+          # its body just like any other commit. --first-parent keeps the range
+          # to this branch's own timeline (see the note at the top of the file):
+          # merge commits are inspected, but the histories they import are not.
+          COMMITS=$(git log --first-parent --format=%H "$RANGE_START..$TIP")
           if [ -z "$COMMITS" ]; then
             echo "No commits in range: nothing to check."
             echo "review_status=[]" >> "$GITHUB_OUTPUT"

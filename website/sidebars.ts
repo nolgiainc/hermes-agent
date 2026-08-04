@@ -109,6 +109,7 @@ const sidebars: SidebarsConfig = {
           label: 'Media & Web',
           items: [
             'user-guide/features/voice-mode',
+            'user-guide/features/wake-word',
             'user-guide/features/web-search',
             'user-guide/features/x-search',
             'user-guide/features/browser',
@@ -275,6 +276,7 @@ const sidebars: SidebarsConfig = {
                   items: [
                     'user-guide/skills/bundled/research/research-arxiv',
                     'user-guide/skills/bundled/research/research-blogwatcher',
+                    'user-guide/skills/bundled/research/research-grounded-citations',
                     'user-guide/skills/bundled/research/research-llm-wiki',
                     'user-guide/skills/bundled/research/research-polymarket',
                     'user-guide/skills/bundled/research/research-research-paper-writing',
@@ -306,6 +308,7 @@ const sidebars: SidebarsConfig = {
                   items: [
                     'user-guide/skills/bundled/software-development/software-development-dogfood',
                     'user-guide/skills/bundled/software-development/software-development-hermes-agent-skill-authoring',
+                    'user-guide/skills/bundled/software-development/software-development-inspecting-hermes-desktop-dom',
                     'user-guide/skills/bundled/software-development/software-development-node-inspect-debugger',
                     'user-guide/skills/bundled/software-development/software-development-plan',
                     'user-guide/skills/bundled/software-development/software-development-python-debugpy',
@@ -654,10 +657,12 @@ const sidebars: SidebarsConfig = {
           type: 'category',
           label: 'Other',
           items: [
+            'user-guide/messaging/a2a',
             'user-guide/messaging/homeassistant',
             'user-guide/messaging/mattermost',
             'user-guide/messaging/matrix',
             'user-guide/messaging/bluebubbles',
+            'user-guide/messaging/buzz',
             'user-guide/messaging/photon',
             'user-guide/messaging/google_chat',
             'user-guide/messaging/line',
@@ -665,6 +670,7 @@ const sidebars: SidebarsConfig = {
             'user-guide/messaging/ntfy',
             'user-guide/messaging/irc',
             'user-guide/messaging/open-webui',
+            'user-guide/messaging/relay',
             'user-guide/messaging/webhooks',
           ],
         },
@@ -678,6 +684,7 @@ const sidebars: SidebarsConfig = {
         'integrations/index',
         'integrations/nous-portal',
         'integrations/providers',
+        'integrations/buzz',
         'user-guide/features/mcp',
         'user-guide/features/acp',
         'user-guide/features/provider-routing',
@@ -752,6 +759,7 @@ const sidebars: SidebarsConfig = {
               link: {type: 'doc', id: 'developer-guide/plugins/index'},
               items: [
                 'developer-guide/plugin-llm-access',
+                'developer-guide/subagent-lifecycle-api',
                 'developer-guide/desktop-plugin-sdk',
                 'developer-guide/memory-provider-plugin',
                 'developer-guide/context-engine-plugin',
