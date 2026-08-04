@@ -20,6 +20,9 @@ The leak-safety properties under test mirror the existing
 """
 
 import re
+import threading
+import time
+from collections import defaultdict
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -64,8 +67,9 @@ def _clear_asset_cache():
         nolgia_assets._asset_cache.clear()
 
 
-def _make_adapter() -> APIServerAdapter:
-    return APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+def _make_adapter(api_key: str = "") -> APIServerAdapter:
+    extra = {"key": api_key} if api_key else {}
+    return APIServerAdapter(PlatformConfig(enabled=True, extra=extra))
 
 
 def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
@@ -78,9 +82,9 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     return app
 
 
-async def _wait_completed(cli, run_id, tries=100):
+async def _wait_completed(cli, run_id, tries=100, headers=None):
     for _ in range(tries):
-        resp = await cli.get(f"/v1/runs/{run_id}")
+        resp = await cli.get(f"/v1/runs/{run_id}", headers=headers or {})
         data = await resp.json()
         if data["status"] in {"completed", "failed", "cancelled"}:
             return data
@@ -278,3 +282,248 @@ class TestRunsEndpoint:
             assert resp.status == 200
             data = await resp.json()
             assert data["features"]["nolgia_run_token"] is True
+
+
+# ---------------------------------------------------------------------------
+# NOL-413 regressions: every in-run CLI invocation carries the turn credential
+# ---------------------------------------------------------------------------
+
+
+def _simulated_cli_spawn_env() -> dict:
+    """Build a tool-subprocess env exactly the way the terminal bridge does.
+
+    ``{"NOLGIA_TOKEN": "pod-wide"}`` stands in for the pod deployment env; the
+    real ``_inject_session_context_env`` then applies the task-local session
+    context, so the returned ``NOLGIA_TOKEN`` is what a spawned ``nolgia
+    assets upload`` would authenticate with.
+    """
+    env = {"NOLGIA_TOKEN": "pod-wide"}
+    _inject_session_context_env(env)
+    return env
+
+
+class TestConcurrentRunsSequentialUploads:
+    @pytest.mark.asyncio
+    async def test_every_upload_carries_its_own_runs_credential(self):
+        """Two OVERLAPPING /v1/runs, each performing three sequential CLI
+        'uploads': every spawn env must carry its own run's token — never the
+        sibling's, never the pod-wide bearer (NOL-413)."""
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+        # Lockstep barrier: each upload round happens only when BOTH runs are
+        # mid-turn, so a per-run binding that leaked through any process-global
+        # slot would be caught (last-writer-wins would poison the sibling).
+        barrier = threading.Barrier(2)
+        recorded: dict = defaultdict(list)
+        rec_lock = threading.Lock()
+
+        def _observing_run(user_message=None, conversation_history=None, task_id=None):
+            sid = get_session_env("HERMES_SESSION_ID")
+            for _ in range(3):
+                barrier.wait(timeout=15)
+                env = _simulated_cli_spawn_env()
+                with rec_lock:
+                    recorded[sid].append(env.get("NOLGIA_TOKEN"))
+            return {"final_response": "done"}
+
+        def _fake_create_agent(**kwargs):
+            agent = MagicMock()
+            agent.run_conversation.side_effect = _observing_run
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            return agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_fake_create_agent):
+                resp_a = await cli.post(
+                    "/v1/runs",
+                    json={"input": "a", "session_id": "sess-a", "nolgia_token": "nolt_run_a"},
+                )
+                resp_b = await cli.post(
+                    "/v1/runs",
+                    json={"input": "b", "session_id": "sess-b", "nolgia_token": "nolt_run_b"},
+                )
+                assert resp_a.status == 202 and resp_b.status == 202
+                run_a = (await resp_a.json())["run_id"]
+                run_b = (await resp_b.json())["run_id"]
+                await _wait_completed(cli, run_a, tries=500)
+                await _wait_completed(cli, run_b, tries=500)
+
+        assert recorded["sess-a"] == ["nolt_run_a"] * 3
+        assert recorded["sess-b"] == ["nolt_run_b"] * 3
+
+
+class TestWakeContinuationRetainedToken:
+    """Pod-internal continuation turns (gateway.wake's self-POST to
+    /v1/chat/completions after a background delegation completes) carry no
+    request credential. The adapter must re-bind the session's RETAINED run
+    token so the continuation's uploads still attribute to the causing turn —
+    the NOL-413 'sibling upload lost the credential' hole."""
+
+    @pytest.mark.asyncio
+    async def test_wake_selfpost_rebinds_the_sessions_run_token(self):
+        adapter = _make_adapter(api_key="sk-secret")
+        app = _create_runs_app(adapter)
+        app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+        seen: dict = {}
+        auth = {"Authorization": "Bearer sk-secret"}
+
+        def _observing_run(user_message=None, conversation_history=None, task_id=None, **_kw):
+            seen["bound_token"] = get_session_env("HERMES_SESSION_NOLGIA_TOKEN")
+            seen["child_env_token"] = _simulated_cli_spawn_env().get("NOLGIA_TOKEN")
+            return {"final_response": "done"}
+
+        def _fake_create_agent(**kwargs):
+            agent = MagicMock()
+            agent.run_conversation.side_effect = _observing_run
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            agent.session_id = "sess-wake"
+            agent._last_compaction_in_place = False
+            return agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_fake_create_agent):
+                # 1. Platform-submitted run binds AND retains the turn token.
+                resp = await cli.post(
+                    "/v1/runs",
+                    headers=auth,
+                    json={"input": "go", "session_id": "sess-wake", "nolgia_token": "nolt_wake"},
+                )
+                assert resp.status == 202
+                await _wait_completed(cli, (await resp.json())["run_id"], headers=auth)
+                assert seen == {
+                    "bound_token": "nolt_wake",
+                    "child_env_token": "nolt_wake",
+                }
+                seen.clear()
+
+                # 2. Wake continuation: same session id, NO token in the
+                #    request — exactly gateway.wake's self-post shape.
+                adapter._session_db = MagicMock(
+                    get_messages_as_conversation=MagicMock(return_value=[])
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "sess-wake", **auth},
+                    json={"messages": [{"role": "user", "content": "delegation finished"}]},
+                )
+                assert resp.status == 200
+
+        assert seen == {
+            "bound_token": "nolt_wake",
+            "child_env_token": "nolt_wake",
+        }
+
+    @pytest.mark.asyncio
+    async def test_foreign_session_continuation_stays_pod_scoped(self):
+        """A continuation for a session that never rode /v1/runs must keep
+        today's behavior byte-for-byte: nothing bound, pod bearer for children."""
+        adapter = _make_adapter(api_key="sk-secret")
+        app = _create_runs_app(adapter)
+        app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+        seen: dict = {}
+
+        def _observing_run(user_message=None, conversation_history=None, task_id=None, **_kw):
+            seen["bound_token"] = get_session_env("HERMES_SESSION_NOLGIA_TOKEN")
+            seen["child_env_token"] = _simulated_cli_spawn_env().get("NOLGIA_TOKEN")
+            return {"final_response": "done"}
+
+        def _fake_create_agent(**kwargs):
+            agent = MagicMock()
+            agent.run_conversation.side_effect = _observing_run
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            agent.session_id = "sess-other"
+            agent._last_compaction_in_place = False
+            return agent
+
+        adapter._session_db = MagicMock(
+            get_messages_as_conversation=MagicMock(return_value=[])
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_fake_create_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Session-Id": "sess-other",
+                        "Authorization": "Bearer sk-secret",
+                    },
+                    json={"messages": [{"role": "user", "content": "hi"}]},
+                )
+                assert resp.status == 200
+
+        assert seen["bound_token"] == ""
+        assert seen["child_env_token"] == "pod-wide"
+
+    def test_retention_ttl_and_overwrite(self):
+        adapter = _make_adapter()
+        adapter._retain_session_run_token("sess-1", "nolt_first")
+        assert adapter._retained_session_run_token("sess-1") == "nolt_first"
+        # A newer run for the same session overwrites — attribution follows
+        # the most recent platform-submitted turn.
+        adapter._retain_session_run_token("sess-1", "nolt_second")
+        assert adapter._retained_session_run_token("sess-1") == "nolt_second"
+        # Expired entries neither resolve nor survive the next write's prune.
+        adapter._session_run_tokens["sess-1"] = ("nolt_second", time.monotonic() - 1)
+        assert adapter._retained_session_run_token("sess-1") == ""
+        adapter._retain_session_run_token("sess-2", "nolt_other")
+        assert "sess-1" not in adapter._session_run_tokens
+        # Empty ids/tokens are never retained.
+        adapter._retain_session_run_token("", "nolt_x")
+        adapter._retain_session_run_token("sess-3", "")
+        assert "" not in adapter._session_run_tokens
+        assert "sess-3" not in adapter._session_run_tokens
+
+
+class TestExecuteCodeSandboxCredential:
+    """The execute_code sandbox builds its child env through its own allowlist
+    scrub (no session-context bridge). When the pod GRANTS ``NOLGIA_TOKEN``
+    via env passthrough, a bound run token must replace the pod-wide value —
+    sandbox scripts spawn the nolgia CLI directly (the film pipeline's --json
+    subprocess pattern), and those uploads must attribute to the causing turn
+    (NOL-413). The substitution must never introduce a credential the scrub
+    withheld."""
+
+    def test_granted_pod_token_substituted_with_run_token(self):
+        from tools.code_execution_tool import _scrub_child_env
+        from tools.environments.local import apply_run_scoped_nolgia_token
+
+        tokens = set_session_vars(platform="api_server", nolgia_token="nolt_run")
+        try:
+            env = _scrub_child_env(
+                {"NOLGIA_TOKEN": "pod-wide"},
+                is_passthrough=lambda k: k == "NOLGIA_TOKEN",
+            )
+            assert env.get("NOLGIA_TOKEN") == "pod-wide", "scrub grants the pod value"
+            apply_run_scoped_nolgia_token(env)
+        finally:
+            clear_session_vars(tokens)
+        assert env["NOLGIA_TOKEN"] == "nolt_run"
+
+    def test_withheld_token_never_introduced(self):
+        from tools.code_execution_tool import _scrub_child_env
+        from tools.environments.local import apply_run_scoped_nolgia_token
+
+        tokens = set_session_vars(platform="api_server", nolgia_token="nolt_run")
+        try:
+            env = _scrub_child_env({"NOLGIA_TOKEN": "pod-wide"})  # no passthrough
+            assert "NOLGIA_TOKEN" not in env, "secret-substring scrub drops it"
+            apply_run_scoped_nolgia_token(env)
+        finally:
+            clear_session_vars(tokens)
+        assert "NOLGIA_TOKEN" not in env
+
+    def test_unbound_context_keeps_pod_value(self):
+        from tools.environments.local import apply_run_scoped_nolgia_token
+
+        tokens = set_session_vars(platform="api_server")  # engaged, no run token
+        try:
+            env = {"NOLGIA_TOKEN": "pod-wide"}
+            apply_run_scoped_nolgia_token(env)
+        finally:
+            clear_session_vars(tokens)
+        assert env["NOLGIA_TOKEN"] == "pod-wide"

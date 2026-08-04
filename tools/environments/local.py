@@ -466,6 +466,39 @@ def _inject_session_context_env(env: dict) -> None:
         env["NOLGIA_TOKEN"] = scoped_nolgia_token
 
 
+def apply_run_scoped_nolgia_token(env: dict) -> None:
+    """Substitute the turn-scoped Nolgia credential for a granted NOLGIA_TOKEN.
+
+    For child environments that do NOT go through the full session-context
+    bridge (:func:`_inject_session_context_env`) — the execute_code sandbox
+    builds its env via its own allowlist scrub, which deliberately drops the
+    ``HERMES_SESSION_*`` vars.  When such a child was granted ``NOLGIA_TOKEN``
+    (skill/config env passthrough) it would otherwise always authenticate as
+    the POD, so every ``nolgia assets upload`` a sandbox script spawns lands
+    unattributed under concurrent turn execution (NOL-413).
+
+    Semantics deliberately narrower than the terminal bridge:
+    - Only SUBSTITUTES: the run token replaces an already-granted
+      ``NOLGIA_TOKEN``; it never introduces a credential the sandbox's grant
+      policy withheld. (The terminal bridge sets it unconditionally because
+      terminal children legitimately inherit the pod env wholesale.)
+    - The run token is the same account's turn-scoped credential — strictly
+      narrower than the pod-wide bearer it replaces, so this can only improve
+      attribution, never widen access.
+    No-op when no run token is bound in this task's context.
+    """
+    if "NOLGIA_TOKEN" not in env:
+        return
+    try:
+        from gateway.session_context import get_session_env
+
+        scoped = get_session_env("HERMES_SESSION_NOLGIA_TOKEN", "").strip()
+    except Exception:
+        return
+    if scoped:
+        env["NOLGIA_TOKEN"] = scoped
+
+
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:

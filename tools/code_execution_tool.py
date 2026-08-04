@@ -1439,6 +1439,15 @@ def execute_code(
         # passed through — without those, the child can't create a socket
         # or spawn a subprocess.  See ``_scrub_child_env`` for the rules.
         child_env = _scrub_child_env(os.environ)
+        # A sandbox granted NOLGIA_TOKEN (skill env passthrough) must spend it
+        # as the CAUSING TURN, not as the pod: scripts here spawn the nolgia
+        # CLI directly (the film pipeline's --json subprocess pattern), and
+        # without this substitution their uploads carry no agent_session_id
+        # stamp under concurrent turn execution (NOL-413). Substitution-only —
+        # never introduces a credential the scrub withheld.
+        from tools.environments.local import apply_run_scoped_nolgia_token
+
+        apply_run_scoped_nolgia_token(child_env)
         child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
         child_env["HERMES_RPC_TOKEN"] = rpc_token
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
