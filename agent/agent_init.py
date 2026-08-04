@@ -888,7 +888,11 @@ def init_agent(
     # provenances are stamped by compression writers (heartbeat / timeout / cooldown).
     agent._last_activity_provenance = ActivityProvenance.UNKNOWN
     # Rate-limit durable SessionDB activity stamps from _touch_activity (#72016).
-    agent._session_activity_last_persist_mono: float = 0.0
+    # -inf ("never persisted"), not 0.0: the due-check subtracts this from
+    # time.monotonic(), which counts from boot — on a freshly-booted pod with
+    # uptime under the heartbeat interval, 0.0 reads as "just persisted" and
+    # the session's first durable stamp is silently swallowed.
+    agent._session_activity_last_persist_mono: float = float("-inf")
     agent._current_tool: str | None = None
     agent._api_call_count: int = 0
     # Opt-out flag for the between-turns MCP tool refresh (build_turn_context).
