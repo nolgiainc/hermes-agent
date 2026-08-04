@@ -1376,6 +1376,11 @@ _RUNS_IDEMPOTENCY_FINGERPRINT_KEYS = [
     "previous_response_id",
     "conversation_history",
     "session_id",
+    # workspace_id keys the run's scratch workspace (NOL-414). Unlike
+    # nolgia_token it is a stable identity, not a per-attempt credential: a
+    # retry naming a DIFFERENT workspace is a different submission and must
+    # not replay a run that executed against another session's scratch dir.
+    "workspace_id",
     "model",
     "provider",
     "model_options",
@@ -3201,6 +3206,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 # causing turn. The platform relay keys per-user concurrent
                 # turn execution on this flag.
                 "nolgia_run_token": True,
+                # Runs execute inside a session-scoped scratch workspace
+                # (<base>/session-<id8>/ — nolgia-api#249's staging
+                # convention) enforced as the turn's default cwd/TMPDIR, and
+                # POST /v1/runs accepts an optional "workspace_id" naming
+                # the workspace identity explicitly (the platform session
+                # UUID aligns the scratch dir with the relayed
+                # attachment-staging dir). NOL-414; the platform gates the
+                # per-user concurrency bump on this flag.
+                "session_workspaces": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -6119,6 +6133,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_key: str = "",
         session_id: str = "",
         nolgia_token: str = "",
+        workspace_id: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -6140,14 +6155,64 @@ class APIServerAdapter(BasePlatformAdapter):
         egress and tool subprocesses of THIS run then authenticate as the
         causing turn instead of the pod-wide bearer. Empty means "no run
         scoping" — everything falls back to pod env exactly as before.
+
+        Per-session scratch workspace (NOL-414): every bind derives a
+        session-scoped scratch dir (gateway.session_workspace,
+        ``<base>/session-<id8>/``) from ``workspace_id`` (an explicit
+        caller-supplied workspace identity, e.g. the Nolgia platform session
+        UUID) falling back to the session identity, and enforces it as the
+        turn's DEFAULT write surface: it becomes the terminal/file-tool cwd
+        seed and the subprocess TMPDIR — so concurrent turns from different
+        sessions stop sharing one scratch directory. Deliberately NOT bound
+        as the runtime cwd (``set_session_vars(cwd=...)``): that resolver
+        also anchors context-file discovery (AGENTS.md/.hermes.md via
+        ``resolve_context_cwd``), and re-anchoring it to an empty scratch
+        dir would silently drop workspace doctrine from the system prompt.
+        Absolute paths are not fenced either: shared read-only resources
+        (git checkouts, config, skills) stay reachable exactly as before.
+        Disabled deployments (operator-pinned TERMINAL_CWD, or
+        HERMES_SESSION_WORKSPACES=0) bind exactly as before.
         """
         from gateway.session_context import set_session_vars
+        from gateway.session_workspace import ensure_session_workspace
+
+        scratch_dir = ensure_session_workspace(
+            workspace_id or session_id or chat_id or session_key
+        )
+        if scratch_dir:
+            # Seed the per-session cwd RECORD (the terminal/file tools'
+            # first-rung cwd resolver) so commands without an explicit
+            # workdir run inside the session workspace. Seed-only: a
+            # continuing session that already has cwd state (the model
+            # `cd`'d somewhere) keeps it, and a surface-registered cwd
+            # override (ACP/TUI workspace pinning) is never shadowed.
+            # Both key spaces are seeded because the terminal resolves the
+            # record via the approval/session key while the file tools use
+            # the raw task id (the run's session id).
+            try:
+                from tools.terminal_tool import (
+                    get_session_cwd,
+                    record_session_cwd,
+                    resolve_task_overrides,
+                )
+
+                for key in {k for k in (session_key, session_id, chat_id) if k}:
+                    if (
+                        get_session_cwd(key) is None
+                        and not resolve_task_overrides(key).get("cwd")
+                    ):
+                        record_session_cwd(key, scratch_dir)
+            except Exception:
+                logger.debug(
+                    "session workspace cwd seeding failed", exc_info=True
+                )
 
         return set_session_vars(
             platform="api_server",
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            scratch_dir=scratch_dir or "",
             async_delivery=False,
             nolgia_token=nolgia_token,
             cron_session="",
@@ -6709,6 +6774,31 @@ class APIServerAdapter(BasePlatformAdapter):
                     _openai_error("'nolgia_token' is malformed"), status=400
                 )
 
+        # Optional explicit workspace identity (NOL-414): keys ONLY the run's
+        # session-scoped scratch dir (gateway.session_workspace), never the
+        # pod's session state — so the Nolgia relay can name its platform
+        # session UUID here and the scratch dir the gateway enforces becomes
+        # byte-identical to the staging dir its attachment-fetch instruction
+        # names (nolgia-api#249's `/opt/data/tmp/session-<id8>/`), WITHOUT
+        # re-keying pod sessions (the NOL-129 concern that keeps session_id
+        # off the relay's submission). Absent, the scratch dir keys off the
+        # effective session id (the run id for relay submissions) — still
+        # fully isolated, just not name-aligned with the relayed instruction.
+        # The derivation sanitizes before use, so validation here only
+        # bounds/shapes the field.
+        raw_workspace_id = body.get("workspace_id")
+        workspace_id = ""
+        if raw_workspace_id is not None:
+            if not isinstance(raw_workspace_id, str):
+                return web.json_response(
+                    _openai_error("'workspace_id' must be a string"), status=400
+                )
+            workspace_id = raw_workspace_id.strip()
+            if len(workspace_id) > 128 or re.search(r"[\r\n\x00]", workspace_id):
+                return web.json_response(
+                    _openai_error("'workspace_id' is malformed"), status=400
+                )
+
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
         selection_error = self._request_route_conflict_error(
@@ -6869,6 +6959,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
                                 nolgia_token=nolgia_token,
+                                workspace_id=workspace_id,
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             # /v1/runs runs its own agent lifecycle (no

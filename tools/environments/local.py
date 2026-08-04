@@ -465,6 +465,26 @@ def _inject_session_context_env(env: dict) -> None:
     if scoped_nolgia_token:
         env["NOLGIA_TOKEN"] = scoped_nolgia_token
 
+    # Session-scoped scratch workspace (NOL-414): when the gateway bound a
+    # per-session workspace for THIS task (gateway.session_workspace,
+    # ``<base>/session-<id8>/``), point the child's TMPDIR at it so
+    # mktemp/tempfile writes from concurrent runs land in their own session
+    # dir instead of one shared scratch surface. Unbound leaves TMPDIR
+    # untouched (single-session/CLI behavior). Safe against the
+    # shared-snapshot leak channel exactly like NOLGIA_TOKEN above: TMPDIR
+    # is excluded from the shared shell snapshot
+    # (tools/environments/base._SNAPSHOT_EXCLUDED_ENV_REGEX), so one
+    # session's override can never persist into a sibling session's
+    # commands. The mkdir re-creates the dir if a tmp cleaner removed it
+    # mid-session; on failure the inherited TMPDIR is kept.
+    scoped_scratch_dir = env.get("HERMES_SESSION_SCRATCH_DIR", "")
+    if scoped_scratch_dir:
+        try:
+            os.makedirs(scoped_scratch_dir, mode=0o700, exist_ok=True)
+            env["TMPDIR"] = scoped_scratch_dir
+        except OSError:
+            pass
+
 
 def apply_run_scoped_nolgia_token(env: dict) -> None:
     """Substitute the turn-scoped Nolgia credential for a granted NOLGIA_TOKEN.
