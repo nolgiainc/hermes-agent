@@ -29,6 +29,29 @@ def _mock_botocore_session(*, return_value=None, side_effect=None):
         yield session_mod.get_session
 
 
+@contextmanager
+def _mock_botocore_config():
+    """Patch botocore.config even when botocore is not installed.
+
+    ``_get_bedrock_runtime_client`` imports ``botocore.config.Config`` to build
+    a budgeted client, but boto3/botocore sit behind the optional ``bedrock``
+    extra and are absent from CI. The cache-keying contract those tests assert
+    is botocore-independent, so stub the one symbol the code path needs rather
+    than skip the assertions everywhere the extra is missing. Tests that assert
+    on real ``Config`` semantics use ``pytest.importorskip`` instead.
+    """
+    class _StubConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    botocore_mod = ModuleType("botocore")
+    config_mod = ModuleType("botocore.config")
+    config_mod.Config = _StubConfig
+    botocore_mod.config = config_mod
+    with patch.dict("sys.modules", {"botocore": botocore_mod, "botocore.config": config_mod}):
+        yield _StubConfig
+
+
 # ---------------------------------------------------------------------------
 # AWS credential detection
 # ---------------------------------------------------------------------------
@@ -956,7 +979,7 @@ class TestBedrockRuntimeClientTimeoutBudget:
         reset_client_cache()
         captured: list = []
         with patch("agent.bedrock_adapter._require_boto3",
-                   return_value=self._fake_boto3(captured)):
+                   return_value=self._fake_boto3(captured)), _mock_botocore_config():
             first = _get_bedrock_runtime_client("us-east-1", timeout=30.0)
             second = _get_bedrock_runtime_client("us-east-1", timeout=30.0)
 
@@ -968,7 +991,7 @@ class TestBedrockRuntimeClientTimeoutBudget:
         reset_client_cache()
         captured: list = []
         with patch("agent.bedrock_adapter._require_boto3",
-                   return_value=self._fake_boto3(captured)):
+                   return_value=self._fake_boto3(captured)), _mock_botocore_config():
             slow = _get_bedrock_runtime_client("us-east-1", timeout=60.0)
             fast = _get_bedrock_runtime_client("us-east-1", timeout=5.0)
 
