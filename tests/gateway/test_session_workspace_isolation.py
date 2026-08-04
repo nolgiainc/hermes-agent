@@ -508,3 +508,195 @@ class TestConcurrentSessionIsolation:
                 )
                 assert other.status == 202
                 assert (await other.json())["run_id"] != first_id
+
+
+# ---------------------------------------------------------------------------
+# The NOL-414 LIVE regression: the turn's ADVERTISED working directory
+# ---------------------------------------------------------------------------
+#
+# The 2026-08-04 live smoke on the pod image containing the original NOL-414
+# change: two concurrent platform-relay runs each created+seeded their session
+# workspace correctly, yet BOTH wrote `marker.txt` at the shared home
+# (`/opt/data`) and collided. Cause: the bind never set the runtime cwd, so
+# the system prompt's "Current working directory" line (resolve_agent_cwd)
+# fell back to TERMINAL_CWD — the shared home — and the model, told to work
+# "in its current working directory", emitted ABSOLUTE shared-home paths that
+# bypass the (relative-path) cwd record entirely. These tests pin the fix:
+# the advertised cwd IS the session workspace on the live relay shape, while
+# context-file discovery stays home-anchored and `cd` state / operator pins
+# keep winning.
+
+
+@pytest.fixture
+def pod_home(tmp_path, monkeypatch):
+    """The pod's exact shape: HOME == HERMES_HOME == TERMINAL_CWD.
+
+    The startup bridge materializes TERMINAL_CWD=$HOME when terminal.cwd is
+    unset (on the pod: /opt/data) — the home-fallback case that counts as
+    NOT operator-pinned, so session workspaces stay auto-enabled.
+    """
+    home = tmp_path / "opt-data"
+    (home / "tmp").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("TERMINAL_CWD", str(home))
+    monkeypatch.delenv("HERMES_SESSION_WORKSPACES", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_SCRATCH_BASE", raising=False)
+    return home
+
+
+class TestAdvertisedRuntimeCwd:
+    @pytest.mark.asyncio
+    async def test_relay_run_advertises_session_workspace(self, pod_home):
+        """The live-divergence shape: relay-style POST /v1/runs (no
+        session_id — NOL-129), pod env. Inside the turn the ADVERTISED cwd
+        (what the system prompt reports) must be the session workspace, and a
+        real relative write_file through the full dispatcher must land there
+        — never at the shared home."""
+        import json as _json
+
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+        captured = {}
+
+        def _run(user_message=None, conversation_history=None, task_id=None):
+            from agent.runtime_cwd import resolve_agent_cwd, resolve_context_cwd
+            from model_tools import handle_function_call
+
+            captured["task_id"] = task_id
+            captured["advertised"] = str(resolve_agent_cwd())
+            captured["context"] = resolve_context_cwd()
+            result = handle_function_call(
+                "write_file",
+                {"path": "marker.txt", "content": "GAMMA-4472"},
+                task_id=task_id,
+            )
+            captured["write"] = _json.loads(result)
+            return {"final_response": "done"}
+
+        def _make_agent(**kwargs):
+            agent = MagicMock()
+            agent.run_conversation.side_effect = _run
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            return agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_make_agent):
+                resp = await cli.post("/v1/runs", json={"input": "smoke"})
+                assert resp.status == 202, await resp.text()
+                run_id = (await resp.json())["run_id"]
+                status = await _wait_completed(cli, run_id)
+
+        assert status["status"] == "completed", status
+        expected = str(pod_home / "tmp" / f"session-{captured['task_id'][4:12]}")
+        # The prompt's "Current working directory" line names the session
+        # workspace — NOT the shared home (the live bug).
+        assert captured["advertised"] == expected
+        assert captured["advertised"] != str(pod_home)
+        # Context-file discovery keeps its pre-bind anchor (the home
+        # workspace doctrine), never the empty scratch dir.
+        assert str(captured["context"]) == str(pod_home)
+        # And the real write landed inside the workspace.
+        assert captured["write"]["resolved_path"] == os.path.join(
+            expected, "marker.txt"
+        )
+        assert (Path(expected) / "marker.txt").read_text(
+            encoding="utf-8"
+        ) == "GAMMA-4472"
+        assert not (pod_home / "marker.txt").exists()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_relay_runs_advertise_distinct_workspaces(
+        self, pod_home
+    ):
+        """Two overlapping relay runs: each turn is TOLD a different cwd."""
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+        barrier = threading.Barrier(2)
+        captured = {}
+
+        def _run(user_message=None, conversation_history=None, task_id=None):
+            from agent.runtime_cwd import resolve_agent_cwd
+
+            barrier.wait(timeout=20)
+            captured[task_id] = str(resolve_agent_cwd())
+            barrier.wait(timeout=20)
+            return {"final_response": "done"}
+
+        def _make_agent(**kwargs):
+            agent = MagicMock()
+            agent.run_conversation.side_effect = _run
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            return agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_make_agent):
+                resp_a = await cli.post("/v1/runs", json={"input": "a"})
+                resp_b = await cli.post("/v1/runs", json={"input": "b"})
+                assert resp_a.status == 202 and resp_b.status == 202
+                run_a = (await resp_a.json())["run_id"]
+                run_b = (await resp_b.json())["run_id"]
+                assert (await _wait_completed(cli, run_a))["status"] == "completed"
+                assert (await _wait_completed(cli, run_b))["status"] == "completed"
+
+        cwds = list(captured.values())
+        assert len(cwds) == 2
+        assert cwds[0] != cwds[1]
+        assert str(pod_home) not in cwds
+        for task_id, cwd in captured.items():
+            assert cwd == str(pod_home / "tmp" / f"session-{task_id[4:12]}")
+
+    def test_bind_advertises_cd_state_over_scratch(self, pod_home, tmp_path):
+        """Seed-only semantics extend to the advertised cwd: a continuing
+        session's `cd` state wins over the scratch workspace."""
+        from agent.runtime_cwd import resolve_agent_cwd
+
+        cd_target = tmp_path / "project"
+        cd_target.mkdir()
+        sid = "cafe0005-aaaa-bbbb-cccc-ddddeeeeffff"
+        terminal_tool.record_session_cwd(sid, str(cd_target))
+        tokens = APIServerAdapter._bind_api_server_session(
+            chat_id=sid, session_key=sid, session_id=sid
+        )
+        try:
+            assert str(resolve_agent_cwd()) == str(cd_target)
+        finally:
+            clear_session_vars(tokens)
+
+    def test_pinned_workspace_bind_leaves_runtime_cwd_unbound(self, monkeypatch):
+        """Operator-pinned TERMINAL_CWD disables the feature entirely: the
+        bind must not set a runtime cwd, so the pin keeps governing the
+        advertised directory exactly as before."""
+        from agent import runtime_cwd
+
+        monkeypatch.setenv("TERMINAL_CWD", "/pinned/workspace")
+        monkeypatch.delenv("HERMES_SESSION_WORKSPACES", raising=False)
+        sid = "cafe0006-aaaa-bbbb-cccc-ddddeeeeffff"
+        tokens = APIServerAdapter._bind_api_server_session(
+            chat_id=sid, session_key=sid, session_id=sid
+        )
+        try:
+            assert runtime_cwd._session_cwd_override() == ""
+        finally:
+            clear_session_vars(tokens)
+
+    def test_context_cwd_ignores_only_the_scratch_workspace(self, pod_home):
+        """resolve_context_cwd skips a session cwd equal to the bound scratch
+        dir (doctrine must not re-anchor into an empty workspace) but keeps
+        honoring a REAL bound workspace (ACP/TUI) exactly as before."""
+        from agent.runtime_cwd import resolve_context_cwd
+        from gateway.session_context import set_session_vars
+
+        real_ws = pod_home / "checkout"
+        real_ws.mkdir()
+        tokens = set_session_vars(
+            platform="acp", cwd=str(real_ws), scratch_dir=""
+        )
+        try:
+            assert resolve_context_cwd() == real_ws
+        finally:
+            clear_session_vars(tokens)

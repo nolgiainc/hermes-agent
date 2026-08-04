@@ -6279,15 +6279,27 @@ class APIServerAdapter(BasePlatformAdapter):
         UUID) falling back to the session identity, and enforces it as the
         turn's DEFAULT write surface: it becomes the terminal/file-tool cwd
         seed and the subprocess TMPDIR — so concurrent turns from different
-        sessions stop sharing one scratch directory. Deliberately NOT bound
-        as the runtime cwd (``set_session_vars(cwd=...)``): that resolver
-        also anchors context-file discovery (AGENTS.md/.hermes.md via
-        ``resolve_context_cwd``), and re-anchoring it to an empty scratch
-        dir would silently drop workspace doctrine from the system prompt.
-        Absolute paths are not fenced either: shared read-only resources
-        (git checkouts, config, skills) stay reachable exactly as before.
-        Disabled deployments (operator-pinned TERMINAL_CWD, or
-        HERMES_SESSION_WORKSPACES=0) bind exactly as before.
+        sessions stop sharing one scratch directory.
+
+        The turn's effective session cwd (the record after seeding — i.e. the
+        seeded workspace, or the session's own ``cd`` state when one exists)
+        is ALSO bound as the runtime cwd (``set_session_vars(cwd=...)``).
+        This is what the system prompt's "Current working directory" line
+        reports (``resolve_agent_cwd``): without it the prompt advertises the
+        TERMINAL_CWD fallback — the shared home on the pod — and a model
+        asked to work "in its current working directory" writes ABSOLUTE
+        shared-home paths that bypass the seeded record entirely (the
+        NOL-414 live smoke: two concurrent runs both wrote
+        ``/opt/data/marker.txt`` while their seeded workspaces sat empty).
+        Context-file discovery is NOT re-anchored by this bind:
+        ``resolve_context_cwd`` explicitly ignores a session cwd equal to
+        the bound scratch workspace (agent/runtime_cwd.py), so workspace
+        doctrine (e.g. the pod's ``/opt/data`` AGENTS.md) keeps resolving
+        exactly as before. Absolute paths are not fenced either: shared
+        read-only resources (git checkouts, config, skills) stay reachable
+        exactly as before. Disabled deployments (operator-pinned
+        TERMINAL_CWD, or HERMES_SESSION_WORKSPACES=0) bind exactly as
+        before — no scratch dir, no runtime-cwd bind.
 
         ``profile`` is the multiplex profile serving THIS request
         (``_api_request_profile``, captured on the request task — the ContextVar
@@ -6303,6 +6315,7 @@ class APIServerAdapter(BasePlatformAdapter):
         scratch_dir = ensure_session_workspace(
             workspace_id or session_id or chat_id or session_key
         )
+        session_cwd = ""
         if scratch_dir:
             # Seed the per-session cwd RECORD (the terminal/file tools'
             # first-rung cwd resolver) so commands without an explicit
@@ -6326,6 +6339,22 @@ class APIServerAdapter(BasePlatformAdapter):
                         and not resolve_task_overrides(key).get("cwd")
                     ):
                         record_session_cwd(key, scratch_dir)
+
+                # The turn's ADVERTISED working directory (NOL-414 live fix):
+                # bind the record's post-seed value so the system prompt's
+                # "Current working directory" line names the session
+                # workspace — not the shared-home TERMINAL_CWD fallback the
+                # model would otherwise echo back as absolute write paths.
+                # Reading the record (not scratch_dir) keeps seed-only
+                # semantics: a session's own `cd` state wins, and when a
+                # surface override vetoed the seed the record stays empty so
+                # the bind stays empty too (operator pin keeps governing).
+                for key in (session_key, session_id, chat_id):
+                    if key:
+                        recorded = get_session_cwd(key)
+                        if recorded:
+                            session_cwd = recorded
+                            break
             except Exception:
                 logger.debug(
                     "session workspace cwd seeding failed", exc_info=True
@@ -6336,6 +6365,7 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            cwd=session_cwd,
             scratch_dir=scratch_dir or "",
             async_delivery=False,
             nolgia_token=nolgia_token,
