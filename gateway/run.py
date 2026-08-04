@@ -21702,6 +21702,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         acceptance can still cause durable at-least-once replay.
         """
         source = self._build_process_event_source(evt)
+        # Run-scoped Nolgia credential of the turn that SPAWNED this work
+        # (async-delegation completions only, in-memory events only — see
+        # tools.async_delegation._attach_origin_nolgia_token). Handed to the
+        # api_server self-post so the continuation turn attributes its CLI work
+        # to that run instead of the session's most recent one (NOL-413).
+        origin_nolgia_token = str(evt.get("origin_nolgia_token") or "")
         if not source:
             # API-server-originated sessions bind a RAW session key (the
             # X-Hermes-Session-Id value — see _bind_api_server_session), not a
@@ -21725,7 +21731,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "session %s via self-post",
                             raw_sid,
                         )
-                        await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                        await deliver_wake(
+                            adapter,
+                            text=synth_text,
+                            session_id=raw_sid,
+                            nolgia_token=origin_nolgia_token,
+                        )
                         return True
                     except Exception as e:
                         logger.warning(
@@ -21768,7 +21779,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "%s via self-post",
                     raw_sid,
                 )
-                await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                await deliver_wake(
+                    adapter,
+                    text=synth_text,
+                    session_id=raw_sid,
+                    nolgia_token=origin_nolgia_token,
+                )
                 return True
             except Exception as e:
                 logger.warning(

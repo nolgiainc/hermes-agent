@@ -674,6 +674,30 @@ def _current_origin_session_id() -> str:
         return ""
 
 
+def _current_origin_nolgia_token() -> str:
+    """Run-scoped Nolgia credential of the ORIGINATING turn, or ``""``.
+
+    Read on the dispatching (parent) thread, where the api_server request
+    binding is still live. Carried on the completion event so the wake that
+    re-enters the conversation authenticates as the run that SPAWNED this
+    delegation — not as whatever turn the session happens to be running when
+    the delegation finishes (a detached delegation has no wall-clock bound, and
+    same-session concurrent runs are supported, so "the session's latest token"
+    would attribute the continuation's uploads to the wrong turn). NEVER
+    persisted: the credential lives only in the in-memory record/event (see
+    _push_completion_event).
+
+    Unlike ``HERMES_SESSION_ID``, this binding survives child-agent
+    construction — ``set_session_vars`` is its only writer.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        return (get_session_env("HERMES_SESSION_NOLGIA_TOKEN", "") or "").strip()
+    except Exception:
+        return ""
+
+
 def dispatch_async_delegation(
     *,
     goal: str,
@@ -744,6 +768,8 @@ def dispatch_async_delegation(
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
+        # In-memory only — never persisted (see _current_origin_nolgia_token).
+        "origin_nolgia_token": _current_origin_nolgia_token(),
         "parent_session_id": parent_session_id,
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -860,6 +886,21 @@ def _finish_finalization(delegation_id: str, status: str) -> None:
         _prune_completed_locked()
 
 
+def _attach_origin_nolgia_token(
+    evt: Dict[str, Any], record: Dict[str, Any],
+) -> None:
+    """Carry the dispatch-time run credential on an in-memory completion event.
+
+    Called only AFTER the event was persisted, so the credential never reaches
+    disk. The gateway hands it to the wake self-post (gateway.wake) so the
+    continuation turn runs under the credential of the run that spawned the
+    delegation.
+    """
+    token = str(record.get("origin_nolgia_token") or "")
+    if token:
+        evt["origin_nolgia_token"] = token
+
+
 def _push_completion_event(
     record: Dict[str, Any], result: Dict[str, Any], status: str
 ) -> None:
@@ -919,6 +960,12 @@ def _push_completion_event(
         if _k in result:
             evt[_k] = result[_k]
     _persist_completion(evt, result)
+    # Attach the originating turn's credential AFTER persistence: it is a live
+    # short-lived secret and must never be written to the durable event_json
+    # (a replayed row would also present a stale one). A durably-replayed
+    # completion therefore carries no credential and the wake falls back to the
+    # session's retained token / the pod bearer, exactly as before.
+    _attach_origin_nolgia_token(evt, record)
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -984,6 +1031,8 @@ def dispatch_async_delegation_batch(
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
+        # In-memory only — never persisted (see _current_origin_nolgia_token).
+        "origin_nolgia_token": _current_origin_nolgia_token(),
         "parent_session_id": parent_session_id,
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -1128,6 +1177,8 @@ def _push_batch_completion_event(
         if _k in combined:
             evt[_k] = combined[_k]
     _persist_completion(evt, combined)
+    # In-memory only, after persistence — see _push_completion_event.
+    _attach_origin_nolgia_token(evt, event_record)
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover

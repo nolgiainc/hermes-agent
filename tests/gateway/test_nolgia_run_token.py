@@ -459,24 +459,181 @@ class TestWakeContinuationRetainedToken:
         assert seen["bound_token"] == ""
         assert seen["child_env_token"] == "pod-wide"
 
-    def test_retention_ttl_and_overwrite(self):
+    @pytest.mark.asyncio
+    async def test_wake_selfpost_prefers_the_originating_runs_credential(self):
+        """A wake carries the credential of the run whose detached delegation
+        it reports. A NEWER turn on the same session must not re-attribute the
+        continuation's uploads to itself, so the request credential wins over
+        the session's retained one."""
+        adapter = _make_adapter(api_key="sk-secret")
+        app = _create_runs_app(adapter)
+        app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+        seen: dict = {}
+
+        def _observing_run(user_message=None, conversation_history=None, task_id=None, **_kw):
+            seen["bound_token"] = get_session_env("HERMES_SESSION_NOLGIA_TOKEN")
+            seen["child_env_token"] = _simulated_cli_spawn_env().get("NOLGIA_TOKEN")
+            return {"final_response": "done"}
+
+        def _fake_create_agent(**kwargs):
+            agent = MagicMock()
+            agent.run_conversation.side_effect = _observing_run
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            agent.session_id = "sess-wake"
+            agent._last_compaction_in_place = False
+            return agent
+
+        adapter._session_db = MagicMock(
+            get_messages_as_conversation=MagicMock(return_value=[])
+        )
+        # A later turn on this session has already overwritten the retained
+        # token; the wake must NOT pick that one up.
+        adapter._retain_session_run_token("sess-wake", "nolt_newer_turn")
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_fake_create_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Session-Id": "sess-wake",
+                        "Authorization": "Bearer sk-secret",
+                    },
+                    json={
+                        "messages": [{"role": "user", "content": "delegation finished"}],
+                        "nolgia_token": "nolt_origin_run",
+                    },
+                )
+                assert resp.status == 200
+
+        assert seen == {
+            "bound_token": "nolt_origin_run",
+            "child_env_token": "nolt_origin_run",
+        }
+
+    @pytest.mark.asyncio
+    async def test_continuation_rejects_a_malformed_credential(self):
+        adapter = _make_adapter(api_key="sk-secret")
+        app = _create_runs_app(adapter)
+        app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+        async with TestClient(TestServer(app)) as cli:
+            for bad in [123, "tok\nen", "x" * 600]:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "nolgia_token": bad,
+                    },
+                )
+                assert resp.status == 400, f"expected 400 for {bad!r}"
+
+
+class TestRetentionLifecycle:
+    """Retention is bounded by the originating run's lifecycle (holders) plus a
+    settle grace, and scoped by profile — never by a fixed window from request
+    receipt, and never by session id alone."""
+
+    def test_grace_and_overwrite(self):
         adapter = _make_adapter()
+        key = adapter._session_run_token_key("sess-1")
         adapter._retain_session_run_token("sess-1", "nolt_first")
         assert adapter._retained_session_run_token("sess-1") == "nolt_first"
-        # A newer run for the same session overwrites — attribution follows
-        # the most recent platform-submitted turn.
+        # A newer run for the same session overwrites — a continuation that
+        # carries no credential of its own follows the most recent submission.
         adapter._retain_session_run_token("sess-1", "nolt_second")
         assert adapter._retained_session_run_token("sess-1") == "nolt_second"
-        # Expired entries neither resolve nor survive the next write's prune.
-        adapter._session_run_tokens["sess-1"] = ("nolt_second", time.monotonic() - 1)
+        # Both runs settle; the entry then ages out on the grace and does not
+        # survive the next write's prune.
+        adapter._release_session_run_token("sess-1")
+        adapter._release_session_run_token("sess-1")
+        token, _deadline, holders = adapter._session_run_tokens[key]
+        assert (token, holders) == ("nolt_second", 0)
+        adapter._session_run_tokens[key] = ("nolt_second", time.monotonic() - 1, 0)
         assert adapter._retained_session_run_token("sess-1") == ""
         adapter._retain_session_run_token("sess-2", "nolt_other")
-        assert "sess-1" not in adapter._session_run_tokens
+        assert key not in adapter._session_run_tokens
         # Empty ids/tokens are never retained.
         adapter._retain_session_run_token("", "nolt_x")
         adapter._retain_session_run_token("sess-3", "")
-        assert "" not in adapter._session_run_tokens
-        assert "sess-3" not in adapter._session_run_tokens
+        assert adapter._session_run_token_key("") not in adapter._session_run_tokens
+        assert adapter._session_run_token_key("sess-3") not in adapter._session_run_tokens
+
+    def test_live_run_keeps_its_credential_past_the_grace(self):
+        """A foreground /v1/runs turn can legitimately execute for longer than
+        any fixed window. While the run still HOLDS the entry, an elapsed
+        deadline must not expire it."""
+        adapter = _make_adapter()
+        key = adapter._session_run_token_key("sess-long")
+        adapter._retain_session_run_token("sess-long", "nolt_long")
+        # Simulate a run executing far longer than the settle grace.
+        adapter._session_run_tokens[key] = ("nolt_long", time.monotonic() - 1, 1)
+        assert adapter._retained_session_run_token("sess-long") == "nolt_long"
+        # A sibling session's write must not prune a held entry either.
+        adapter._retain_session_run_token("sess-other", "nolt_other")
+        assert key in adapter._session_run_tokens
+        # Releasing the last holder restarts the grace, then it ages out.
+        adapter._release_session_run_token("sess-long")
+        assert adapter._retained_session_run_token("sess-long") == "nolt_long"
+        token, _deadline, holders = adapter._session_run_tokens[key]
+        assert holders == 0
+        adapter._session_run_tokens[key] = (token, time.monotonic() - 1, 0)
+        assert adapter._retained_session_run_token("sess-long") == ""
+
+    def test_retention_is_scoped_by_profile(self):
+        """In multiplex mode every /p/<profile>/... route shares one adapter
+        while session ids are caller-controlled: a request in profile B must
+        never resolve the credential profile A retained under the same id."""
+        adapter = _make_adapter()
+        adapter._retain_session_run_token("sess-x", "nolt_profile_a", profile="alpha")
+        assert adapter._retained_session_run_token("sess-x", profile="alpha") == "nolt_profile_a"
+        assert adapter._retained_session_run_token("sess-x", profile="beta") == ""
+        # The default profile is its own scope, not a catch-all.
+        assert adapter._retained_session_run_token("sess-x") == ""
+        adapter._retain_session_run_token("sess-x", "nolt_profile_b", profile="beta")
+        assert adapter._retained_session_run_token("sess-x", profile="alpha") == "nolt_profile_a"
+        assert adapter._retained_session_run_token("sess-x", profile="beta") == "nolt_profile_b"
+        # Releasing one profile's holder leaves the other's entry untouched.
+        adapter._release_session_run_token("sess-x", profile="beta")
+        assert adapter._retained_session_run_token("sess-x", profile="alpha") == "nolt_profile_a"
+
+
+class TestDelegationOriginCredential:
+    """The dispatch-time credential rides the IN-MEMORY completion event (never
+    the persisted event_json) so the wake it triggers attributes to the run that
+    spawned the delegation."""
+
+    def test_dispatch_reads_the_bound_run_credential(self):
+        from tools.async_delegation import _current_origin_nolgia_token
+
+        tokens = set_session_vars(platform="api_server", nolgia_token="nolt_origin_run")
+        try:
+            assert _current_origin_nolgia_token() == "nolt_origin_run"
+        finally:
+            clear_session_vars(tokens)
+        assert _current_origin_nolgia_token() == ""
+
+    def test_non_api_server_platform_has_no_run_credential(self):
+        from tools.async_delegation import _current_origin_nolgia_token
+
+        tokens = set_session_vars(platform="api_server")
+        try:
+            assert _current_origin_nolgia_token() == ""
+        finally:
+            clear_session_vars(tokens)
+
+    def test_completion_event_carries_the_dispatch_credential(self):
+        from tools.async_delegation import _attach_origin_nolgia_token
+
+        evt: dict = {"type": "async_delegation", "delegation_id": "d1"}
+        _attach_origin_nolgia_token(evt, {"origin_nolgia_token": "nolt_origin_run"})
+        assert evt["origin_nolgia_token"] == "nolt_origin_run"
+
+        # A durably-replayed completion has no in-memory record token: no
+        # field, so the wake falls back to the retained token / pod bearer.
+        replayed: dict = {"type": "async_delegation", "delegation_id": "d1"}
+        _attach_origin_nolgia_token(replayed, {})
+        assert "origin_nolgia_token" not in replayed
 
 
 class TestExecuteCodeSandboxCredential:
@@ -527,3 +684,61 @@ class TestExecuteCodeSandboxCredential:
         finally:
             clear_session_vars(tokens)
         assert env["NOLGIA_TOKEN"] == "pod-wide"
+
+
+class TestExecuteCodeRemoteSandboxCredential:
+    """Remote backends (docker/ssh/modal/...) never build a scrubbed child env —
+    the sandbox script inherits the backend runtime's POD-wide bearer, so the
+    local substitution cannot reach them. ``_remote_scoped_nolgia_token`` decides
+    the per-command override, with the same grant gate: substitution only, never
+    introduction."""
+
+    @pytest.fixture
+    def granted(self, monkeypatch):
+        import tools.env_passthrough as ep
+
+        monkeypatch.setenv("NOLGIA_TOKEN", "pod-wide")
+        monkeypatch.setattr(ep, "is_env_passthrough", lambda name: name == "NOLGIA_TOKEN")
+        monkeypatch.setattr(ep, "resolve_passthrough_value", lambda _n, fallback: fallback)
+
+    def test_granted_and_bound_yields_the_run_token(self, granted):
+        from tools.code_execution_tool import _remote_scoped_nolgia_token
+
+        tokens = set_session_vars(platform="api_server", nolgia_token="nolt_run")
+        try:
+            assert _remote_scoped_nolgia_token() == "nolt_run"
+        finally:
+            clear_session_vars(tokens)
+
+    def test_granted_but_unbound_leaves_the_pod_value_alone(self, granted):
+        from tools.code_execution_tool import _remote_scoped_nolgia_token
+
+        tokens = set_session_vars(platform="api_server")  # engaged, no run token
+        try:
+            assert _remote_scoped_nolgia_token() == ""
+        finally:
+            clear_session_vars(tokens)
+
+    def test_withheld_credential_is_never_introduced(self, monkeypatch):
+        import tools.env_passthrough as ep
+        from tools.code_execution_tool import _remote_scoped_nolgia_token
+
+        monkeypatch.setenv("NOLGIA_TOKEN", "pod-wide")
+        monkeypatch.setattr(ep, "is_env_passthrough", lambda _name: False)
+        tokens = set_session_vars(platform="api_server", nolgia_token="nolt_run")
+        try:
+            assert _remote_scoped_nolgia_token() == ""
+        finally:
+            clear_session_vars(tokens)
+
+    def test_no_pod_credential_means_no_override(self, monkeypatch):
+        import tools.env_passthrough as ep
+        from tools.code_execution_tool import _remote_scoped_nolgia_token
+
+        monkeypatch.delenv("NOLGIA_TOKEN", raising=False)
+        monkeypatch.setattr(ep, "is_env_passthrough", lambda name: name == "NOLGIA_TOKEN")
+        tokens = set_session_vars(platform="api_server", nolgia_token="nolt_run")
+        try:
+            assert _remote_scoped_nolgia_token() == ""
+        finally:
+            clear_session_vars(tokens)
