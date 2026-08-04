@@ -109,6 +109,19 @@ def _write_config(mapping: dict) -> Path:
     return path
 
 
+def _snapshot_env():
+    """Minimal concrete BaseEnvironment for inspecting the wrapped script."""
+
+    class _WrapOnlyEnv(env_base.BaseEnvironment):
+        def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
+            raise NotImplementedError
+
+        def cleanup(self):
+            pass
+
+    return _WrapOnlyEnv(cwd="/tmp", timeout=10)
+
+
 def _make_adapter() -> APIServerAdapter:
     return APIServerAdapter(PlatformConfig(enabled=True, extra={}))
 
@@ -396,6 +409,60 @@ class TestRetention:
         assert prune_session_workspaces(base=scratch_base, retention_hours=1) == 0
         assert path.is_dir()
 
+    def test_workspace_reclaimed_after_the_scan_is_not_deleted(self, scratch_base, monkeypatch):
+        """A stale session resumed WHILE the sweep runs keeps its workspace.
+
+        The sweeper must not pass its age check, let `_provision` hand the
+        same directory to the resuming turn, and then rmtree it anyway: that
+        run would be left with a nonexistent cwd/TMPDIR and lost contents.
+        """
+        import gateway.session_workspace as sw
+
+        sid = "cafe0010-0000-4000-8000-000000000010"
+        path = Path(ensure_session_workspace(sid))
+        (path / "artifact.txt").write_text("keep", encoding="utf-8")
+        old = time.time() - 999 * 3600
+        # Age every entry (the owner marker included) so the dir reads as idle.
+        for target in (*path.iterdir(), path):
+            os.utime(target, (old, old))
+
+        real_newest = sw._newest_mtime
+        calls = {"n": 0}
+
+        def rebinding_newest(target):
+            age = real_newest(target)
+            calls["n"] += 1
+            if calls["n"] == 1 and target == str(path):
+                # The turn resumes right after the sweeper reads the age:
+                # provisioning claims and refreshes the same directory.
+                assert ensure_session_workspace(sid) == str(path)
+            return age
+
+        monkeypatch.setattr(sw, "_newest_mtime", rebinding_newest)
+        assert prune_session_workspaces(base=scratch_base, retention_hours=1) == 0
+        assert (path / "artifact.txt").read_text(encoding="utf-8") == "keep"
+
+    def test_prune_throttle_is_per_scratch_base(self, tmp_path, monkeypatch):
+        """Each profile's scratch base gets its own sweep budget: one global
+        timestamp let a busy profile starve every other profile's base."""
+        import gateway.session_workspace as sw
+
+        swept = []
+        monkeypatch.setattr(sw, "_last_prune_at", {})
+        monkeypatch.setattr(
+            sw,
+            "prune_session_workspaces",
+            lambda base=None, keep=(): swept.append(str(base)),
+        )
+
+        base_a = tmp_path / "profile-a" / "tmp"
+        base_b = tmp_path / "profile-b" / "tmp"
+        sw._maybe_prune(base_a)
+        sw._maybe_prune(base_b)
+        sw._maybe_prune(base_a)  # throttled within the interval
+
+        assert swept == [str(base_a), str(base_b)]
+
 
 # ---------------------------------------------------------------------------
 # Bind-time enforcement units
@@ -508,6 +575,78 @@ class TestSubprocessBridge:
             '"$snap"', scoped_tmpdir=True
         )
         assert "TMPDIR" in scoped
+
+    def test_wrap_command_restores_scoped_tmpdir_after_sourcing(self, scratch_base):
+        """Sourcing a snapshot written by an EARLIER unscoped turn must not
+        overwrite this turn's bound TMPDIR: the wrapper saves it before the
+        source and restores it immediately afterwards, exactly as it does for
+        profile-scoped passthrough names."""
+        env = _snapshot_env()
+        env._snapshot_ready = True
+
+        unscoped = env._wrap_command("echo hi", "/tmp")
+        assert "_HERMES_RUNTIME_PASSTHROUGH_TMPDIR_VALUE" not in unscoped
+
+        sid = "cafe0006-aaaa-bbbb-cccc-ddddeeeeffff"
+        tokens = APIServerAdapter._bind_api_server_session(
+            chat_id=sid, session_key=sid, session_id=sid
+        )
+        try:
+            wrapped = env._wrap_command("echo hi", "/tmp")
+        finally:
+            clear_session_vars(tokens)
+
+        save = wrapped.index("_HERMES_RUNTIME_PASSTHROUGH_TMPDIR_VALUE=${TMPDIR-}")
+        source = wrapped.index("source ")
+        restore = wrapped.index(
+            'export TMPDIR="$_HERMES_RUNTIME_PASSTHROUGH_TMPDIR_VALUE"'
+        )
+        run = wrapped.index("eval 'echo hi'")
+        # Saved before the source, restored after it, before the command runs.
+        assert save < source < restore < run
+        # The value travels in environment memory, never in the command string.
+        assert str(scratch_base) not in wrapped
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX bash snapshot path")
+    def test_stale_snapshot_tmpdir_does_not_win_over_the_bound_workspace(
+        self, scratch_base, tmp_path
+    ):
+        """E2E through the real source-and-execute path: a snapshot polluted
+        by an unscoped `export TMPDIR=/custom` must not redirect a later
+        session-scoped run's temp writes out of its own workspace."""
+        from tools.environments.local import LocalEnvironment
+
+        custom = tmp_path / "user-tmp"
+        custom.mkdir()
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=60)
+        env.init_session()
+        try:
+            # An unscoped turn (CLI-style) persists its own TMPDIR.
+            env.execute(f"export TMPDIR={custom}")
+            assert custom.name in env.execute('printf "%s" "$TMPDIR"').get("output", "")
+
+            sid = "cafe0007-aaaa-bbbb-cccc-ddddeeeeffff"
+            expected = str(scratch_base / "session-cafe0007")
+            result = {}
+
+            def scoped_turn():
+                tokens = APIServerAdapter._bind_api_server_session(
+                    chat_id=sid, session_key=sid, session_id=sid
+                )
+                try:
+                    result["tmpdir"] = env.execute(
+                        'printf "%s" "$TMPDIR"'
+                    ).get("output", "")
+                finally:
+                    clear_session_vars(tokens)
+
+            thread = threading.Thread(target=scoped_turn)
+            thread.start()
+            thread.join(timeout=90)
+
+            assert result.get("tmpdir", "").strip() == expected
+        finally:
+            env.cleanup()
 
     def test_scoped_tmpdir_detection_follows_the_bound_session(self, scratch_base):
         """The default (no explicit flag) tracks whether THIS turn owns its

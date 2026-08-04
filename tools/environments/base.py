@@ -869,13 +869,31 @@ class BaseEnvironment(ABC):
         parts = []
         passthrough_names = self._snapshot_excluded_passthrough_names()
 
+        # Read the ContextVar once so the restore list below and the re-dump
+        # further down agree on whether this turn owns its TMPDIR.
+        scoped_tmpdir = _session_scoped_tmpdir_active()
+
         # A shared snapshot may contain the previous profile's value. Save
         # the current process environment before sourcing it, then restore the
         # current profile's value (or unset the name) immediately afterwards.
         # Values stay in environment memory and never enter the shell command
         # string, so secrets are not exposed through process arguments/logs.
+        #
+        # TMPDIR joins that list for session-scoped turns (NOL-414). Excluding
+        # it from the RE-DUMP only stops this turn from publishing its value;
+        # a snapshot written EARLIER by an unscoped turn (a CLI/messaging
+        # `export TMPDIR=/custom`, or any turn before workspaces engaged) still
+        # carries a `declare -x TMPDIR=…` line, and sourcing that would
+        # overwrite the per-command bridge's session scratch dir: it would
+        # silently send this run's temp artifacts back to the shared/foreign
+        # directory the workspace exists to replace. Save-and-restore around
+        # the source keeps the bound workspace authoritative.
+        restore_names = list(passthrough_names)
+        if scoped_tmpdir and "TMPDIR" not in restore_names:
+            restore_names.append("TMPDIR")
+
         saved_names: list[tuple[str, str, str]] = []
-        for name in passthrough_names:
+        for name in restore_names:
             marker = f"_HERMES_RUNTIME_PASSTHROUGH_{name}"
             present = f"{marker}_PRESENT"
             value = f"{marker}_VALUE"
@@ -925,7 +943,7 @@ class BaseEnvironment(ABC):
         if self._snapshot_ready:
             parts.append(
                 f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) && "
-                f"{{ {_export_dump_excluding_session_vars(_snap_tmp, passthrough_names)} "
+                f"{{ {_export_dump_excluding_session_vars(_snap_tmp, passthrough_names, scoped_tmpdir=scoped_tmpdir)} "
                 f"&& mv -f {_snap_tmp} {_quoted_snap}; }} "
                 f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
             )

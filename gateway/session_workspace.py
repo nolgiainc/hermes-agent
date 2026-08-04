@@ -120,11 +120,23 @@ _LOCAL_BACKENDS = frozenset({"", "local"})
 
 _DEFAULT_RETENTION_HOURS = 48.0
 
-# At most one retention sweep per process per interval: provisioning happens
-# on every turn and the sweep stats a directory tree.
+# At most one retention sweep per scratch base per process per interval:
+# provisioning happens on every turn and the sweep stats a directory tree.
 _PRUNE_INTERVAL_SECONDS = 900.0
-_prune_lock = threading.Lock()
-_last_prune_at: Optional[float] = None
+
+# Serializes provisioning's create/claim/refresh against the sweep's final
+# age check + delete. Without one shared lock a sweeper could pass the age
+# check, _provision could then hand the same (freshly refreshed) directory to
+# a resuming turn, and the sweeper would still rmtree it, leaving that live
+# run with a nonexistent cwd/TMPDIR and its workspace contents gone.
+# Reentrant: ensure_session_workspace provisions and then sweeps on one thread.
+_workspace_lock = threading.RLock()
+
+# Last sweep time keyed by RESOLVED BASE. A multiplexed gateway serves several
+# profiles and each normally resolves its own $HERMES_HOME/tmp; one global
+# timestamp let the busiest profile win every 15-minute window and starve the
+# others' bases, so their "bounded" scratch data would grow without limit.
+_last_prune_at: dict = {}
 
 _backend_warning_emitted = False
 
@@ -382,22 +394,28 @@ def _claim_workspace(path: str, raw_id: str) -> bool:
 
 
 def _provision(base: Path, name: str, raw_id: str) -> Optional[str]:
-    """Create + claim ``base/name``, returning its path or None."""
+    """Create + claim ``base/name``, returning its path or None.
+
+    Held under ``_workspace_lock`` so the create/claim/refresh sequence cannot
+    interleave with a concurrent sweep's age-check → delete: a workspace this
+    call hands back is never one the sweeper is midway through reclaiming.
+    """
     path = str(base / name)
-    try:
-        os.makedirs(path, mode=0o700, exist_ok=True)
-    except OSError as exc:
-        logger.warning("could not create session workspace %s: %s", path, exc)
-        return None
-    if not _claim_workspace(path, raw_id):
-        return None
-    try:
-        # Keep an active session's workspace young so the retention sweep
-        # never reclaims a live turn's scratch dir just because the turn
-        # wrote nothing this time.
-        os.utime(path, None)
-    except OSError:
-        pass
+    with _workspace_lock:
+        try:
+            os.makedirs(path, mode=0o700, exist_ok=True)
+        except OSError as exc:
+            logger.warning("could not create session workspace %s: %s", path, exc)
+            return None
+        if not _claim_workspace(path, raw_id):
+            return None
+        try:
+            # Keep an active session's workspace young so the retention sweep
+            # never reclaims a live turn's scratch dir just because the turn
+            # wrote nothing this time.
+            os.utime(path, None)
+        except OSError:
+            pass
     return path
 
 
@@ -507,13 +525,23 @@ def prune_session_workspaces(
                 continue
         except OSError:
             continue
+        # Cheap pre-filter: skip obviously live workspaces without taking the
+        # lock (a busy base holds mostly-fresh dirs).
         if _newest_mtime(entry.path) > cutoff:
             continue
-        try:
-            shutil.rmtree(entry.path)
-        except OSError as exc:
-            logger.debug("could not prune session workspace %s: %s", entry.path, exc)
-            continue
+        with _workspace_lock:
+            # Final age check under the SAME lock _provision holds, so a turn
+            # that reclaimed and refreshed this workspace since the scan can
+            # no longer have its live scratch dir deleted underneath it.
+            if _newest_mtime(entry.path) > cutoff:
+                continue
+            try:
+                shutil.rmtree(entry.path)
+            except OSError as exc:
+                logger.debug(
+                    "could not prune session workspace %s: %s", entry.path, exc
+                )
+                continue
         removed += 1
         logger.info(
             "pruned abandoned session workspace %s (idle > %sh)", entry.path, hours
@@ -522,14 +550,22 @@ def prune_session_workspaces(
 
 
 def _maybe_prune(base: Path, keep: Iterable[str] = ()) -> None:
-    """Run the retention sweep at most once per ``_PRUNE_INTERVAL_SECONDS``."""
-    global _last_prune_at
+    """Sweep *base* at most once per ``_PRUNE_INTERVAL_SECONDS``.
 
+    Throttled PER BASE: each profile in a multiplexed gateway resolves its own
+    scratch base, and they must not share one budget (the busiest profile would
+    otherwise be the only one ever swept).
+    """
+    try:
+        key = os.path.abspath(os.path.expanduser(str(base)))
+    except Exception:
+        key = str(base)
     now = time.monotonic()
-    with _prune_lock:
-        if _last_prune_at is not None and now - _last_prune_at < _PRUNE_INTERVAL_SECONDS:
+    with _workspace_lock:
+        last = _last_prune_at.get(key)
+        if last is not None and now - last < _PRUNE_INTERVAL_SECONDS:
             return
-        _last_prune_at = now
+        _last_prune_at[key] = now
     try:
         prune_session_workspaces(base=base, keep=keep)
     except Exception:
