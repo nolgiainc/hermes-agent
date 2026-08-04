@@ -1599,6 +1599,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # validity window.
         self._session_run_tokens: Dict[str, tuple] = {}
         self._session_run_tokens_lock = threading.Lock()
+        # Push-based marketplace ability freshness (NOL-416): SSE subscriber
+        # + between-turns installer + turn-boundary version check. Constructed
+        # in connect() only when the pod holds platform credentials.
+        self._ability_freshness: Optional[Any] = None
+        self._ability_events_task: Optional["asyncio.Task"] = None
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -1616,6 +1621,60 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         except Exception:
             return 0
+
+    # ------------------------------------------------------------------
+    # Ability freshness (NOL-416)
+    # ------------------------------------------------------------------
+
+    def _start_ability_freshness(self) -> None:
+        """Construct the freshness manager and launch its SSE subscriber.
+
+        Idempotent across reconnects (the old task is cancelled). Import is
+        lazy and failures are soft: freshness plumbing must never take the
+        API server down.
+        """
+        try:
+            from gateway.ability_freshness import (
+                AbilityFreshnessManager,
+                ability_freshness_enabled,
+            )
+
+            if not ability_freshness_enabled():
+                return
+            if self._ability_freshness is None:
+                self._ability_freshness = AbilityFreshnessManager(
+                    idle_check=self.active_agent_work_count
+                )
+            if self._ability_events_task is not None and not self._ability_events_task.done():
+                self._ability_events_task.cancel()
+            task = asyncio.create_task(self._ability_freshness.run_subscriber())
+            self._ability_events_task = task
+            try:
+                self._background_tasks.add(task)
+            except TypeError:
+                pass
+            if hasattr(task, "add_done_callback"):
+                task.add_done_callback(self._background_tasks.discard)
+        except Exception:
+            logger.debug("ability freshness startup failed", exc_info=True)
+
+    async def _ensure_abilities_fresh(self) -> None:
+        """Turn-boundary check: the run about to execute must see the latest
+        published version of every installed ability. Cheap no-op while the
+        push subscription is live and caught up; fail-open otherwise."""
+        manager = self._ability_freshness
+        if manager is not None:
+            await manager.ensure_fresh_before_turn()
+
+    def _notify_ability_turn_finished(self) -> None:
+        """Turn-end hook: give deferred ability installs their between-turns
+        window."""
+        manager = self._ability_freshness
+        if manager is not None:
+            try:
+                manager.notify_turn_finished()
+            except Exception:
+                logger.debug("ability turn-finished hook failed", exc_info=True)
 
     @staticmethod
     def _gateway_is_draining() -> bool:
@@ -6316,6 +6375,11 @@ class APIServerAdapter(BasePlatformAdapter):
         another thread to stop in-progress LLM calls.
         """
         loop = asyncio.get_running_loop()
+        # Turn boundary (NOL-416): every _run_agent() caller (chat
+        # completions, responses, native session chat) is about to execute a
+        # turn — install any newer published versions of installed abilities
+        # first so the turn never runs on stale content.
+        await self._ensure_abilities_fresh()
         # Capture before hopping to the executor — ContextVars do not follow
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
@@ -6506,6 +6570,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return await loop.run_in_executor(None, _run)
         finally:
             self._inflight_agent_runs -= 1
+            # Between-turns window (NOL-416): deferred ability installs.
+            self._notify_ability_turn_finished()
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
@@ -6885,6 +6951,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.cancelled",
                     )
                     return
+                # Turn boundary (NOL-416): this run has not started executing,
+                # so install any newer published versions of installed
+                # abilities NOW — a turn must never run on a stale ability.
+                await self._ensure_abilities_fresh()
                 with self._profile_scope(request_profile):
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
@@ -7167,6 +7237,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                # Between-turns window (NOL-416): deferred ability installs.
+                self._notify_ability_turn_finished()
 
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
@@ -7633,6 +7705,13 @@ class APIServerAdapter(BasePlatformAdapter):
             if hasattr(sweep_task, "add_done_callback"):
                 sweep_task.add_done_callback(self._background_tasks.discard)
 
+            # Push-based ability freshness (NOL-416): subscribe to the
+            # platform's ability-publish SSE stream so marketplace content
+            # updates install between turns without a pod roll — plus the
+            # turn-boundary installed-vs-latest check wired into the run
+            # entrypoints. No-op unless the pod holds platform credentials.
+            self._start_ability_freshness()
+
             # Loud warning when a network-accessible API server runs against an
             # unsandboxed local terminal backend. The API server can drive the
             # agent's terminal/file tools as the host user; on a public bind
@@ -7737,6 +7816,19 @@ class APIServerAdapter(BasePlatformAdapter):
         (OSError: [Errno 24] Too many open files, #37011).
         """
         self._mark_disconnected()
+        # Stop the ability freshness subscriber (NOL-416): the reconnect loop
+        # constructs a fresh adapter, which starts its own. getattr-guarded:
+        # some tests exercise disconnect on partially-constructed adapters.
+        manager = getattr(self, "_ability_freshness", None)
+        if manager is not None:
+            try:
+                manager.stop()
+            except Exception:
+                pass
+        events_task = getattr(self, "_ability_events_task", None)
+        if events_task is not None:
+            events_task.cancel()
+            self._ability_events_task = None
         if self._response_store is not None:
             try:
                 self._response_store.close()
