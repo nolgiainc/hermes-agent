@@ -22,7 +22,19 @@ def test_bound_activity_description_truncates():
 def test_reset_session_activity_persist_window_clears_rate_limit():
     agent = SimpleNamespace(_session_activity_last_persist_mono=1234.5)
     reset_session_activity_persist_window(agent)
-    assert agent._session_activity_last_persist_mono == 0.0
+    # -inf, not 0.0: the due-check subtracts from time.monotonic(), which
+    # counts from boot — on a freshly-booted host with uptime under the
+    # heartbeat interval a 0.0 reset would still read as "just persisted"
+    # and swallow the forced write. -inf is due on any clock.
+    assert agent._session_activity_last_persist_mono == float("-inf")
+    import time
+    from agent.session_activity import (
+        SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS,
+    )
+    assert (
+        time.monotonic() - agent._session_activity_last_persist_mono
+        >= SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS
+    )
 
 
 def test_reset_session_activity_persist_window_swallows_missing_attr():
