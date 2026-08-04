@@ -1,7 +1,7 @@
 ---
-title: "Evaluating Llms Harness — lm-eval-harness: benchmark LLMs (MMLU, GSM8K, etc"
+title: "Evaluating Llms Harness — lm-eval-harness: benchmark LLMs (MMLU, GSM8K, etc.)"
 sidebar_label: "Evaluating Llms Harness"
-description: "lm-eval-harness: benchmark LLMs (MMLU, GSM8K, etc"
+description: "lm-eval-harness: benchmark LLMs (MMLU, GSM8K, etc.)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
