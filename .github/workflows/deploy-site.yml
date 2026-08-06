@@ -39,7 +39,22 @@ jobs:
     # main commit needs to ship live before the next release tag — e.g.
     # a skills-index PR that doesn't touch website/** paths and so
     # doesn't auto-deploy via the deploy-docs path.
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    #
+    # NOL-472: the dispatch half is now ref-guarded. It fires the Vercel deploy
+    # hook, which ships whatever is on the dispatched ref to the live site, and
+    # `github.event_name == 'workflow_dispatch'` alone accepts ANY ref — the
+    # identical defect that put an unmerged branch on 100% of nolgia-api
+    # production traffic on 2026-08-06.
+    #
+    # The guard is applied per-event rather than as a blanket
+    # `&& github.ref == 'refs/heads/main'`, because on a `release` event
+    # `github.ref` is `refs/tags/<tag>` and a blanket ref check would silently
+    # break every production release cut — turning a safety fix into an outage.
+    # Release publishes are already deliberate, tag-based production cuts made
+    # from merged commits; the unconstrained path was only ever the dispatch.
+    if: >-
+      github.event_name == 'release'
+      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
