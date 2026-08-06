@@ -11,6 +11,7 @@ Covers:
 """
 
 import asyncio
+import json
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -1219,8 +1220,15 @@ class TestDurableRunStatus:
 
                 # In-memory: cancelled (same-process pollers stay informed).
                 assert adapter._run_statuses[run_id]["status"] == "cancelled"
-                # Durable: nothing — a restarted gateway must 404 this run.
+                # Durable: no settled terminal status — the run's journal
+                # row stays unsettled so the NEXT boot reports the honest
+                # restart failure (see TestRunJournal) instead of a
+                # synthetic settled "cancelled".
                 assert adapter._response_store.get_run_status(run_id) is None
+                assert (
+                    adapter._response_store.get_journal_row(run_id)["settled"]
+                    is False
+                )
                 interrupted.set()  # release the executor thread
 
     @pytest.mark.asyncio
@@ -1259,3 +1267,344 @@ class TestDurableRunStatus:
             store._conn.commit()
         assert store.get_run_status("run_bad") is None
         assert store.get_run_status("run_bad") is None  # evicted, stays gone
+
+
+# ---------------------------------------------------------------------------
+# Restart-durable run journal (NOL-423)
+# ---------------------------------------------------------------------------
+
+
+class TestRunJournal:
+    """Runs are journaled durably at submission and reconciled on the next
+    boot: a run a dead process left in flight becomes a durable ``failed``
+    status with error_code="gateway_restart" + provenance, so a replacement
+    pod answers status polls honestly (no 404) and the platform's
+    capability-gated auto-resubmit can act safely. Autopilot caps
+    termination grace at 600s on-demand / 25s on spot (NOL-410), so this
+    journal — not graceful drain — is what makes restarts honest."""
+
+    @pytest.mark.asyncio
+    async def test_submission_journals_identity_not_payload(self):
+        """The journal row lands before the run executes and carries hashes,
+        sizes, and a bounded redacted tail — never the full input and never
+        the run credential."""
+        import hashlib
+
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+        secret_token = "nolgia-tok-SECRET-4242"
+        long_input = ("finish the quarterly report " * 40).strip()  # > tail bound
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, interrupted = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": long_input,
+                        "session_id": "journal-sid",
+                        "nolgia_token": secret_token,
+                    },
+                    headers={"Idempotency-Key": "msg-journal-1"},
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                agent_ready.wait(timeout=3.0)
+
+                row = adapter._response_store.get_journal_row(run_id)
+                assert row is not None
+                assert row["settled"] is False
+                assert row["boot_uuid"] == adapter._boot_uuid
+                data = row["data"]
+                assert data["session_id"] == "journal-sid"
+                assert data["idempotency_key"] == "msg-journal-1"
+                assert data["pod"] == adapter._pod_identity
+                assert data["input_sha256"] == hashlib.sha256(
+                    long_input.encode("utf-8")
+                ).hexdigest()
+                assert data["input_bytes"] == len(long_input.encode("utf-8"))
+                # Bounded tail, not the full payload.
+                assert len(data["input_tail"]) <= 200
+                assert long_input not in json.dumps(data)
+                # Never a credential.
+                assert secret_token not in json.dumps(data)
+
+                interrupted.set()
+                await _wait_terminal(cli, run_id)
+
+    @pytest.mark.asyncio
+    async def test_terminal_settle_is_transactional_and_idempotent(self):
+        """A completed run's journal row settles with the terminal write;
+        replaying the settle and reconciling a later boot never overwrite
+        the real outcome (completed-during-shutdown wins)."""
+        adapter = _make_adapter()
+        store = adapter._response_store
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_create.return_value = _make_completed_agent("all done")
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                status = await _wait_terminal(cli, run_id)
+                assert status["status"] == "completed"
+
+        row = store.get_journal_row(run_id)
+        assert row["settled"] is True
+        assert row["status"] == "completed"
+
+        # Idempotent: replaying the settle rewrites the same rows.
+        store.settle_run_status(run_id, store.get_run_status(run_id))
+        assert store.get_run_status(run_id)["status"] == "completed"
+
+        # A later boot must not double-mark the settled run.
+        reconciled = store.reconcile_prior_boot_runs("some-other-boot")
+        assert reconciled == []
+        assert store.get_run_status(run_id)["status"] == "completed"
+        assert store.get_run_status(run_id)["output"] == "all done"
+
+    @pytest.mark.asyncio
+    async def test_prior_boot_inflight_run_reconciled_as_gateway_restart(self):
+        """The core NOL-423 contract: a run in flight when the process died
+        answers the next boot's status poll as durably failed with
+        error_code="gateway_restart" and provenance — never a 404."""
+        first = _make_adapter()
+        app = _create_runs_app(first)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(first, "_create_agent") as mock_create:
+                mock_agent, agent_ready, interrupted = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs", json={"input": "hello", "session_id": "restart-sid"}
+                )
+                run_id = (await resp.json())["run_id"]
+                agent_ready.wait(timeout=3.0)
+                await asyncio.sleep(0.05)
+
+                # A fresh adapter simulates the replacement pod booting
+                # against the same durable store. Its __init__ reconciles.
+                reborn = _make_adapter()
+                reborn_app = _create_runs_app(reborn)
+                async with TestClient(TestServer(reborn_app)) as reborn_cli:
+                    status_resp = await reborn_cli.get(f"/v1/runs/{run_id}")
+                    assert status_resp.status == 200
+                    status = await status_resp.json()
+
+                assert status["status"] == "failed"
+                assert status["error_code"] == "gateway_restart"
+                assert status["last_status"] == "running"
+                assert status["session_id"] == "restart-sid"
+                provenance = status["restart_provenance"]
+                assert provenance["boot_uuid"] == first._boot_uuid
+                assert provenance["last_status"] == "running"
+                assert provenance["reconciled_by_pod"] == reborn._pod_identity
+
+                # The journal row settled, so a THIRD boot re-marks nothing.
+                assert first._response_store.get_journal_row(run_id) is not None
+                third = _make_adapter()
+                assert (
+                    third._response_store.get_run_status(run_id)["error_code"]
+                    == "gateway_restart"
+                )
+                interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_teardown_cancelled_run_reconciles_on_next_boot(self):
+        """The durable=False teardown cancellation intentionally leaves the
+        journal unsettled; the next boot turns it into the honest restart
+        failure instead of the pre-journal 404."""
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, interrupted = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                agent_ready.wait(timeout=3.0)
+                await asyncio.sleep(0.05)
+
+                task = adapter._active_run_tasks[run_id]
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                interrupted.set()
+
+        reborn = _make_adapter()
+        reborn_app = _create_runs_app(reborn)
+        async with TestClient(TestServer(reborn_app)) as cli:
+            status_resp = await cli.get(f"/v1/runs/{run_id}")
+            assert status_resp.status == 200
+            status = await status_resp.json()
+        assert status["status"] == "failed"
+        assert status["error_code"] == "gateway_restart"
+
+    def test_same_boot_rows_are_never_reconciled(self, adapter):
+        """Liveness is boot identity, not heartbeat staleness: a slow or
+        paused process is not dead, so same-boot rows are untouched no
+        matter how stale their heartbeat is."""
+        store = adapter._response_store
+        store.journal_run_submitted(
+            "run_live_here",
+            adapter._boot_uuid,
+            {"status": "running", "created_at": time.time() - 3600},
+        )
+        assert store.reconcile_prior_boot_runs(adapter._boot_uuid) == []
+        assert store.get_journal_row("run_live_here")["settled"] is False
+        assert store.get_run_status("run_live_here") is None
+
+    def test_waiting_for_approval_orphan_reports_lost_approval(self, adapter):
+        """Approval queues are process memory: an orphaned
+        waiting_for_approval run reports the restart failure with its last
+        status so the platform can tell the user the approval was lost."""
+        store = adapter._response_store
+        store.journal_run_submitted(
+            "run_appr", "dead-boot", {"status": "queued", "created_at": time.time()}
+        )
+        store.journal_run_update(
+            "run_appr", status="waiting_for_approval", last_event="approval.request"
+        )
+        reconciled = store.reconcile_prior_boot_runs("new-boot")
+        assert [r["run_id"] for r in reconciled] == ["run_appr"]
+        status = store.get_run_status("run_appr")
+        assert status["status"] == "failed"
+        assert status["error_code"] == "gateway_restart"
+        assert status["last_status"] == "waiting_for_approval"
+        assert status["last_event"] == "approval.request"
+
+    def test_existing_terminal_status_wins_over_unsettled_journal(self, adapter):
+        """Defense in depth for rows an older image wrote terminally without
+        the transactional settle: the real outcome is kept, the row is only
+        settled."""
+        store = adapter._response_store
+        store.journal_run_submitted(
+            "run_done_old", "dead-boot", {"status": "running", "created_at": time.time()}
+        )
+        store.put_run_status(
+            "run_done_old", {"run_id": "run_done_old", "status": "completed", "output": "kept"}
+        )
+        reconciled = store.reconcile_prior_boot_runs("new-boot")
+        assert reconciled == []
+        assert store.get_run_status("run_done_old")["status"] == "completed"
+        assert store.get_journal_row("run_done_old")["settled"] is True
+
+    def test_status_transitions_journal_immediately(self, adapter):
+        store = adapter._response_store
+        rid = "run_transitions"
+        store.journal_run_submitted(
+            rid, adapter._boot_uuid, {"status": "queued", "created_at": time.time()}
+        )
+        adapter._set_run_status(rid, "running")
+        assert store.get_journal_row(rid)["status"] == "running"
+        # A transition inside the heartbeat window still writes immediately.
+        adapter._set_run_status(
+            rid, "waiting_for_approval", last_event="approval.request"
+        )
+        row = store.get_journal_row(rid)
+        assert row["status"] == "waiting_for_approval"
+        assert row["data"]["last_event"] == "approval.request"
+
+    def test_heartbeats_are_throttled(self, adapter):
+        """Repeat-status journal writes (tool lifecycle events) land at most
+        once per heartbeat interval; the floor keeps journal I/O off the
+        per-event hot path."""
+        store = adapter._response_store
+        rid = "run_heartbeat"
+        store.journal_run_submitted(
+            rid, adapter._boot_uuid, {"status": "queued", "created_at": time.time()}
+        )
+        adapter._set_run_status(rid, "running", last_event="run.started")
+        assert store.get_journal_row(rid)["data"]["last_event"] == "run.started"
+
+        # Same status within the window: memory updates, journal does not.
+        for i in range(5):
+            adapter._set_run_status(rid, "running", last_event=f"tool.started:{i}")
+        assert adapter._run_statuses[rid]["last_event"] == "tool.started:4"
+        assert store.get_journal_row(rid)["data"]["last_event"] == "run.started"
+
+        # Age the throttle window (no sleeping): the next event heartbeats.
+        adapter._run_journal_heartbeat_at[rid] -= (
+            adapter._RUN_JOURNAL_HEARTBEAT_SECONDS + 1
+        )
+        adapter._set_run_status(rid, "running", last_event="tool.completed")
+        row = store.get_journal_row(rid)
+        assert row["data"]["last_event"] == "tool.completed"
+        assert row["data"]["heartbeat_at"] > 0
+
+    def test_output_tail_is_bounded_and_flushed_on_heartbeat(self, adapter):
+        store = adapter._response_store
+        rid = "run_tail"
+        store.journal_run_submitted(
+            rid, adapter._boot_uuid, {"status": "queued", "created_at": time.time()}
+        )
+        adapter._append_run_output_tail(rid, "x" * 3000)
+        adapter._append_run_output_tail(rid, " the latest progress")
+        assert (
+            len(adapter._run_output_tails[rid])
+            <= adapter._RUN_JOURNAL_OUTPUT_TAIL_CHARS
+        )
+        adapter._set_run_status(rid, "running")  # transition flushes the tail
+        tail = store.get_journal_row(rid)["data"]["output_tail"]
+        assert tail.endswith("the latest progress")
+        assert len(tail) <= adapter._RUN_JOURNAL_OUTPUT_TAIL_CHARS
+
+    def test_journal_settlement_clears_throttle_state(self, adapter):
+        rid = "run_cleanup"
+        adapter._response_store.journal_run_submitted(
+            rid, adapter._boot_uuid, {"status": "queued", "created_at": time.time()}
+        )
+        adapter._set_run_status(rid, "running")
+        adapter._append_run_output_tail(rid, "partial")
+        adapter._set_run_status(rid, "completed", output="done")
+        assert rid not in adapter._run_journal_heartbeat_at
+        assert rid not in adapter._run_output_tails
+
+    def test_late_event_cannot_reopen_settled_row(self, adapter):
+        """A tool event landing after the terminal settle must not resurrect
+        the journal row into a shape the next boot would re-fail."""
+        store = adapter._response_store
+        rid = "run_late_event"
+        store.journal_run_submitted(
+            rid, adapter._boot_uuid, {"status": "queued", "created_at": time.time()}
+        )
+        adapter._set_run_status(rid, "completed", output="done")
+        store.journal_run_update(rid, status="running", last_event="tool.started")
+        row = store.get_journal_row(rid)
+        assert row["settled"] is True
+        assert row["status"] == "completed"
+
+    def test_journal_capacity_evicts_settled_rows_first(self, adapter):
+        """An unsettled row is the only record the next boot has of an
+        in-flight run, so capacity pressure evicts settled rows first."""
+        store = adapter._response_store
+        store.MAX_STORED_RUN_STATUSES = 5
+        now = time.time()
+        for i in range(4):
+            rid = f"run_settled_{i}"
+            store.journal_run_submitted(rid, "boot-a", {"created_at": now})
+            store.settle_run_status(rid, {"run_id": rid, "status": "completed"})
+        for i in range(3):
+            store.journal_run_submitted(
+                f"run_open_{i}", "boot-a", {"status": "running", "created_at": now}
+            )
+        for i in range(3):
+            assert store.get_journal_row(f"run_open_{i}") is not None
+        remaining_settled = sum(
+            1 for i in range(4) if store.get_journal_row(f"run_settled_{i}") is not None
+        )
+        assert remaining_settled == 2
+
+    @pytest.mark.asyncio
+    async def test_capabilities_advertises_run_restart_journal(self, adapter):
+        """The platform keys "gateway_restart failures are auto-resubmit-
+        eligible, and 404-after-restart is no longer the signal" on this
+        flag during the fleet roll."""
+        app = _create_runs_app(adapter)
+        app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/capabilities")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["features"]["run_restart_journal"] is True
