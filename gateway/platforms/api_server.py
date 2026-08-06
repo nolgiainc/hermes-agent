@@ -52,11 +52,13 @@ from functools import wraps
 import logging
 import os
 import re
+import socket
 import sqlite3
 import sys
 import threading
 import time
 import uuid
+import weakref
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -824,14 +826,40 @@ class ResponseStore:
         # a late GET /v1/runs/{id} salvage probe would 404 and the caller's
         # only recourse is re-running the whole turn — double side effects,
         # double credit spend. Terminal statuses (completed/failed/cancelled)
-        # are therefore mirrored here; in-flight statuses are NOT (a pod
-        # restart mid-run genuinely loses the work, and a durable "running"
-        # row would lie about it forever).
+        # are therefore mirrored here. In-flight statuses are never mirrored
+        # into THIS table (a durable "running" row would lie about lost work
+        # forever); the run_journal below is what makes an in-flight run's
+        # existence survive a restart, as an honest failure.
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS run_statuses (
                 run_id TEXT PRIMARY KEY,
                 data TEXT NOT NULL,
                 updated_at REAL NOT NULL
+            )"""
+        )
+        # Restart-durable run journal (NOL-423). One row per /v1/runs
+        # submission, inserted before the run is visible as queued, updated
+        # on low-frequency status transitions and throttled heartbeats, and
+        # settled (settled=1) in the SAME transaction as the terminal status
+        # write. Its consumer is the NEXT boot: reconcile_prior_boot_runs()
+        # turns rows a dead process left unsettled into durable `failed`
+        # statuses with error_code="gateway_restart" + provenance, so a
+        # replacement pod answers a status poll honestly instead of 404ing
+        # and the platform's capability-gated auto-resubmit (NOL-397 part 1)
+        # can act on a machine-matchable signal. Rows carry identity and
+        # provenance only — hashes, sizes, bounded redacted tails — never
+        # full payloads (the platform durably owns submission content) and
+        # never credentials. Resume-from-journal is deliberately out of
+        # scope: honest-failure-with-provenance first.
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS run_journal (
+                run_id TEXT PRIMARY KEY,
+                boot_uuid TEXT NOT NULL,
+                status TEXT NOT NULL,
+                settled INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                data TEXT NOT NULL
             )"""
         )
         self._conn.commit()
@@ -845,6 +873,17 @@ class ResponseStore:
         # rather than after every commit — chmod-on-every-write is wasted
         # syscalls on a hot path.
         self._tighten_file_permissions()
+
+    @property
+    def db_path(self) -> Optional[str]:
+        """On-disk backing path, or None when this store is memory-only.
+
+        None means every row here dies with the process: __init__ falls back
+        to ``:memory:`` when the configured path cannot be opened. Callers
+        that promise durability (the run journal's restart contract) MUST
+        gate that promise on this being set.
+        """
+        return self._db_path
 
     def _tighten_file_permissions(self) -> None:
         """Force owner-only permissions on the DB and SQLite sidecars."""
@@ -959,28 +998,33 @@ class ResponseStore:
 
     def put_run_status(self, run_id: str, data: Dict[str, Any]) -> None:
         """Persist a terminal run status (INSERT OR REPLACE) and prune."""
-        now = time.time()
         with self._run_status_lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO run_statuses (run_id, data, updated_at) VALUES (?, ?, ?)",
-                (run_id, json.dumps(data, default=str), now),
-            )
-            self._conn.execute(
-                "DELETE FROM run_statuses WHERE updated_at < ?",
-                (now - self.RUN_STATUS_RETENTION_SECONDS,),
-            )
-            count = self._conn.execute(
-                "SELECT COUNT(*) FROM run_statuses"
-            ).fetchone()[0]
-            if count > self.MAX_STORED_RUN_STATUSES:
-                self._conn.execute(
-                    """DELETE FROM run_statuses WHERE run_id IN (
-                        SELECT run_id FROM run_statuses
-                        ORDER BY updated_at ASC LIMIT ?
-                    )""",
-                    (count - self.MAX_STORED_RUN_STATUSES,),
-                )
+            self._put_run_status_locked(run_id, data, time.time())
             self._conn.commit()
+
+    def _put_run_status_locked(
+        self, run_id: str, data: Dict[str, Any], now: float
+    ) -> None:
+        """Write + prune a terminal status. Caller holds the lock and commits."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO run_statuses (run_id, data, updated_at) VALUES (?, ?, ?)",
+            (run_id, json.dumps(data, default=str), now),
+        )
+        self._conn.execute(
+            "DELETE FROM run_statuses WHERE updated_at < ?",
+            (now - self.RUN_STATUS_RETENTION_SECONDS,),
+        )
+        count = self._conn.execute(
+            "SELECT COUNT(*) FROM run_statuses"
+        ).fetchone()[0]
+        if count > self.MAX_STORED_RUN_STATUSES:
+            self._conn.execute(
+                """DELETE FROM run_statuses WHERE run_id IN (
+                    SELECT run_id FROM run_statuses
+                    ORDER BY updated_at ASC LIMIT ?
+                )""",
+                (count - self.MAX_STORED_RUN_STATUSES,),
+            )
 
     def get_run_status(self, run_id: str) -> Optional[Dict[str, Any]]:
         """Return a persisted, unexpired terminal run status, or None.
@@ -1018,6 +1062,207 @@ class ResponseStore:
                 self._conn.commit()
             return None
 
+    # Restart-durable run journal (NOL-423) ------------------------------
+
+    def journal_run_submitted(
+        self, run_id: str, boot_uuid: str, data: Dict[str, Any]
+    ) -> None:
+        """Insert the run's journal row at submission time (and prune)."""
+        now = time.time()
+        with self._run_status_lock:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO run_journal
+                   (run_id, boot_uuid, status, settled, created_at, updated_at, data)
+                   VALUES (?, ?, ?, 0, ?, ?, ?)""",
+                (
+                    run_id,
+                    boot_uuid,
+                    str(data.get("status", "queued")),
+                    float(data.get("created_at") or now),
+                    now,
+                    json.dumps(data, default=str),
+                ),
+            )
+            # Retention and capacity BOTH apply to settled rows only. An
+            # unsettled row is the only record the next boot has of an
+            # in-flight run, and a run can legitimately go quiet for longer
+            # than retention (an approval waiting on a human, a long
+            # external operation), so age alone must never delete it —
+            # otherwise the next boot 404s a run this gateway still claims
+            # to journal. Capacity is likewise a bound on settled history:
+            # exceeding it is preferable to erasing live runs.
+            self._conn.execute(
+                "DELETE FROM run_journal WHERE settled = 1 AND updated_at < ?",
+                (now - self.RUN_STATUS_RETENTION_SECONDS,),
+            )
+            count = self._conn.execute(
+                "SELECT COUNT(*) FROM run_journal"
+            ).fetchone()[0]
+            if count > self.MAX_STORED_RUN_STATUSES:
+                self._conn.execute(
+                    """DELETE FROM run_journal WHERE run_id IN (
+                        SELECT run_id FROM run_journal WHERE settled = 1
+                        ORDER BY updated_at ASC LIMIT ?
+                    )""",
+                    (count - self.MAX_STORED_RUN_STATUSES,),
+                )
+            self._conn.commit()
+
+    def journal_run_update(
+        self, run_id: str, status: Optional[str] = None, **fields: Any
+    ) -> None:
+        """Merge a status transition / heartbeat into a live journal row.
+
+        No-ops when the run was never journaled (statuses set outside the
+        /v1/runs submission path) or its row is already settled (a late
+        tool event landing after the terminal settle must not reopen it).
+        """
+        now = time.time()
+        with self._run_status_lock:
+            row = self._conn.execute(
+                "SELECT status, data, settled FROM run_journal WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None or row[2]:
+                return
+            try:
+                data = json.loads(row[1])
+            except (json.JSONDecodeError, TypeError):
+                data = {}
+            new_status = str(status) if status else str(row[0])
+            data["status"] = new_status
+            data.update(fields)
+            self._conn.execute(
+                "UPDATE run_journal SET status = ?, updated_at = ?, data = ? WHERE run_id = ?",
+                (new_status, now, json.dumps(data, default=str), run_id),
+            )
+            self._conn.commit()
+
+    def settle_run_status(self, run_id: str, data: Dict[str, Any]) -> None:
+        """Persist a terminal status AND settle the journal row atomically.
+
+        One transaction on purpose: reconciliation trusts ``settled`` to
+        mean "a durable terminal status exists", so the pair must be
+        indivisible — a terminal write without the settle would let the
+        next boot double-mark a finished run as gateway_restart-failed, and
+        a settle without the terminal write would silently drop the
+        outcome. Idempotent: replaying the settle rewrites the same rows.
+        """
+        now = time.time()
+        with self._run_status_lock:
+            self._put_run_status_locked(run_id, data, now)
+            self._conn.execute(
+                "UPDATE run_journal SET settled = 1, status = ?, updated_at = ? WHERE run_id = ?",
+                (str(data.get("status", "")), now, run_id),
+            )
+            self._conn.commit()
+
+    def reconcile_prior_boot_runs(
+        self, current_boot_uuid: str, pod_identity: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Durably fail every unsettled journal row from a PRIOR boot.
+
+        Runs once at adapter startup, before any request is served. Rows
+        whose ``boot_uuid`` differs from the current boot and that never
+        settled are, by construction, runs whose in-flight work this
+        process is not executing — the prior process died with them.  Each
+        becomes a durable ``failed`` status with the stable, machine-
+        matchable ``error_code: "gateway_restart"`` plus provenance
+        (original created_at, last journaled status/event/heartbeat, prior
+        boot/pod identity, bounded redacted output tail), so a late poll
+        answers honestly instead of 404ing and the platform can treat the
+        failure as auto-resubmit-eligible.
+
+        Liveness is the boot-identity comparison, never heartbeat
+        staleness: a paused/slow process is not dead, and same-boot rows
+        are never touched. If a durable terminal status already exists for
+        a row (completed-during-shutdown on an image that wrote statuses
+        without settling), the real outcome wins and the row is only
+        settled.  Returns the failed statuses written.
+        """
+        now = time.time()
+        reconciled: List[Dict[str, Any]] = []
+        with self._run_status_lock:
+            rows = self._conn.execute(
+                """SELECT run_id, boot_uuid, status, created_at, updated_at, data
+                   FROM run_journal WHERE settled = 0 AND boot_uuid != ?""",
+                (current_boot_uuid,),
+            ).fetchall()
+            for run_id, boot_uuid, last_status, created_at, journaled_at, raw in rows:
+                try:
+                    data = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    data = {}
+                existing = self._conn.execute(
+                    "SELECT 1 FROM run_statuses WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if existing is None:
+                    provenance: Dict[str, Any] = {
+                        "boot_uuid": boot_uuid,
+                        "last_status": last_status,
+                        "last_journal_write_at": journaled_at,
+                        "reconciled_at": now,
+                    }
+                    for key in ("pod", "last_event", "heartbeat_at", "output_tail"):
+                        if data.get(key) is not None:
+                            provenance[key] = data[key]
+                    if pod_identity:
+                        provenance["reconciled_by_pod"] = pod_identity
+                    status_payload: Dict[str, Any] = {
+                        "object": "hermes.run",
+                        "run_id": run_id,
+                        "status": "failed",
+                        "error": (
+                            "gateway restarted while the run was in flight; "
+                            "the in-flight work was lost and the submission "
+                            "can be safely retried"
+                        ),
+                        "error_code": "gateway_restart",
+                        "created_at": created_at,
+                        "updated_at": now,
+                        "last_status": last_status,
+                        "restart_provenance": provenance,
+                    }
+                    for key in ("session_id", "model", "last_event"):
+                        if data.get(key) is not None:
+                            status_payload[key] = data[key]
+                    self._put_run_status_locked(run_id, status_payload, now)
+                    reconciled.append(status_payload)
+                self._conn.execute(
+                    "UPDATE run_journal SET settled = 1, status = ?, updated_at = ? WHERE run_id = ?",
+                    (
+                        "failed" if existing is None else str(last_status),
+                        now,
+                        run_id,
+                    ),
+                )
+            if rows:
+                self._conn.commit()
+        return reconciled
+
+    def get_journal_row(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """Return the raw journal row for a run (introspection/tests)."""
+        with self._run_status_lock:
+            row = self._conn.execute(
+                """SELECT boot_uuid, status, settled, created_at, updated_at, data
+                   FROM run_journal WHERE run_id = ?""",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            data = json.loads(row[5])
+        except (json.JSONDecodeError, TypeError):
+            data = {}
+        return {
+            "boot_uuid": row[0],
+            "status": row[1],
+            "settled": bool(row[2]),
+            "created_at": row[3],
+            "updated_at": row[4],
+            "data": data,
+        }
+
     def close(self) -> None:
         """Close the database connection."""
         try:
@@ -1028,6 +1273,26 @@ class ResponseStore:
     def __len__(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()
         return row[0] if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Run-journal store ownership (NOL-423)
+# ---------------------------------------------------------------------------
+# Reconciliation converts every unsettled prior-boot journal row into a
+# durable gateway_restart failure, which the platform treats as
+# auto-resubmit-eligible. Doing that while the boot that owns those rows is
+# still executing them duplicates tool side effects and credit spend, so a
+# boot may only reconcile after proving no live gateway owns the store.
+#
+# The machine-local scoped lock (gateway.status) provides the cross-process
+# half of that proof, but it is re-entrant per PID and therefore cannot
+# separate two adapters inside ONE process (multiplexed startup, reconnect
+# churn constructing a replacement adapter before the old one is collected)
+# that share a response_store.db. This registry is the in-process half:
+# db_path -> weakref to the owning adapter. Ownership passes on only when
+# the current owner is gone or no longer connected.
+_JOURNAL_STORE_OWNERS: "Dict[str, Any]" = {}
+_JOURNAL_STORE_OWNERS_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -1566,6 +1831,32 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        # Per-instance boot identity for the restart journal (NOL-423). One
+        # adapter instance == one gateway boot serving /v1/runs: in-memory
+        # run state (streams, approval queues, executor threads) dies with
+        # the instance, so journal rows carrying any OTHER boot_uuid are, by
+        # construction, runs whose work this process cannot be executing.
+        self._boot_uuid: str = uuid.uuid4().hex
+        try:
+            self._pod_identity: str = os.getenv("HOSTNAME") or socket.gethostname() or ""
+        except Exception:
+            self._pod_identity = ""
+        # Journal heartbeat throttle state and the bounded partial-output
+        # tail flushed with heartbeats (memory only between journal writes).
+        self._run_journal_heartbeat_at: Dict[str, float] = {}
+        self._run_output_tails: Dict[str, str] = {}
+        # Effective state of the restart-journal contract (NOL-423), and the
+        # only thing /v1/capabilities may advertise it from. False until
+        # connect() proves BOTH halves: the store is on-disk durable (a
+        # :memory: fallback journal dies with the process) and prior-boot
+        # reconciliation actually ran for this boot. A platform that stops
+        # treating a post-restart 404 as the lost-run signal on the strength
+        # of this flag must never see it set on a pod that cannot keep the
+        # promise.
+        self._run_journal_ready: bool = False
+        # Scoped-lock identity held while this boot owns the journal's store
+        # (set by _claim_run_journal_ownership, released on disconnect).
+        self._run_journal_lock_identity: Optional[str] = None
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -3308,6 +3599,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 # this flag — pods roll gradually, so it must not retry
                 # broadly against a pod that would double-execute.
                 "run_idempotency": True,
+                # Run submissions are journaled durably and, after a
+                # restart, prior-boot in-flight runs are reported as failed
+                # with error_code="gateway_restart" (+ provenance) instead
+                # of 404ing (NOL-423). The platform can treat that code as
+                # auto-resubmit-eligible without observed-alive heuristics.
+                # EFFECTIVE state, not intent: false when response_store.db
+                # could not be opened (the :memory: fallback journal dies
+                # with the process) or when startup reconciliation did not
+                # run for this boot — a platform that stops treating a
+                # post-restart 404 as the lost-run signal must only do so
+                # against a pod that can actually keep the promise.
+                "run_restart_journal": bool(self._run_journal_ready),
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
@@ -6823,6 +7126,144 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    # Journal heartbeat floor (seconds): non-transition journal writes (a
+    # tool lifecycle event refreshing last_event) are throttled to at most
+    # one per interval per run. Status TRANSITIONS always write. Message
+    # deltas never reach the journal directly — they only refresh the
+    # in-memory output tail, flushed with the next heartbeat.
+    _RUN_JOURNAL_HEARTBEAT_SECONDS = 15.0
+    # Bounded partial-output tail journaled with heartbeats. With spot's
+    # 25s termination grace (NOL-410) the journaled tail is often the only
+    # surviving record of a preempted run's progress.
+    _RUN_JOURNAL_OUTPUT_TAIL_CHARS = 2000
+    # Headroom on the in-memory accumulation buffer. Redaction is always
+    # applied to the WHOLE buffer before any tail is sliced off it (a
+    # credential's recognizable prefix — "-----BEGIN … KEY-----",
+    # "password=", "eyJ" — can sit before the retained boundary while the
+    # secret bytes extend into it), so the buffer must hold enough leading
+    # context for the longest credential shapes redact_sensitive_text knows.
+    _RUN_JOURNAL_OUTPUT_RAW_CHARS = 8000
+    # Bounded redacted tail of the submitted input kept as journal provenance.
+    _RUN_JOURNAL_INPUT_TAIL_CHARS = 200
+
+    def _claim_run_journal_ownership(self) -> bool:
+        """Claim exclusive ownership of the journal's durable store.
+
+        True only when no OTHER live gateway can be serving runs out of the
+        same ``response_store.db``: this process holds no other connected
+        adapter for that path (in-process registry) and the machine-local
+        scoped lock for it is either free or held by a dead process (the
+        lock's PID + start-time liveness check is the "prior boot is gone"
+        proof; the OS reclaims nothing, so staleness is decided by whether
+        the recorded process still exists).
+
+        Fails closed. Reconciliation is destructive-by-design for a live
+        boot's runs (auto-resubmit duplicates side effects and credit
+        spend), so any uncertainty means no reconciliation and no
+        capability advertisement.
+        """
+        db_path = self._response_store.db_path
+        if not db_path:
+            return False
+        with _JOURNAL_STORE_OWNERS_LOCK:
+            owner_ref = _JOURNAL_STORE_OWNERS.get(db_path)
+            owner = owner_ref() if owner_ref is not None else None
+            if owner is not None and owner is not self and owner.is_connected:
+                logger.warning(
+                    "[%s] another adapter in this process is serving runs from "
+                    "%s; skipping prior-boot run reconciliation (its in-flight "
+                    "runs are live, not lost)",
+                    self.name, db_path,
+                )
+                return False
+            _JOURNAL_STORE_OWNERS[db_path] = weakref.ref(self)
+        try:
+            from gateway.status import acquire_scoped_lock
+            acquired, existing = acquire_scoped_lock(
+                "api_server_run_journal",
+                db_path,
+                metadata={
+                    "boot_uuid": self._boot_uuid,
+                    "pod": self._pod_identity,
+                    "port": self._port,
+                },
+            )
+        except Exception:
+            logger.warning(
+                "[%s] could not evaluate run-journal store ownership for %s; "
+                "skipping prior-boot run reconciliation",
+                self.name, db_path, exc_info=True,
+            )
+            self._release_run_journal_ownership()
+            return False
+        if not acquired:
+            logger.warning(
+                "[%s] run journal store %s is held by a live gateway (%s); "
+                "skipping prior-boot run reconciliation so its in-flight runs "
+                "are not mis-reported as gateway_restart failures",
+                self.name, db_path,
+                (existing or {}).get("pid", "unknown"),
+            )
+            self._release_run_journal_ownership()
+            return False
+        self._run_journal_lock_identity = db_path
+        return True
+
+    def _release_run_journal_ownership(self) -> None:
+        """Drop the in-process claim and the scoped lock, if held."""
+        db_path = self._response_store.db_path
+        if db_path:
+            with _JOURNAL_STORE_OWNERS_LOCK:
+                owner_ref = _JOURNAL_STORE_OWNERS.get(db_path)
+                owner = owner_ref() if owner_ref is not None else None
+                if owner is None or owner is self:
+                    _JOURNAL_STORE_OWNERS.pop(db_path, None)
+        identity = self._run_journal_lock_identity
+        self._run_journal_lock_identity = None
+        if identity:
+            try:
+                from gateway.status import release_scoped_lock
+                release_scoped_lock("api_server_run_journal", identity)
+            except Exception:
+                logger.debug(
+                    "[%s] failed to release run-journal store lock",
+                    self.name, exc_info=True,
+                )
+
+    def _reconcile_prior_boot_runs(self) -> bool:
+        """Fail every unsettled prior-boot journal row, once ownership is proven.
+
+        Deliberately NOT done in ``__init__``: adapter construction happens
+        on every reconnect attempt, including a contender that is about to
+        lose the port with EADDRINUSE, and the original gateway's in-flight
+        runs would then be durably marked ``gateway_restart`` (which the
+        platform auto-resubmits) while they keep executing. Called from
+        ``connect()`` after the listener is bound and store ownership is
+        claimed, so the prior boot is provably gone.
+
+        Runs synchronously with no ``await`` between the bind and here, so
+        no request handler can observe the pre-reconciliation state.
+        Returns True when reconciliation completed and the restart-journal
+        contract is therefore live for this boot.
+        """
+        if not self._claim_run_journal_ownership():
+            return False
+        try:
+            reconciled = self._response_store.reconcile_prior_boot_runs(
+                self._boot_uuid, pod_identity=self._pod_identity
+            )
+        except Exception:
+            logger.exception("[%s] prior-boot run reconciliation failed", self.name)
+            return False
+        if reconciled:
+            logger.warning(
+                "[%s] marked %d prior-boot run(s) failed with "
+                "error_code=gateway_restart: %s",
+                self.name,
+                len(reconciled),
+                ", ".join(entry["run_id"] for entry in reconciled),
+            )
+        return True
 
     def _set_run_status(
         self, run_id: str, status: str, durable: bool = True, **fields: Any
@@ -6833,11 +7274,14 @@ class APIServerAdapter(BasePlatformAdapter):
         teardown cancellations (gateway restart cancelling the
         ``_run_and_close`` task): persisting that synthetic "cancelled"
         would make the restarted gateway serve a durable terminal result
-        where the honest answer is 404 — the in-flight work was lost and the
-        caller should resubmit.
+        for work that was actually lost. Skipping the settle leaves the
+        run's journal row unsettled, so the NEXT boot reports it as failed
+        with error_code="gateway_restart" — the honest answer the platform
+        can auto-resubmit on (NOL-423).
         """
         now = time.time()
         current = self._run_statuses.get(run_id, {})
+        prior_status = current.get("status")
         current.update({
             "object": "hermes.run",
             "run_id": run_id,
@@ -6847,20 +7291,113 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
-        if durable and status in ("completed", "failed", "cancelled"):
-            # Mirror terminal statuses durably so a supervisor that lost the
-            # run (budget timeout, restart on either side) can still salvage
-            # the outcome from GET /v1/runs/{run_id} instead of re-executing
-            # the turn. Best-effort: a store hiccup must never fail the run.
-            try:
-                self._response_store.put_run_status(run_id, dict(current))
-            except Exception:
-                logger.debug(
-                    "[api_server] failed to persist terminal status for run %s",
-                    run_id,
-                    exc_info=True,
-                )
+        if status in ("completed", "failed", "cancelled"):
+            self._run_journal_heartbeat_at.pop(run_id, None)
+            self._run_output_tails.pop(run_id, None)
+            if durable:
+                # Mirror terminal statuses durably so a supervisor that lost
+                # the run (budget timeout, restart on either side) can still
+                # salvage the outcome from GET /v1/runs/{run_id} instead of
+                # re-executing the turn. The journal row settles in the same
+                # transaction so reconciliation can never double-mark this
+                # run. Best-effort: a store hiccup must never fail the run.
+                try:
+                    self._response_store.settle_run_status(run_id, dict(current))
+                except Exception:
+                    logger.debug(
+                        "[api_server] failed to persist terminal status for run %s",
+                        run_id,
+                        exc_info=True,
+                    )
+        else:
+            self._journal_run_progress(
+                run_id, status, prior_status, current.get("last_event"), now
+            )
         return current
+
+    def _journal_run_progress(
+        self,
+        run_id: str,
+        status: str,
+        prior_status: Optional[str],
+        last_event: Optional[str],
+        now: float,
+    ) -> None:
+        """Journal a non-terminal status durably, at bounded frequency.
+
+        Transitions (queued→running, running→waiting_for_approval, …)
+        write immediately — low-frequency and provenance-bearing. Repeat
+        statuses (tool lifecycle events refreshing last_event) are
+        heartbeats, throttled to _RUN_JOURNAL_HEARTBEAT_SECONDS apart.
+        Best-effort: a store hiccup must never fail the run.
+        """
+        if status == prior_status and (
+            now - self._run_journal_heartbeat_at.get(run_id, 0.0)
+            < self._RUN_JOURNAL_HEARTBEAT_SECONDS
+        ):
+            return
+        fields: Dict[str, Any] = {"heartbeat_at": now}
+        if last_event is not None:
+            fields["last_event"] = last_event
+        tail = self._run_output_tails.get(run_id)
+        if tail:
+            # Same egress redaction the SSE stream applies before any text
+            # leaves the process — applied to the whole buffer BEFORE the
+            # journaled tail is sliced, so a credential whose prefix sits
+            # ahead of the boundary is still recognized (slicing first would
+            # persist its raw remainder).
+            fields["output_tail"] = redact_sensitive_text(tail, force=True)[
+                -self._RUN_JOURNAL_OUTPUT_TAIL_CHARS:
+            ]
+        try:
+            self._response_store.journal_run_update(run_id, status=status, **fields)
+        except Exception:
+            logger.debug(
+                "[api_server] failed to journal progress for run %s",
+                run_id,
+                exc_info=True,
+            )
+        else:
+            self._run_journal_heartbeat_at[run_id] = now
+
+    def _append_run_output_tail(self, run_id: str, delta: str) -> None:
+        """Accumulate a bounded in-memory output tail (journaled on heartbeat).
+
+        Trimming redacts first: dropping the head of raw text can strip the
+        prefix (key header, ``password=``, JWT ``eyJ``) that makes a
+        credential recognizable, leaving its remaining bytes to be journaled
+        verbatim later. Redacting the full buffer before the drop keeps the
+        journal's no-credentials contract intact for text that straddles the
+        boundary.
+        """
+        tail = self._run_output_tails.get(run_id, "") + delta
+        if len(tail) > self._RUN_JOURNAL_OUTPUT_RAW_CHARS:
+            tail = redact_sensitive_text(tail, force=True)[
+                -self._RUN_JOURNAL_OUTPUT_RAW_CHARS:
+            ]
+        self._run_output_tails[run_id] = tail
+
+    def _flush_run_output_heartbeat(self, run_id: str) -> None:
+        """Heartbeat a streaming run so its output tail reaches the journal.
+
+        A text-only response produces message deltas and nothing else: after
+        the ``running`` transition there is no further status event, so
+        without this the journal would hold none of the partial output the
+        restart contract promises survives a preemption. Routed through the
+        same throttled heartbeat as tool lifecycle events — at most one
+        journal write per ``_RUN_JOURNAL_HEARTBEAT_SECONDS`` per run, never
+        one per delta. Called from the run's executor thread.
+        """
+        current = self._run_statuses.get(run_id)
+        if not current:
+            return
+        status = str(current.get("status") or "")
+        if not status or status in ("completed", "failed", "cancelled"):
+            return
+        # prior_status == status keeps this on the throttled heartbeat path.
+        self._journal_run_progress(
+            run_id, status, status, current.get("last_event"), time.time()
+        )
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
@@ -7155,6 +7692,16 @@ class APIServerAdapter(BasePlatformAdapter):
         def _text_cb(delta: Optional[str]) -> None:
             if delta is None:
                 return
+            # Feed the journal's bounded output tail even with no SSE
+            # subscriber draining the stream: after a preemption the
+            # journaled tail can be the only surviving record of progress.
+            # The append itself is memory-only; the flush below is the
+            # heartbeat that makes it durable — throttled to one write per
+            # _RUN_JOURNAL_HEARTBEAT_SECONDS, never one per delta. Without
+            # it a text-only response (no tool events after the `running`
+            # transition) would journal no progress at all.
+            self._append_run_output_tail(run_id, delta)
+            self._flush_run_output_heartbeat(run_id)
             if run_id not in self._run_streams:
                 return
             try:
@@ -7166,6 +7713,61 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
             except Exception:
                 pass
+
+        # Restart journal (NOL-423): record the submission durably BEFORE
+        # the run is visible as queued. Identity and provenance only —
+        # hashes, sizes, a bounded redacted input tail — never the full
+        # payload (the platform durably owns submission content in
+        # agent_messages) and never credentials (nolgia_token is
+        # deliberately absent). If this process dies mid-run, the next boot
+        # turns this row into a durable failed status with
+        # error_code="gateway_restart". Best-effort: journal problems must
+        # never fail the submission.
+        try:
+            input_text = (
+                user_message if isinstance(user_message, str) else str(user_message)
+            )
+            input_bytes = input_text.encode("utf-8", "replace")
+            history_blob = json.dumps(
+                conversation_history, sort_keys=True, default=str
+            ).encode("utf-8", "replace")
+            journal_seed: Dict[str, Any] = {
+                "status": "queued",
+                "created_at": created_at,
+                "session_id": session_id,
+                "model": body.get("model", self._model_name),
+                "profile": str(request_profile or ""),
+                "pod": self._pod_identity,
+                "input_sha256": hashlib.sha256(input_bytes).hexdigest(),
+                "input_bytes": len(input_bytes),
+                # Redact the WHOLE input before slicing its tail: a
+                # credential can start ahead of the retained boundary and
+                # extend into it (long private key, JWT, `password=…`), and
+                # slicing first would strip exactly the prefix
+                # redact_sensitive_text needs to recognize it — persisting
+                # raw credential bytes in run_journal. Same order as the
+                # sibling output-tail path. The extra scan is one pass per
+                # submission, alongside the sha256 already taken here.
+                "input_tail": redact_sensitive_text(input_text, force=True)[
+                    -self._RUN_JOURNAL_INPUT_TAIL_CHARS:
+                ],
+                "history_sha256": hashlib.sha256(history_blob).hexdigest(),
+                "history_messages": len(conversation_history),
+                "history_bytes": len(history_blob),
+            }
+            if idempotency_key:
+                journal_seed["idempotency_key"] = idempotency_key
+            if workspace_id:
+                journal_seed["workspace_id"] = workspace_id
+            self._response_store.journal_run_submitted(
+                run_id, self._boot_uuid, journal_seed
+            )
+        except Exception:
+            logger.debug(
+                "[api_server] failed to journal submission for run %s",
+                run_id,
+                exc_info=True,
+            )
 
         self._set_run_status(
             run_id,
@@ -7396,9 +7998,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 # through the executor path; a CancelledError landing HERE is
                 # (aside from a stop racing teardown) the gateway shutting
                 # down mid-run. That work is lost — keep the terminal status
-                # in memory for late same-process pollers, but do NOT persist
-                # it: after the restart the honest answer is 404 (resubmit),
-                # not a durable "cancelled" that reads as a settled run.
+                # in memory for late same-process pollers, but do NOT settle
+                # it durably: the unsettled journal row makes the NEXT boot
+                # report this run as failed with error_code="gateway_restart"
+                # (NOL-423) — the honest, auto-resubmit-eligible answer — not
+                # a durable "cancelled" that reads as a settled run.
                 self._set_run_status(
                     run_id,
                     "cancelled",
@@ -7541,8 +8145,10 @@ class APIServerAdapter(BasePlatformAdapter):
             # Memory miss: the entry aged out of _RUN_STATUS_TTL or the
             # gateway restarted since the run settled. Terminal statuses are
             # mirrored durably (see ResponseStore.put_run_status) precisely
-            # so this late poll can still salvage the outcome; only runs that
-            # never reached a terminal state 404 (that work is really gone).
+            # so this late poll can still salvage the outcome — and runs a
+            # prior boot lost mid-flight were reconciled at startup into
+            # durable failed statuses with error_code="gateway_restart"
+            # (NOL-423), so they answer honestly here too instead of 404ing.
             try:
                 status = self._response_store.get_run_status(run_id)
             except Exception:
@@ -7845,6 +8451,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                self._run_journal_heartbeat_at.pop(run_id, None)
+                self._run_output_tails.pop(run_id, None)
 
         stale_statuses = [
             run_id
@@ -8051,6 +8659,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 return False
 
+            # Startup reconciliation (NOL-423) — deliberately here, after the
+            # listener is ours. Owning the port (plus the store lease claimed
+            # inside) is the proof that the boot whose unsettled journal rows
+            # we are about to fail is actually gone: a contender that starts
+            # against a live gateway's HERMES_HOME never reaches this line
+            # (EADDRINUSE above) or fails the store-ownership check. Every
+            # unsettled prior-boot row becomes a durable `failed` status with
+            # error_code="gateway_restart" + provenance, so the replacement
+            # pod answers status polls honestly instead of 404ing and the
+            # platform's capability-gated auto-resubmit (NOL-397 part 1) can
+            # act on a stable signal. This is what makes restart durability
+            # real on a fleet whose termination grace Autopilot caps at 600s
+            # on-demand / 25s on spot (NOL-410): drain is not load-bearing,
+            # the journal is. Synchronous on purpose — no await between the
+            # bind and here, so no request is served mid-reconciliation.
+            self._run_journal_ready = self._reconcile_prior_boot_runs()
+            if not self._run_journal_ready:
+                logger.warning(
+                    "[%s] restart-run-journal support is INACTIVE for this boot "
+                    "(no durable store or reconciliation unavailable); "
+                    "/v1/capabilities reports run_restart_journal=false so the "
+                    "platform keeps its pre-journal lost-run handling",
+                    self.name,
+                )
+
             self._mark_connected()
             logger.info(
                 "[%s] API server listening on http://%s:%d (model: %s)",
@@ -8088,6 +8721,17 @@ class APIServerAdapter(BasePlatformAdapter):
         if events_task is not None:
             events_task.cancel()
             self._ability_events_task = None
+        # Hand the journal store back before closing it: the next boot (or a
+        # replacement adapter in this process) must be able to prove this one
+        # is gone in order to reconcile (NOL-423).
+        self._run_journal_ready = False
+        try:
+            self._release_run_journal_ownership()
+        except Exception:
+            logger.debug(
+                "Failed to release run-journal ownership for %s",
+                self.name, exc_info=True,
+            )
         if self._response_store is not None:
             try:
                 self._response_store.close()
