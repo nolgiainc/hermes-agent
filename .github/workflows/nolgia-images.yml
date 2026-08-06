@@ -48,7 +48,18 @@ env:
 jobs:
   build-push:
     name: Build & push (${{ matrix.env }})
-    if: github.repository == 'nolgiainc/hermes-agent'
+    # NOL-472: this is OUR workflow (it only runs in the nolgiainc fork) and it
+    # builds and pushes the hermes-agent image to nolgia-web-stg/prd Artifact
+    # Registry with `push: true`. `push` is main-only via the `on:` block, but
+    # `workflow_dispatch` accepts ANY ref, so before this guard a dispatch from
+    # a feature branch published that branch's image into a real environment's
+    # registry. Same defect that put an unmerged branch on 100% of nolgia-api
+    # production traffic on 2026-08-06.
+    #
+    # Contrast docker.yml in this repo, whose publishing jobs already carry
+    # `github.event_name == 'push' && github.ref == 'refs/heads/main' ||
+    # github.event_name == 'release'`. This workflow was the one that did not.
+    if: github.repository == 'nolgiainc/hermes-agent' && github.ref == 'refs/heads/main'
     # stays hosted: needs docker daemon
     runs-on: blacksmith-4vcpu-ubuntu-2404
     strategy:

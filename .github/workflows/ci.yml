@@ -14,6 +14,31 @@ name: CI
 # Do not add ``secrets: inherit`` or GitHub App credentials here. Trusted
 # main-only automation uses protected environments in its own workflows.
 
+# NOL-479: this workflow is DELIBERATELY NOT `workflow_dispatch`-able, and that
+# is a considered decision rather than an oversight — recorded here so the next
+# person to hit an outage does not "fix" it in one line and quietly destroy the
+# merge gate.
+#
+# `all-checks-pass` below is the single required context on main, and its
+# evaluator treats `skipped` as a pass ('✅' for `result in ('success',
+# 'skipped')`; it only fails on `failure`). Six of the jobs it aggregates gate
+# on `needs.detect.outputs.event_name == 'pull_request'`: history-check,
+# commit-attribution, lockfile-diff, supply-chain, review-labels and docker.
+# On a dispatch every one of them skips, `detect` fails open so the remaining
+# lanes run, and the aggregate reports GREEN having never checked commit
+# attribution, unrelated histories, lockfile diffs or supply-chain findings.
+#
+# That is the NOL-479 vacuous-pass trap at the level of the whole gate: it would
+# convert a webhook outage from "PRs cannot merge" into "PRs merge with the
+# PR-only half of CI silently switched off", which is strictly worse. A required
+# check that passes without doing its work is worse than one that cannot run.
+#
+# Making it genuinely dispatchable is real work, not a trigger line: each of the
+# six needs a PR-context fallback (`review-labels` reads PR labels and arguably
+# has no meaningful fallback at all), and `all-checks-pass` needs to stop
+# counting a skip as a pass when the skip was caused by the event type. Until
+# that is done, the outage lever for this repo is the standalone required checks
+# in the sibling repos, not this aggregate.
 on:
   pull_request:
   push:

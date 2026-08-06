@@ -39,15 +39,61 @@ jobs:
     # main commit needs to ship live before the next release tag — e.g.
     # a skills-index PR that doesn't touch website/** paths and so
     # doesn't auto-deploy via the deploy-docs path.
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    #
+    # NOL-472: the dispatch half is now ref-guarded. It fires the Vercel deploy
+    # hook, which ships whatever is on the dispatched ref to the live site, and
+    # `github.event_name == 'workflow_dispatch'` alone accepts ANY ref — the
+    # identical defect that put an unmerged branch on 100% of nolgia-api
+    # production traffic on 2026-08-06.
+    #
+    # The guard is applied per-event rather than as a blanket
+    # `&& github.ref == 'refs/heads/main'`, because on a `release` event
+    # `github.ref` is `refs/tags/<tag>` and a blanket ref check would silently
+    # break every production release cut — turning a safety fix into an outage.
+    # Release publishes are already deliberate, tag-based production cuts made
+    # from merged commits; the unconstrained path was only ever the dispatch.
+    #
+    # The `if` below is necessary but NOT sufficient on its own: `gh workflow run
+    # deploy-site.yml --ref <branch>` runs that ref's copy of this file, so a
+    # dispatch of any branch cut before this commit still evaluates the old
+    # event-only condition and posts the hook. A condition living inside the
+    # ref-controlled workflow can always be replaced by the dispatched ref.
+    #
+    # The durable half of the guard is therefore the `site-publish` environment
+    # below, whose deployment branch/tag rules are repo settings the dispatched
+    # ref cannot rewrite. Same boundary docker.yml's `publish` job uses via
+    # `container-publish`. That rule must allow `main` AND the release tag
+    # pattern — a main-only rule would block release cuts (`github.ref` is
+    # `refs/tags/<tag>` there), which is the blanket-ref-check outage described
+    # above, just moved into settings.
+    if: >-
+      github.event_name == 'release'
+      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    environment: site-publish
     timeout-minutes: 30
     steps:
       - name: Trigger Vercel Deploy
         run: curl -fsS --retry 3 --retry-delay 10 -X POST "${{ secrets.VERCEL_DEPLOY_HOOK }}"
 
   deploy-docs:
-    if: github.repository == 'NousResearch/hermes-agent'
+    # NOL-472: `actions/deploy-pages` below replaces the production Pages site
+    # with whatever ref this job checked out, so the same dispatch hole applied
+    # here — the repository-only condition accepted any manually dispatched
+    # branch and published it live.
+    #
+    # Guarded per-event for the same reason as deploy-vercel: `push` is already
+    # main-only via the `on:` block and `release` runs on `refs/tags/<tag>`, so
+    # only the dispatch path gets the ref constraint. A blanket
+    # `&& github.ref == 'refs/heads/main'` would silently stop publishing docs
+    # on release.
+    #
+    # The settings-side backstop for this job is the `github-pages` environment's
+    # deployment branch/tag rules (see the note on deploy-vercel: an `if` inside
+    # a ref-controlled workflow is replaceable by the dispatched ref).
+    if: >-
+      github.repository == 'NousResearch/hermes-agent'
+      && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     environment:
