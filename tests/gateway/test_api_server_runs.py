@@ -1283,6 +1283,22 @@ class TestRunJournal:
     termination grace at 600s on-demand / 25s on spot (NOL-410), so this
     journal — not graceful drain — is what makes restarts honest."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_journal_store_ownership(self, tmp_path, monkeypatch):
+        """Keep the store-ownership lease inside the test's temp dir.
+
+        Reconciliation is gated on owning the journal's store, which is
+        proven with a machine-local scoped lock; point it at tmp_path so
+        tests never touch the developer's real lock dir, and clear the
+        in-process owner registry between tests.
+        """
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "gateway-locks"))
+        from gateway.platforms import api_server as api_server_mod
+
+        api_server_mod._JOURNAL_STORE_OWNERS.clear()
+        yield
+        api_server_mod._JOURNAL_STORE_OWNERS.clear()
+
     @pytest.mark.asyncio
     async def test_submission_journals_identity_not_payload(self):
         """The journal row lands before the run executes and carries hashes,
@@ -1383,8 +1399,12 @@ class TestRunJournal:
                 await asyncio.sleep(0.05)
 
                 # A fresh adapter simulates the replacement pod booting
-                # against the same durable store. Its __init__ reconciles.
+                # against the same durable store. Reconciliation happens
+                # once it owns the listener + the journal store (connect()),
+                # never at construction — see
+                # test_construction_alone_never_reconciles_live_runs.
                 reborn = _make_adapter()
+                assert reborn._reconcile_prior_boot_runs() is True
                 reborn_app = _create_runs_app(reborn)
                 async with TestClient(TestServer(reborn_app)) as reborn_cli:
                     status_resp = await reborn_cli.get(f"/v1/runs/{run_id}")
@@ -1403,6 +1423,7 @@ class TestRunJournal:
                 # The journal row settled, so a THIRD boot re-marks nothing.
                 assert first._response_store.get_journal_row(run_id) is not None
                 third = _make_adapter()
+                assert third._reconcile_prior_boot_runs() is True
                 assert (
                     third._response_store.get_run_status(run_id)["error_code"]
                     == "gateway_restart"
@@ -1433,6 +1454,7 @@ class TestRunJournal:
                 interrupted.set()
 
         reborn = _make_adapter()
+        assert reborn._reconcile_prior_boot_runs() is True
         reborn_app = _create_runs_app(reborn)
         async with TestClient(TestServer(reborn_app)) as cli:
             status_resp = await cli.get(f"/v1/runs/{run_id}")
@@ -1539,11 +1561,11 @@ class TestRunJournal:
         store.journal_run_submitted(
             rid, adapter._boot_uuid, {"status": "queued", "created_at": time.time()}
         )
-        adapter._append_run_output_tail(rid, "x" * 3000)
+        adapter._append_run_output_tail(rid, "x" * 12000)
         adapter._append_run_output_tail(rid, " the latest progress")
         assert (
             len(adapter._run_output_tails[rid])
-            <= adapter._RUN_JOURNAL_OUTPUT_TAIL_CHARS
+            <= adapter._RUN_JOURNAL_OUTPUT_RAW_CHARS
         )
         adapter._set_run_status(rid, "running")  # transition flushes the tail
         tail = store.get_journal_row(rid)["data"]["output_tail"]
@@ -1596,15 +1618,238 @@ class TestRunJournal:
         )
         assert remaining_settled == 2
 
+    def test_unsettled_rows_survive_age_and_capacity_pruning(self, adapter):
+        """A live run can go quiet longer than retention (an approval waiting
+        on a human, a long external operation). Its unsettled row is the only
+        record the next boot has of it, so neither age nor capacity may
+        delete it — otherwise the gateway 404s a run it advertises as
+        journaled."""
+        store = adapter._response_store
+        store.MAX_STORED_RUN_STATUSES = 2
+        old = time.time() - store.RUN_STATUS_RETENTION_SECONDS - 3600
+        store.journal_run_submitted(
+            "run_quiet", "boot-a", {"status": "waiting_for_approval", "created_at": old}
+        )
+        with store._run_status_lock:
+            store._conn.execute(
+                "UPDATE run_journal SET updated_at = ? WHERE run_id = ?",
+                (old, "run_quiet"),
+            )
+            store._conn.commit()
+        store.journal_run_submitted(
+            "run_settled_old", "boot-a", {"status": "queued", "created_at": old}
+        )
+        store.settle_run_status(
+            "run_settled_old", {"run_id": "run_settled_old", "status": "completed"}
+        )
+        with store._run_status_lock:
+            store._conn.execute(
+                "UPDATE run_journal SET updated_at = ? WHERE run_id = ?",
+                (old, "run_settled_old"),
+            )
+            store._conn.commit()
+
+        # Aged out: only the settled row.
+        store.journal_run_submitted(
+            "run_new_1", "boot-a", {"status": "queued", "created_at": time.time()}
+        )
+        assert store.get_journal_row("run_settled_old") is None
+        assert store.get_journal_row("run_quiet") is not None
+
+        # Capacity is a bound on settled history: with nothing settled left
+        # to evict it is exceeded rather than erasing live runs.
+        for i in range(3):
+            store.journal_run_submitted(
+                f"run_new_{i + 2}",
+                "boot-a",
+                {"status": "running", "created_at": time.time()},
+            )
+        assert store.get_journal_row("run_quiet") is not None
+        assert store.reconcile_prior_boot_runs("new-boot")
+
+    def test_construction_alone_never_reconciles_live_runs(self, adapter):
+        """A contender gateway constructs an adapter (and may then lose the
+        port with EADDRINUSE) while the original keeps serving. Construction
+        must not mark the live gateway's in-flight runs gateway_restart —
+        that error is auto-resubmit-eligible, so it would duplicate tool side
+        effects and credit spend on a run that is still executing."""
+        store = adapter._response_store
+        store.journal_run_submitted(
+            "run_live_elsewhere",
+            "live-boot",
+            {"status": "running", "created_at": time.time()},
+        )
+        contender = _make_adapter()
+        assert contender._response_store.get_run_status("run_live_elsewhere") is None
+        assert store.get_journal_row("run_live_elsewhere")["settled"] is False
+        assert contender._run_journal_ready is False
+
+    def test_reconciliation_skipped_while_another_adapter_owns_the_store(self):
+        """Two adapters, one shared response_store.db (multiplexed startup,
+        reconnect churn): only the owner reconciles. The scoped lock is
+        re-entrant per PID, so the in-process claim is what separates them."""
+        first = _make_adapter()
+        first._response_store.journal_run_submitted(
+            "run_owned", "dead-boot", {"status": "running", "created_at": time.time()}
+        )
+        assert first._claim_run_journal_ownership() is True
+        first._running = True  # connected: it is serving this store
+
+        second = _make_adapter()
+        assert second._reconcile_prior_boot_runs() is False
+        assert second._run_journal_lock_identity is None
+        assert first._response_store.get_journal_row("run_owned")["settled"] is False
+        assert first._response_store.get_run_status("run_owned") is None
+
+        # Ownership passes on once the owner disconnects.
+        first._running = False
+        first._release_run_journal_ownership()
+        assert second._reconcile_prior_boot_runs() is True
+        assert (
+            second._response_store.get_run_status("run_owned")["error_code"]
+            == "gateway_restart"
+        )
+
+    def test_memory_only_store_never_claims_the_journal_contract(self, adapter):
+        """response_store.db can fail to open, and ResponseStore then falls
+        back to :memory: — where every journal row dies with the process.
+        The capability must report that honestly instead of telling the
+        platform to stop treating a post-restart 404 as the lost-run
+        signal."""
+        from gateway.platforms.api_server import ResponseStore
+
+        adapter._response_store = ResponseStore(db_path=":memory:")
+        assert adapter._response_store.db_path is None
+        assert adapter._reconcile_prior_boot_runs() is False
+        adapter._run_journal_ready = adapter._reconcile_prior_boot_runs()
+        assert adapter._run_journal_ready is False
+
+    def test_failed_reconciliation_does_not_claim_the_journal_contract(self, adapter):
+        """Reconciliation raising is logged, not fatal — but the boot has not
+        reconciled, so it must not advertise the contract either."""
+        with patch.object(
+            adapter._response_store,
+            "reconcile_prior_boot_runs",
+            side_effect=RuntimeError("disk gone"),
+        ):
+            assert adapter._reconcile_prior_boot_runs() is False
+
     @pytest.mark.asyncio
-    async def test_capabilities_advertises_run_restart_journal(self, adapter):
+    async def test_capabilities_reports_effective_journal_state(self, adapter):
         """The platform keys "gateway_restart failures are auto-resubmit-
         eligible, and 404-after-restart is no longer the signal" on this
-        flag during the fleet roll."""
+        flag during the fleet roll, so it reports what this boot can
+        actually deliver — false until reconciliation ran against a durable
+        store."""
         app = _create_runs_app(adapter)
         app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.get("/v1/capabilities")
-            assert resp.status == 200
+            data = await resp.json()
+            assert data["features"]["run_restart_journal"] is False
+
+            adapter._run_journal_ready = adapter._reconcile_prior_boot_runs()
+            assert adapter._run_journal_ready is True
+            resp = await cli.get("/v1/capabilities")
             data = await resp.json()
             assert data["features"]["run_restart_journal"] is True
+
+    def test_output_tail_redacts_credentials_straddling_the_boundary(self, adapter):
+        """The journal's no-credentials contract must hold for a secret whose
+        recognizable prefix sits ahead of the retained boundary: bounding raw
+        text first would strip "-----BEGIN … KEY-----" and persist the
+        remaining key bytes verbatim."""
+        store = adapter._response_store
+        rid = "run_secret_tail"
+        store.journal_run_submitted(
+            rid, adapter._boot_uuid, {"status": "queued", "created_at": time.time()}
+        )
+        key_body = "A" * 1800
+        private_key = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            + key_body
+            + "\n-----END RSA PRIVATE KEY-----"
+        )
+        adapter._append_run_output_tail(rid, "streaming along " * 500)
+        adapter._append_run_output_tail(rid, private_key)
+        assert key_body not in adapter._run_output_tails[rid]
+
+        adapter._set_run_status(rid, "running")
+        tail = store.get_journal_row(rid)["data"]["output_tail"]
+        assert key_body not in tail
+        assert "PRIVATE KEY" in tail  # redacted marker, not the key material
+        assert len(tail) <= adapter._RUN_JOURNAL_OUTPUT_TAIL_CHARS
+
+    @pytest.mark.asyncio
+    async def test_input_tail_redacts_credentials_straddling_the_boundary(self):
+        """Same bug class on the sibling submission path: the input tail is
+        redacted before it is bounded."""
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+        key_body = "B" * 1800
+        payload = (
+            "deploy this key: -----BEGIN RSA PRIVATE KEY-----\n"
+            + key_body
+            + "\n-----END RSA PRIVATE KEY-----"
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, interrupted = _make_slow_agent()
+                mock_create.return_value = mock_agent
+                resp = await cli.post("/v1/runs", json={"input": payload})
+                run_id = (await resp.json())["run_id"]
+                agent_ready.wait(timeout=3.0)
+
+                data = adapter._response_store.get_journal_row(run_id)["data"]
+                assert key_body not in data["input_tail"]
+                assert key_body not in json.dumps(data)
+                assert len(data["input_tail"]) <= 200
+
+                interrupted.set()
+                await _wait_terminal(cli, run_id)
+
+    @pytest.mark.asyncio
+    async def test_streaming_deltas_heartbeat_the_output_tail(self):
+        """A text-only response emits no status event after the `running`
+        transition, so the deltas themselves must drive the throttled
+        heartbeat — otherwise a preemption mid-stream leaves the journal with
+        none of the partial output this feature promises survives."""
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+        streaming = threading.Event()
+        release = threading.Event()
+
+        def _streaming_agent(**kwargs):
+            delta_cb = kwargs.get("stream_delta_callback")
+            mock_agent = MagicMock()
+
+            def _run(user_message=None, conversation_history=None, task_id=None):
+                delta_cb("partial progress ")
+                streaming.set()
+                release.wait(timeout=10)
+                delta_cb("and more")
+                return {"final_response": "partial progress and more"}
+
+            mock_agent.run_conversation.side_effect = _run
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_streaming_agent):
+                resp = await cli.post("/v1/runs", json={"input": "write me an essay"})
+                run_id = (await resp.json())["run_id"]
+                assert streaming.wait(timeout=3.0)
+                # The `running` transition just wrote, so the first delta is
+                # inside the throttle window. Age it the way a long stream
+                # does (no sleeping) and let the next delta flush.
+                adapter._run_journal_heartbeat_at[run_id] -= (
+                    adapter._RUN_JOURNAL_HEARTBEAT_SECONDS + 1
+                )
+                release.set()
+                status = await _wait_terminal(cli, run_id)
+                assert status["status"] == "completed"
+
+        row = adapter._response_store.get_journal_row(run_id)
+        assert "partial progress" in row["data"]["output_tail"]
