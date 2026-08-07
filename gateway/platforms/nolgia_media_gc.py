@@ -46,7 +46,7 @@ Config (env, deployment-owned):
 - ``NOLGIA_MEDIA_GC_ON_UPLOAD=0``  — disable only the immediate post-upload
   deletion (ledger recording continues; the sweeper still runs).
 - ``NOLGIA_MEDIA_GC_MIN_AGE_HOURS``       — sweeper age threshold (default 6).
-- ``NOLGIA_MEDIA_GC_INTERVAL_SECONDS``    — sweep period (default 3600).
+- ``NOLGIA_MEDIA_GC_INTERVAL_SECONDS``    — sweep period (default 86400, i.e. daily).
 
 Stdlib-only and fail-soft everywhere (mirrors ``nolgia_assets``): GC plumbing
 must never take an upload, a turn, or the gateway down.
@@ -81,7 +81,7 @@ _LEDGER_COMPACT_LINES = 20000
 _LEDGER_KEEP_LINES = 10000
 
 _DEFAULT_MIN_AGE_HOURS = 6.0
-_DEFAULT_INTERVAL_SECONDS = 3600.0
+_DEFAULT_INTERVAL_SECONDS = 86400.0
 # Give the pod time to settle (skills sync, ability installs) before the
 # startup sweep touches the network.
 STARTUP_SWEEP_DELAY_SECONDS = 120.0
