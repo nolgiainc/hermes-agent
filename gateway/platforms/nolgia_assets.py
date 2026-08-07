@@ -283,6 +283,20 @@ def _resolve_tag(raw_path: str, budget: _MessageBudget) -> str:
     # to an existing regular file, not under the credential/system denylist.
     safe_path = validate_media_delivery_path(raw_path)
     if not safe_path:
+        # A path media GC deleted after a CONFIRMED library upload still has
+        # a live asset holding those exact bytes — resolve to it instead of
+        # degrading to a dead filename. (Deliberately not token-scoped like
+        # _asset_cache: the local bytes are gone, so re-uploading under the
+        # current turn's credential is impossible; the original attribution
+        # is the only one that exists.)
+        try:
+            from gateway.platforms import nolgia_media_gc
+
+            gc_asset = nolgia_media_gc.deleted_asset_reference(normalized)
+            if gc_asset:
+                return f"asset:{gc_asset}"
+        except Exception:
+            pass
         return fallback
     resolved = Path(safe_path)
     fallback = resolved.name or fallback
@@ -325,6 +339,18 @@ def _resolve_tag(raw_path: str, budget: _MessageBudget) -> str:
     with _asset_cache_lock:
         _asset_cache[cache_key] = asset_id
     logger.info("[nolgia_assets] uploaded %s as asset:%s", resolved.name, asset_id)
+    # The complete call above verified the stored object server-side, so the
+    # library now provably holds these exact bytes — hand the local copy to
+    # media GC (records the confirmation; deletes the redundant local file
+    # unless opted out). Fail-soft: GC must never break egress.
+    try:
+        from gateway.platforms import nolgia_media_gc
+
+        nolgia_media_gc.on_confirmed_upload(
+            resolved, stat.st_size, stat.st_mtime_ns, asset_id
+        )
+    except Exception:
+        logger.debug("[nolgia_assets] media GC hook failed", exc_info=True)
     return f"asset:{asset_id}"
 
 
