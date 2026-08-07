@@ -1936,6 +1936,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # in connect() only when the pod holds platform credentials.
         self._ability_freshness: Optional[Any] = None
         self._ability_events_task: Optional["asyncio.Task"] = None
+        # Confirmed-in-library media GC sweeper (NOL-516). Started in
+        # connect() only when the pod holds platform credentials.
+        self._media_gc_task: Optional["asyncio.Task"] = None
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -1989,6 +1992,39 @@ class APIServerAdapter(BasePlatformAdapter):
                 task.add_done_callback(self._background_tasks.discard)
         except Exception:
             logger.debug("ability freshness startup failed", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Media GC (NOL-516)
+    # ------------------------------------------------------------------
+
+    def _start_media_gc(self) -> None:
+        """Launch the confirmed-in-library media sweeper (startup + periodic).
+
+        The safety net behind the post-upload deletion hook: media the agent
+        wrote locally but never delivered through a MEDIA: tag (``nolgia gen
+        --out`` downloads, intermediate renders) is reclaimed only after the
+        platform library is proven to hold the same bytes. Idempotent across
+        reconnects; lazy import and soft failures — GC must never take the
+        API server down.
+        """
+        try:
+            from gateway.platforms.nolgia_media_gc import media_gc_enabled, run_sweeper
+
+            if not media_gc_enabled():
+                return
+            existing = getattr(self, "_media_gc_task", None)
+            if existing is not None and not existing.done():
+                return
+            task = asyncio.create_task(run_sweeper())
+            self._media_gc_task = task
+            try:
+                self._background_tasks.add(task)
+            except TypeError:
+                pass
+            if hasattr(task, "add_done_callback"):
+                task.add_done_callback(self._background_tasks.discard)
+        except Exception:
+            logger.debug("media GC startup failed", exc_info=True)
 
     async def _ensure_abilities_fresh(self) -> None:
         """Turn-boundary check: the run about to execute must see the latest
@@ -8578,6 +8614,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # turn-boundary installed-vs-latest check wired into the run
             # entrypoints. No-op unless the pod holds platform credentials.
             self._start_ability_freshness()
+
+            # Confirmed-in-library media GC (NOL-516): reclaim local copies of
+            # media the platform library provably already holds. No-op unless
+            # the pod holds platform credentials.
+            self._start_media_gc()
 
             # Loud warning when a network-accessible API server runs against an
             # unsandboxed local terminal backend. The API server can drive the
