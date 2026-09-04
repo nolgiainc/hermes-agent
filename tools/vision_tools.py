@@ -37,8 +37,8 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Awaitable, Dict, Optional
-from urllib.parse import urlparse
+from typing import Any, Awaitable, Dict, NamedTuple, Optional
+from urllib.parse import parse_qs, urlparse
 import httpx
 
 # ``agent.auxiliary_client`` pulls credential_pool → hermes_cli.auth → httpx
@@ -1873,13 +1873,36 @@ _VIDEO_SIZE_WARN_BYTES = 20 * 1024 * 1024
 _GEMINI_INLINE_MAX_BASE64_BYTES = 19 * 1024 * 1024
 
 
-def _gemini_inline_source_cap_mb() -> float:
-    """Source-video MB that fit under ``_GEMINI_INLINE_MAX_BASE64_BYTES``.
+def _gemini_inline_source_cap_bytes() -> int:
+    """Source-video bytes that fit under ``_GEMINI_INLINE_MAX_BASE64_BYTES``.
 
-    Read at call time (not import time) so the figure in user-facing errors
-    tracks the cap wherever it is tuned or patched.
+    Read at call time (not import time) so the figure tracks the cap wherever
+    it is tuned or patched. It is also the download cap for every non-YouTube
+    URL sent to Gemini, which the tool inlines exactly like a local file.
     """
-    return (_GEMINI_INLINE_MAX_BASE64_BYTES // 4 * 3) / (1024 * 1024)
+    return _GEMINI_INLINE_MAX_BASE64_BYTES // 4 * 3
+
+
+def _gemini_inline_source_cap_mb() -> float:
+    """``_gemini_inline_source_cap_bytes`` in MB, for user-facing errors."""
+    return _gemini_inline_source_cap_bytes() / (1024 * 1024)
+
+
+def _gemini_inline_too_large_error(source_bytes: int) -> ValueError:
+    """The one error for a clip Gemini cannot take inline (local or downloaded).
+
+    Google fetches only YouTube URLs itself; every other source travels
+    inline in the request body, so the remedy is the same either way. The
+    Files API is not wired, so it is deliberately not suggested.
+    """
+    return ValueError(
+        f"Video too large to inline for Gemini: {source_bytes / (1024 * 1024):.1f} MB "
+        f"of source video (base64 limit "
+        f"{_GEMINI_INLINE_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB). "
+        f"Gemini accepts roughly {_gemini_inline_source_cap_mb():.0f} MB of source "
+        "video after base64 expansion; trim the clip or pass a YouTube URL "
+        "(the only URLs Google fetches itself) and retry."
+    )
 
 # Gemini samples ~2.8 fps when ``video_metadata.fps`` is omitted (measured
 # through the proxy: 91 video-tokens/s). ``fps: 1`` measured 32 tokens/s — a
@@ -1950,8 +1973,9 @@ def _video_part_for_model(
 
     Gemini (LiteLLM's ``gemini/`` and ``vertex_ai/`` routes) only attaches
     media that arrives as an OpenAI ``file`` part: ``file_data`` is the video
-    (an https URL Google fetches server-side, or a ``data:`` URL that is
-    inlined), ``format`` its MIME type, ``detail`` maps to the per-part
+    (a YouTube URL Google fetches server-side, or a ``data:`` URL that is
+    inlined -- see ``_is_youtube_url`` for why nothing else is passed
+    through), ``format`` its MIME type, ``detail`` maps to the per-part
     ``media_resolution`` on Gemini 3+, and ``video_metadata.fps`` sets the
     frame-sampling rate. A ``video_url`` part is *silently dropped* by that
     transformation — the request succeeds with no video attached and the
@@ -1998,8 +2022,57 @@ def _video_mime_from_url(video_url: str) -> Optional[str]:
     return _VIDEO_MIME_TYPES.get(Path(path).suffix.lower())
 
 
+_YOUTUBE_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com"})
+
+
+def _is_youtube_url(url: Any) -> bool:
+    """True for a YouTube video URL that Gemini can fetch itself.
+
+    Google resolves ``file_data`` URLs server-side ONLY for YouTube:
+    ``youtube.com/watch?v=<id>``, ``youtube.com/shorts/<id>`` (with or
+    without ``www.``/``m.``) and ``youtu.be/<id>``. Any other https URL --
+    a signed Google Cloud Storage link included -- comes back from the
+    Gemini API as ``403 PERMISSION_DENIED "The caller does not have
+    permission"`` after a long stall, so everything else is downloaded and
+    inlined by ``video_analyze_tool`` instead.
+    """
+    if not isinstance(url, str):
+        return False
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    path = parsed.path or ""
+    if host == "youtu.be":
+        return bool(path.strip("/"))
+    if host not in _YOUTUBE_HOSTS:
+        return False
+    if path == "/watch":
+        return bool(parse_qs(parsed.query).get("v", [""])[0])
+    return path.startswith("/shorts/") and bool(path[len("/shorts/"):].strip("/"))
+
+
+def _resolve_downloaded_video_mime(video_url: str, content_type: Optional[str]) -> str:
+    """MIME type for a downloaded clip: Content-Type, then URL extension, then mp4.
+
+    The server's ``video/*`` Content-Type is authoritative when present. The
+    URL path extension is the next best evidence (signed URLs keep it, e.g.
+    ``.../clip.webm?X-Goog-Signature=...``). ``video/mp4`` is the last
+    resort: Gemini requires *some* MIME type on the part and treats mp4 as
+    the generic container, and the temp file's own ``.mp4`` suffix says
+    nothing about what was fetched.
+    """
+    return content_type or _video_mime_from_url(video_url) or "video/mp4"
+
+
 async def _probe_remote_video_mime(video_url: str, timeout: float = 15.0) -> str:
-    """Best-effort MIME type for a remote video that Google will fetch itself.
+    """Best-effort MIME type for a YouTube URL that Google will fetch itself.
+
+    Only YouTube URLs are passed through (``_is_youtube_url``); every other
+    URL is downloaded and its MIME resolved from the response instead.
 
     A HEAD request validates every redirect/final target against both SSRF and
     website policies. Its ``video/*`` Content-Type is used when available,
@@ -2048,8 +2121,37 @@ async def _probe_remote_video_mime(video_url: str, timeout: float = 15.0) -> str
     return mime or "video/mp4"
 
 
-async def _download_video(video_url: str, destination: Path, max_retries: int = 3) -> Path:
-    """Download video from URL with SSRF protection and retry."""
+class _VideoTooLargeError(ValueError):
+    """A clip over the download cap; carries the size so callers can phrase the error."""
+
+    def __init__(self, size: int, limit: int):
+        super().__init__(f"Video too large ({size} bytes, max {limit})")
+        self.size = size
+        self.limit = limit
+
+
+class _DownloadedVideo(NamedTuple):
+    """Where ``_download_video`` put the clip and what the server said it was."""
+
+    path: Path
+    content_type: Optional[str]  # the response's ``video/*`` type, else None
+
+
+async def _download_video(
+    video_url: str,
+    destination: Path,
+    max_retries: int = 3,
+    max_bytes: int = _MAX_VIDEO_BASE64_BYTES,
+) -> _DownloadedVideo:
+    """Download video from URL with SSRF protection and retry.
+
+    ``max_bytes`` bounds the clip: the ``Content-Length`` header is checked
+    first and the body length again after the fetch; either overrun raises
+    ``_VideoTooLargeError``. Gemini callers pass
+    ``_gemini_inline_source_cap_bytes()`` so a clip that could never be
+    inlined is refused at the header stage. Deterministic failures (too
+    large, policy block, SSRF redirect, 4xx other than 429) are not retried.
+    """
     import asyncio
 
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -2080,10 +2182,8 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
                 response.raise_for_status()
 
                 cl = response.headers.get("content-length")
-                if cl and int(cl) > _MAX_VIDEO_BASE64_BYTES:
-                    raise ValueError(
-                        f"Video too large ({int(cl)} bytes, max {_MAX_VIDEO_BASE64_BYTES})"
-                    )
+                if cl and int(cl) > max_bytes:
+                    raise _VideoTooLargeError(int(cl), max_bytes)
 
                 final_url = str(response.url)
                 blocked = check_website_access(final_url)
@@ -2091,30 +2191,34 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
                     raise PermissionError(blocked["message"])
 
                 body = response.content
-                if len(body) > _MAX_VIDEO_BASE64_BYTES:
-                    raise ValueError(
-                        f"Video too large ({len(body)} bytes, max {_MAX_VIDEO_BASE64_BYTES})"
-                    )
+                if len(body) > max_bytes:
+                    raise _VideoTooLargeError(len(body), max_bytes)
                 destination.write_bytes(body)
 
-            return destination
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries - 1:
-                wait_time = 2 ** (attempt + 1)
-                logger.warning("Video download failed (attempt %s/%s): %s", attempt + 1, max_retries, str(e)[:50])
-                await asyncio.sleep(wait_time)
-            else:
-                logger.error(
-                    "Video download failed after %s attempts: %s",
-                    max_retries, str(e)[:100], exc_info=True,
+                content_type = (
+                    (response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
                 )
 
-    if last_error is None:
-        raise RuntimeError(
-            f"_download_video exited retry loop without attempting (max_retries={max_retries})"
-        )
-    raise last_error
+            return _DownloadedVideo(
+                destination, content_type if content_type.startswith("video/") else None
+            )
+        except Exception as e:
+            last_error = e
+            if not _is_retryable_download_error(e) or attempt >= max_retries - 1:
+                logger.error(
+                    "Video download failed after %s attempt(s): %s",
+                    attempt + 1, str(e)[:100], exc_info=True,
+                )
+                raise
+            wait_time = 2 ** (attempt + 1)
+            logger.warning("Video download failed (attempt %s/%s): %s", attempt + 1, max_retries, str(e)[:50])
+            await asyncio.sleep(wait_time)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(
+        f"_download_video exited retry loop without attempting (max_retries={max_retries})"
+    )
 
 
 async def video_analyze_tool(
@@ -2126,6 +2230,12 @@ async def video_analyze_tool(
     provider: Optional[str] = None,
 ) -> str:
     """Analyze a video via multimodal LLM. Returns JSON {success, analysis}.
+
+    Gemini models get the clip as a ``file`` part. A YouTube URL is passed
+    through for Google to fetch; every other http(s) URL and every local
+    file is inlined as a base64 data URL, capped at
+    ``_gemini_inline_source_cap_bytes()`` (~14 MB of source video). Other
+    models keep the download + ``video_url`` data-URL path (~50 MB cap).
 
     ``fps`` / ``detail`` only affect Gemini models (see
     ``_video_part_for_model``): ``fps`` is sent as ``video_metadata.fps``
@@ -2184,20 +2294,39 @@ async def video_analyze_tool(
             blocked = check_website_access(video_url)
             if blocked:
                 raise PermissionError(blocked["message"])
-            if gemini and video_url.lower().startswith("https://"):
-                # Gemini fetches an https ``file_data`` URL server-side, so
+            if gemini and _is_youtube_url(video_url):
+                # Google fetches YouTube ``file_data`` URLs server-side, so
                 # there is nothing to download, base64-encode or size-cap
                 # here. The SSRF and website-policy checks above still gate
                 # the URL exactly as they gate a download.
                 detected_mime = await _probe_remote_video_mime(video_url)
                 video_file_data = video_url
                 debug_call_data["video_passthrough"] = True
-                logger.info("Passing video URL through for Gemini to fetch (%s)", detected_mime)
+                logger.info("Passing YouTube URL through for Gemini to fetch (%s)", detected_mime)
             else:
+                # Every other URL is downloaded and inlined. Google does NOT
+                # fetch arbitrary https URLs: a signed GCS link in
+                # ``file_data`` returns 403 PERMISSION_DENIED after ~50 s,
+                # while the same clip inlined is answered in ~5 s. For
+                # Gemini the download is capped at what can be inlined so an
+                # oversized clip is refused at the Content-Length stage with
+                # the same error a local file gets.
                 temp_dir = get_hermes_dir("cache/video", "temp_video_files")
                 temp_video_path = temp_dir / f"temp_video_{uuid.uuid4()}.mp4"
-                await _download_video(video_url, temp_video_path)
                 should_cleanup = True
+                try:
+                    downloaded = await _download_video(
+                        video_url,
+                        temp_video_path,
+                        max_bytes=(
+                            _gemini_inline_source_cap_bytes() if gemini else _MAX_VIDEO_BASE64_BYTES
+                        ),
+                    )
+                except _VideoTooLargeError as e:
+                    if gemini:
+                        raise _gemini_inline_too_large_error(e.size) from e
+                    raise
+                detected_mime = _resolve_downloaded_video_mime(video_url, downloaded.content_type)
         else:
             raise ValueError(
                 "Invalid video source. Provide an HTTP/HTTPS URL or a valid local file path."
@@ -2208,7 +2337,8 @@ async def video_analyze_tool(
             video_size_mb = video_size_bytes / (1024 * 1024)
             logger.info("Video ready (%.1f MB)", video_size_mb)
 
-            detected_mime = _detect_video_mime_type(temp_video_path)
+            if not detected_mime:  # local file: the extension is all we have
+                detected_mime = _detect_video_mime_type(temp_video_path)
             if not detected_mime:
                 raise ValueError(
                     f"Unsupported video format: '{temp_video_path.suffix}'. "
@@ -2222,14 +2352,7 @@ async def video_analyze_tool(
             data_size_mb = len(video_data_url) / (1024 * 1024)
 
             if gemini and len(video_data_url) > _GEMINI_INLINE_MAX_BASE64_BYTES:
-                raise ValueError(
-                    f"Video too large to inline for Gemini: base64 payload is "
-                    f"{data_size_mb:.1f} MB (limit "
-                    f"{_GEMINI_INLINE_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB). "
-                    f"Gemini accepts roughly {_gemini_inline_source_cap_mb():.0f} MB "
-                    "of source video after base64 expansion; pass an https URL to let "
-                    "Google fetch it, or compress/trim the video and retry."
-                )
+                raise _gemini_inline_too_large_error(video_size_bytes)
             if len(video_data_url) > _MAX_VIDEO_BASE64_BYTES:
                 raise ValueError(
                     f"Video too large for API: base64 payload is {data_size_mb:.1f} MB "
@@ -2347,7 +2470,8 @@ async def video_analyze_tool(
             analysis = (
                 "The video is too large for the API. Try compressing or trimming "
                 f"the video (max ~50 MB; Gemini accepts roughly {_gemini_inline_source_cap_mb():.0f} MB "
-                f"of local source video after base64 expansion, or an https URL). Error: {e}"
+                "of source video after base64 expansion -- local files and non-YouTube "
+                f"URLs are both inlined; only YouTube URLs are fetched by Google). Error: {e}"
             )
         else:
             analysis = (
@@ -2385,14 +2509,16 @@ VIDEO_ANALYZE_SCHEMA = {
         "Sends the video to a video-capable model (e.g. Gemini) for understanding. "
         "Use this for video files — for images, use vision_analyze instead. "
         "Supports mp4, webm, mov, avi, mkv, mpeg formats. "
-        "Note: large videos (>20 MB) may be slow; max ~50 MB."
+        "Note: large videos (>20 MB) may be slow; max ~50 MB. With Gemini models "
+        "only YouTube URLs are fetched by Google; any other URL or local file is "
+        "inlined and must be under ~14 MB."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "video_url": {
                 "type": "string",
-                "description": "Video URL (http/https) or local file path to analyze.",
+                "description": "Video URL (http/https, including YouTube links) or local file path to analyze.",
             },
             "question": {
                 "type": "string",

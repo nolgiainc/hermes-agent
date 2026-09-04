@@ -620,8 +620,9 @@ prompt_caching:
 #   # Video analysis: the video_analyze tool.  Model falls back to
 #   # auxiliary.vision.model when empty (AUXILIARY_VIDEO_MODEL is the legacy
 #   # env override).  Gemini is the only route that attaches the clip through
-#   # an OpenAI-compatible proxy: Gemini models get a `file` part (https URLs
-#   # are fetched by Google; local source files are limited to roughly 14 MB
+#   # an OpenAI-compatible proxy: Gemini models get a `file` part (YouTube
+#   # URLs are fetched by Google; every other URL is downloaded by the tool
+#   # and inlined like a local file, up to roughly 14 MB of source video
 #   # after base64 expansion), every other model keeps the `video_url` part
 #   # (data URL, up to ~50 MB).
 #   video:
