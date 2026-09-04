@@ -1871,7 +1871,15 @@ _VIDEO_SIZE_WARN_BYTES = 20 * 1024 * 1024
 # headroom for the prompt and JSON framing, which permits roughly 14 MB of
 # source video after base64's 4/3 expansion.
 _GEMINI_INLINE_MAX_BASE64_BYTES = 19 * 1024 * 1024
-_GEMINI_INLINE_MAX_SOURCE_BYTES = (_GEMINI_INLINE_MAX_BASE64_BYTES // 4) * 3
+
+
+def _gemini_inline_source_cap_mb() -> float:
+    """Source-video MB that fit under ``_GEMINI_INLINE_MAX_BASE64_BYTES``.
+
+    Read at call time (not import time) so the figure in user-facing errors
+    tracks the cap wherever it is tuned or patched.
+    """
+    return (_GEMINI_INLINE_MAX_BASE64_BYTES // 4 * 3) / (1024 * 1024)
 
 # Gemini samples ~2.8 fps when ``video_metadata.fps`` is omitted (measured
 # through the proxy: 91 video-tokens/s). ``fps: 1`` measured 32 tokens/s — a
@@ -2218,7 +2226,7 @@ async def video_analyze_tool(
                     f"Video too large to inline for Gemini: base64 payload is "
                     f"{data_size_mb:.1f} MB (limit "
                     f"{_GEMINI_INLINE_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB). "
-                    f"Gemini accepts roughly {_GEMINI_INLINE_MAX_SOURCE_BYTES / (1024 * 1024):.0f} MB "
+                    f"Gemini accepts roughly {_gemini_inline_source_cap_mb():.0f} MB "
                     "of source video after base64 expansion; pass an https URL to let "
                     "Google fetch it, or compress/trim the video and retry."
                 )
@@ -2338,8 +2346,8 @@ async def video_analyze_tool(
         )):
             analysis = (
                 "The video is too large for the API. Try compressing or trimming "
-                "the video (max ~50 MB; Gemini accepts roughly 14 MB of local source "
-                f"video after base64 expansion, or an https URL). Error: {e}"
+                f"the video (max ~50 MB; Gemini accepts roughly {_gemini_inline_source_cap_mb():.0f} MB "
+                f"of local source video after base64 expansion, or an https URL). Error: {e}"
             )
         else:
             analysis = (
