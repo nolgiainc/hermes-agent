@@ -259,3 +259,117 @@ def test_stream_event_translation_emits_tool_call_delta_with_stable_index():
 
 
 
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("gemini-3.8-flash", True),
+        ("google/gemini-3.8-flash", True),
+        ("models/gemini-3.8-flash", True),
+        ("gemini-3.8-flash-lite", True),
+        ("gemini-3.9-flash", True),
+        ("gemini-4-flash", True),
+        ("gemini-4.0-flash", True),
+        ("gemini-4.2-flash-preview", True),
+        ("gemini-3.7-flash", False),
+        ("gemini-3.6-flash", False),
+        ("gemini-3.5-flash-lite", False),
+        ("gemini-3-flash-preview", False),
+        ("gemini-2.5-flash", False),
+        ("gemini-3.8-pro", False),
+        ("gemini-3.1-pro-preview", False),
+        ("gemma-3-27b-it", False),
+        ("", False),
+    ],
+)
+def test_is_gemini_flash_38_or_later(model, expected):
+    """Version comparison, not a prefix match: true from 3.8 Flash onward
+    (3.9, 4.x, -lite / -preview variants), false for 3.7 and earlier and
+    for every Pro model."""
+    from agent.gemini_native_adapter import is_gemini_flash_38_or_later
+
+    assert is_gemini_flash_38_or_later(model) is expected
+
+
+def test_build_gemini_request_drops_sampling_params_for_gemini_38_flash():
+    """Google's gemini-3.8-flash guidance: strip temperature / top_p / top_k —
+    the model tunes its own sampling. Earlier Flash generations keep them."""
+    from agent.gemini_native_adapter import build_gemini_request
+
+    messages = [{"role": "user", "content": "Hi"}]
+    strict = build_gemini_request(model="gemini-3.8-flash", messages=messages, temperature=0.7, top_p=0.9)
+    assert "temperature" not in strict["generationConfig"]
+    assert "topP" not in strict["generationConfig"]
+    # The output-ceiling default is unaffected by the gate.
+    assert strict["generationConfig"]["maxOutputTokens"] > 0
+
+    legacy = build_gemini_request(model="gemini-3.6-flash", messages=messages, temperature=0.7, top_p=0.9)
+    assert legacy["generationConfig"]["temperature"] == 0.7
+    assert legacy["generationConfig"]["topP"] == 0.9
+
+
+def test_build_gemini_request_clamps_minimal_thinking_level_for_gemini_38_flash():
+    """gemini-3.8-flash rejects thinkingLevel "minimal" (low/medium/high only);
+    a caller-supplied "minimal" lands as "low" there and is passed through
+    untouched on earlier generations. Documented levels are never rewritten."""
+    from agent.gemini_native_adapter import build_gemini_request
+
+    messages = [{"role": "user", "content": "Hi"}]
+    minimal = {"includeThoughts": True, "thinkingLevel": "minimal"}
+
+    strict = build_gemini_request(model="gemini-3.8-flash", messages=messages, thinking_config=minimal)
+    assert strict["generationConfig"]["thinkingConfig"] == {"includeThoughts": True, "thinkingLevel": "low"}
+
+    legacy = build_gemini_request(model="gemini-3.6-flash", messages=messages, thinking_config=minimal)
+    assert legacy["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "minimal"
+
+    high = build_gemini_request(
+        model="gemini-3.8-flash",
+        messages=messages,
+        thinking_config={"includeThoughts": True, "thinkingLevel": "high"},
+    )
+    assert high["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "high"
+
+
+def test_native_client_strips_sampling_params_for_gemini_38_flash(monkeypatch):
+    """End to end through the client: the caller's model id must reach
+    build_gemini_request so the gate fires on the wire request, and the
+    aggregator-style ``google/`` prefix must not defeat it."""
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    recorded = {}
+
+    class DummyHTTP:
+        def post(self, url, json=None, headers=None, timeout=None):
+            recorded["url"] = url
+            recorded["json"] = json
+            return DummyResponse(
+                payload={
+                    "candidates": [
+                        {"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 1,
+                        "candidatesTokenCount": 1,
+                        "totalTokenCount": 2,
+                    },
+                }
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("agent.gemini_native_adapter.httpx.Client", lambda *a, **k: DummyHTTP())
+
+    client = GeminiNativeClient(api_key="AIza-test", base_url="https://generativelanguage.googleapis.com/v1beta")
+    client.chat.completions.create(
+        model="google/gemini-3.8-flash",
+        messages=[{"role": "user", "content": "Hello"}],
+        temperature=0.2,
+        top_p=0.8,
+    )
+
+    assert recorded["url"].endswith("/models/gemini-3.8-flash:generateContent")
+    assert "temperature" not in recorded["json"]["generationConfig"]
+    assert "topP" not in recorded["json"]["generationConfig"]

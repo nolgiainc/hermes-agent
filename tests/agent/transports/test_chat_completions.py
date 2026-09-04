@@ -252,6 +252,66 @@ class TestChatCompletionsBuildKwargs:
             "thinking_level": "high",
         }
 
+    @pytest.mark.parametrize("model", ["gemini-3.8-flash", "google/gemini-3.8-flash"])
+    def test_gemini_38_flash_minimal_effort_clamps_to_low_on_native_endpoint(self, transport, model):
+        """gemini-3.8-flash accepts only low/medium/high thinking levels — Google
+        rejects "minimal" outright. Hermes' "minimal" effort must land as "low"."""
+        kw = transport.build_kwargs(
+            model=model,
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_name="gemini",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            reasoning_config={"enabled": True, "effort": "minimal"},
+        )
+        assert kw["extra_body"]["thinking_config"] == {
+            "includeThoughts": True,
+            "thinkingLevel": "low",
+        }
+
+    def test_gemini_38_flash_minimal_effort_clamps_to_low_on_openai_compat(self, transport):
+        kw = transport.build_kwargs(
+            model="gemini-3.8-flash",
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_name="gemini",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+            reasoning_config={"enabled": True, "effort": "minimal"},
+        )
+        assert kw["extra_body"]["extra_body"]["google"]["thinking_config"] == {
+            "include_thoughts": True,
+            "thinking_level": "low",
+        }
+
+    @pytest.mark.parametrize(
+        "reasoning_config",
+        [{"enabled": False}, {"enabled": True, "effort": "none"}],
+    )
+    def test_gemini_38_flash_disabled_reasoning_omits_thinking_level(self, transport, reasoning_config):
+        """Disabled / "none" reasoning must not be spelled as a thinkingLevel —
+        gemini-3.8-flash has no "off" level (minimal is rejected too), so the
+        request carries only includeThoughts=False and the model keeps its own
+        default level."""
+        kw = transport.build_kwargs(
+            model="gemini-3.8-flash",
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_name="gemini",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            reasoning_config=reasoning_config,
+        )
+        assert kw["extra_body"]["thinking_config"] == {"includeThoughts": False}
+
+    def test_gemini_38_flash_never_emits_undocumented_thinking_level(self):
+        """Invariant across Hermes' whole effort vocabulary: every enabled
+        effort maps onto one of the levels Google documents for
+        gemini-3.8-flash (low/medium/high) — never "minimal", never verbatim."""
+        from agent.transports.chat_completions import _build_gemini_thinking_config
+
+        for effort in ("minimal", "low", "medium", "high", "xhigh", "max", "ultra", "bogus"):
+            cfg = _build_gemini_thinking_config(
+                "gemini-3.8-flash", {"enabled": True, "effort": effort}
+            )
+            assert cfg["includeThoughts"] is True, effort
+            assert cfg["thinkingLevel"] in {"low", "medium", "high"}, (effort, cfg)
+
 
 
 

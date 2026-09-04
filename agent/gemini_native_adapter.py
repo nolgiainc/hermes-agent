@@ -20,6 +20,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 import uuid
 from types import SimpleNamespace
@@ -57,6 +58,33 @@ def bare_gemini_model_id(model: str) -> str:
         if lowered.startswith(prefix):
             return name[len(prefix):].strip() or name
     return name
+
+
+_GEMINI_FLASH_GENERATION_RE = re.compile(r"^gemini-(\d+)(?:\.(\d+))?-flash(?:-|$)")
+
+
+def is_gemini_flash_38_or_later(model: str) -> bool:
+    """True for ``gemini-3.8-flash`` and every later Flash generation.
+
+    Starting with gemini-3.8-flash (GA 2026-09-02) the Flash line's request
+    contract tightened: the model rejects ``thinkingLevel: "minimal"`` (only
+    low/medium/high are accepted) and Google's guidance is to strip
+    ``temperature`` / ``topP`` / ``topK`` from requests entirely. Earlier Flash
+    generations (3.7 and below, 2.5) still accept all of those, so this is a
+    version comparison on the model id — not a prefix match. True for 3.8,
+    3.9 and any 4.x Flash (including ``-lite`` / ``-preview`` variants); false
+    for 3.7 and earlier and for every Pro model. Accepts ``google/`` /
+    ``gemini/`` / ``models/`` prefixed ids.
+    """
+    name = bare_gemini_model_id(model).lower()
+    if name.startswith("models/"):
+        name = name[len("models/"):]
+    match = _GEMINI_FLASH_GENERATION_RE.match(name)
+    if not match:
+        return False
+    major = int(match.group(1))
+    minor = int(match.group(2) or 0)
+    return (major, minor) >= (3, 8)
 
 
 def is_native_gemini_base_url(base_url: str) -> bool:
@@ -483,6 +511,7 @@ def build_gemini_request(
     top_p: Optional[float] = None,
     stop: Any = None,
     thinking_config: Any = None,
+    model: Optional[str] = None,
 ) -> Dict[str, Any]:
     contents, system_instruction = _build_gemini_contents(messages)
     request: Dict[str, Any] = {"contents": contents}
@@ -497,8 +526,17 @@ def build_gemini_request(
     if tool_config:
         request["toolConfig"] = tool_config
 
+    # gemini-3.8-flash and later Flash generations reject sampling overrides
+    # and the "minimal" thinking level (see is_gemini_flash_38_or_later).
+    strict_flash = is_gemini_flash_38_or_later(model or "")
+    if strict_flash and (temperature is not None or top_p is not None):
+        logger.debug(
+            "%s rejects sampling overrides; dropping temperature/topP from generationConfig",
+            model,
+        )
+
     generation_config: Dict[str, Any] = {}
-    if temperature is not None:
+    if temperature is not None and not strict_flash:
         generation_config["temperature"] = temperature
     if max_tokens is not None:
         generation_config["maxOutputTokens"] = max_tokens
@@ -514,12 +552,14 @@ def build_gemini_request(
         # the field genuinely means full budget — that assumption does not
         # hold on the native API.
         generation_config["maxOutputTokens"] = GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
-    if top_p is not None:
+    if top_p is not None and not strict_flash:
         generation_config["topP"] = top_p
     if stop:
         generation_config["stopSequences"] = stop if isinstance(stop, list) else [str(stop)]
     normalized_thinking = _normalize_thinking_config(thinking_config)
     if normalized_thinking:
+        if strict_flash and normalized_thinking.get("thinkingLevel") == "minimal":
+            normalized_thinking["thinkingLevel"] = "low"
         generation_config["thinkingConfig"] = normalized_thinking
     if generation_config:
         request["generationConfig"] = generation_config
@@ -1006,6 +1046,7 @@ class GeminiNativeClient:
             top_p=top_p,
             stop=stop,
             thinking_config=thinking_config,
+            model=model,
         )
 
         model = bare_gemini_model_id(model)

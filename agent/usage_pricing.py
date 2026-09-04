@@ -511,6 +511,21 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         pricing_version="deepseek-pricing-2026-07",
     ),
     # Google Gemini
+    # gemini-3.8-flash (GA 2026-09-02) launched at a rate Google documents
+    # through 2026-12-31. From 2027-01-01 it steps up to $1.50 / $7.50 /
+    # $0.15 (input / output / cache read) per 1M tokens — re-pin this entry
+    # and bump pricing_version when the step-up lands.
+    (
+        "google",
+        "gemini-3.8-flash",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.75"),
+        output_cost_per_million=Decimal("3.75"),
+        cache_read_cost_per_million=Decimal("0.075"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-pricing-2026-09-04",
+    ),
     (
         "google",
         "gemini-3.6-flash",
