@@ -478,6 +478,21 @@ class TestGeminiStrictFlashSampling:
 
         assert "temperature" not in kwargs
 
+    def test_auxiliary_call_strips_sampling_from_extra_body(self):
+        kwargs = _build_call_kwargs(
+            provider="openrouter",
+            model="google/gemini-3.8-flash:nitro",
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "top_k": 40,
+                "provider": {"sort": "throughput"},
+            },
+        )
+
+        assert kwargs["extra_body"] == {"provider": {"sort": "throughput"}}
+
 
 class TestNousTagsScoping:
     def test_tags_injected_when_provider_is_nous(self, monkeypatch):

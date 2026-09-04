@@ -284,6 +284,25 @@ class TestChatCompletionsBuildKwargs:
         )
         assert kw["extra_body"]["provider"] == {"only": ["openai"]}
 
+    def test_gemini_38_openrouter_variant_strips_nested_sampling_overrides(self, transport):
+        request_overrides = {
+            "extra_body": {
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "top_k": 40,
+                "provider": {"sort": "throughput"},
+            }
+        }
+
+        kw = transport.build_kwargs(
+            model="google/gemini-3.8-flash:nitro",
+            messages=[{"role": "user", "content": "Hi"}],
+            request_overrides=request_overrides,
+        )
+
+        assert kw["extra_body"] == {"provider": {"sort": "throughput"}}
+        assert request_overrides["extra_body"]["temperature"] == 0.7
+
 
 
 

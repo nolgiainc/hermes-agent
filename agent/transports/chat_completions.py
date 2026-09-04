@@ -196,6 +196,12 @@ def _strip_forbidden_sampling_params(
     if is_gemini_flash_38_or_later(model):
         for key in ("temperature", "top_p", "top_k"):
             api_kwargs.pop(key, None)
+        extra_body = api_kwargs.get("extra_body")
+        if isinstance(extra_body, dict):
+            cleaned_extra_body = dict(extra_body)
+            for key in ("temperature", "top_p", "top_k"):
+                cleaned_extra_body.pop(key, None)
+            api_kwargs["extra_body"] = cleaned_extra_body
 
 
 def _is_openai_api_base_url(base_url: Any) -> bool:
