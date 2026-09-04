@@ -890,6 +890,7 @@ Older configs with `compression.summary_model`, `compression.summary_provider`, 
 | `AUXILIARY_VISION_MODEL` | Override model for vision tasks |
 | `AUXILIARY_VISION_BASE_URL` | Direct OpenAI-compatible endpoint for vision tasks |
 | `AUXILIARY_VISION_API_KEY` | API key paired with `AUXILIARY_VISION_BASE_URL` |
+| `AUXILIARY_VIDEO_MODEL` | Override model for the `video_analyze` tool (falls back to `AUXILIARY_VISION_MODEL`). Legacy env form of `auxiliary.video.model`; `auxiliary.video.{provider, fps, detail}` are config-only. Use a Gemini model (e.g. `gemini-3.8-flash`) — it is the only route that attaches the clip through an OpenAI-compatible proxy. |
 | `AUXILIARY_WEB_EXTRACT_PROVIDER` | Override provider for web extraction/summarization |
 | `AUXILIARY_WEB_EXTRACT_MODEL` | Override model for web extraction/summarization |
 | `AUXILIARY_WEB_EXTRACT_BASE_URL` | Direct OpenAI-compatible endpoint for web extraction/summarization |

@@ -617,6 +617,23 @@ prompt_caching:
 #                            # compression at "low" and vision at "none" to cut
 #                            # side-task latency/cost on reasoning models.
 #
+#   # Video analysis: the video_analyze tool.  Model falls back to
+#   # auxiliary.vision.model when empty (AUXILIARY_VIDEO_MODEL is the legacy
+#   # env override).  Gemini is the only route that attaches the clip through
+#   # an OpenAI-compatible proxy: Gemini models get a `file` part (https URLs
+#   # are fetched by Google; local files are inlined up to ~20 MB), every
+#   # other model keeps the `video_url` part (data URL, up to ~50 MB).
+#   video:
+#     provider: ""           # empty = the vision task's provider; or e.g. "gemini", "main"
+#     model: ""              # e.g. "gemini-3.8-flash" (recommended), "google/gemini-2.5-flash"
+#     fps: 1                 # Gemini frame sampling (video_metadata.fps). 1 fps costs
+#                            # ~2.8x fewer video tokens than Gemini's ~2.8 fps default;
+#                            # 0 or null omits it. Fractional values are not a
+#                            # reliable lever. Ignored for non-Gemini models.
+#     detail: ""             # Gemini 3+ per-part media_resolution: low, medium,
+#                            # high, ultra_high. Empty = model default (measured
+#                            # as a no-op for video on gemini-3.x-flash).
+#
 #   # Web page scraping / summarization + browser page text extraction
 #   web_extract:
 #     provider: "auto"
