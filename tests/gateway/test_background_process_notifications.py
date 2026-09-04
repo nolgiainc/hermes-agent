@@ -649,8 +649,8 @@ async def test_async_delegation_apiserver_persists_delivery_not_self_post(
 
     persisted = []
 
-    async def fake_persist(adapter, *, text, session_id, evt=None):
-        persisted.append({"text": text, "session_id": session_id, "evt": evt})
+    async def fake_persist(adapter, *, text, session_id, evt=None, profile=""):
+        persisted.append({"text": text, "session_id": session_id, "evt": evt, "profile": profile})
 
     monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
     monkeypatch.setattr(wake_mod, "persist_delegation_delivery", fake_persist)
@@ -660,6 +660,7 @@ async def test_async_delegation_apiserver_persists_delivery_not_self_post(
         "delegation_id": "deleg_85957",
         "session_key": "raw-hq-session-id",  # no agent:main:... structure
         "origin_session_id": "raw-hq-session-id",
+        "origin_profile": "alpha",
         "status": "completed",
     }
     result = await runner._inject_watch_notification(
@@ -671,6 +672,7 @@ async def test_async_delegation_apiserver_persists_delivery_not_self_post(
     api_adapter.handle_message.assert_not_awaited()
     assert len(persisted) == 1
     assert persisted[0]["session_id"] == "raw-hq-session-id"
+    assert persisted[0]["profile"] == "alpha"
     assert persisted[0]["evt"]["delegation_id"] == "deleg_85957"
 
 
@@ -690,7 +692,7 @@ async def test_async_delegation_apiserver_persist_failure_is_retryable(
 
     import gateway.wake as wake_mod
 
-    async def fail_persist(adapter, *, text, session_id, evt=None):
+    async def fail_persist(adapter, *, text, session_id, evt=None, profile=""):
         raise RuntimeError("state.db unavailable")
 
     monkeypatch.setattr(wake_mod, "persist_delegation_delivery", fail_persist)

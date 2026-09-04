@@ -14,13 +14,11 @@ name: OS-specific tests
 #   macos    → ``-m macos_only``     on macos-latest
 #   windows  → ``-m windows_only``   on windows-latest
 #
-# Deliberately NOT sliced. The marked set is small (tens of tests, not
-# thousands), so one plain ``pytest`` process per OS is both faster and far
-# less machinery than the per-file parallel runner the Linux lane uses.
-# If either lane grows past its timeout, that is the signal to reach for
-# scripts/run_tests.sh here too.
+# The marked set is small (tens of tests, not thousands), but still runs
+# through scripts/run_tests.sh so each file gets the same clean environment
+# and process isolation as the main Python suite.
 #
-# Each lane FAILS when it selects zero tests (pytest exit code 5). Without
+# Each lane FAILS when the canonical runner reports zero tests overall. Without
 # that guard, a renamed marker or a bad selector would report a green job
 # that ran nothing — the exact silent-coverage-loss failure this workflow
 # exists to prevent.
@@ -142,11 +140,6 @@ jobs:
           echo "selected $# file(s) for ${{ matrix.marker }}:"
           cat "$LIST"
 
-          # ``shell: bash`` runs this script with ``-e`` injected, which
-          # ``set -uo pipefail`` above does not clear. A bare pytest call
-          # would therefore abort the script on any non-zero exit and the
-          # exit-5 branch below would be unreachable dead code — the job
-          # would still fail red, but the diagnostic would never print.
           # Desktop-update hand-off integration tests spawn the real
           # windows.ps1; deselect them unless the PR touched that surface
           # (see the workflow_call input). ``--ignore-glob`` keeps the file
@@ -160,20 +153,14 @@ jobs:
             EXTRA_ARGS+=(--ignore-glob='*test_desktop_update_windows_*.py')
           fi
 
-          status=0
-          uv run --no-sync python -m pytest \
+          scripts/run_tests.sh \
             "$@" \
             ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
             -m "${{ matrix.marker }} and not integration" \
-            -v --tb=short || status=$?
-          if [ "$status" -eq 5 ]; then
-            echo "::error::No tests matched -m ${{ matrix.marker }}. Either the" \
-                 "marker was renamed/dropped or selection is broken — this job" \
-                 "must never pass without running its OS's tests."
-            exit 1
-          fi
-          exit "$status"
+            -v --tb=short
         env:
+          # Platform regressions stay blocking even if a retry would pass.
+          HERMES_TEST_FILE_RETRIES: "0"
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
           OPENROUTER_API_KEY: ""

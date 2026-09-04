@@ -401,6 +401,25 @@ def test_completion_arriving_during_batch_delivery_schedules_next_flush():
     assert adapter.handle_message.await_count == 2
 
 
+def test_completion_batches_do_not_cross_profiles():
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    first = _completion_event(started_at=1.0, session_id="proc_profile_a")
+    first["origin_profile"] = "alpha"
+    second = _completion_event(started_at=2.0, session_id="proc_profile_b")
+    second["origin_profile"] = "beta"
+
+    async def _exercise():
+        return await asyncio.gather(
+            runner._enqueue_process_completion_notification("first", first),
+            runner._enqueue_process_completion_notification("second", second),
+        )
+
+    assert asyncio.run(_exercise()) == [True, True]
+    assert adapter.handle_message.await_count == 2
+
+
 def test_completion_batches_do_not_cross_conversation_routes():
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = _runner(adapter)
@@ -803,6 +822,31 @@ def test_same_tick_async_events_for_different_sessions_do_not_coalesce(
     assert not any("background subagent delegations" in text for text in texts)
     assert any("deleg_route_a" in text for text in texts)
     assert any("deleg_route_b" in text for text in texts)
+
+
+def test_same_tick_async_events_for_different_profiles_do_not_coalesce(
+    monkeypatch, isolated_registry,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    first = _distinct_async_event("deleg_profile_a")
+    first["origin_profile"] = "alpha"
+    second = _distinct_async_event("deleg_profile_b")
+    second["origin_profile"] = "beta"
+    isolated.put(first)
+    isolated.put(second)
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert adapter.handle_message.await_count == 2
+    texts = [call.args[0].text for call in adapter.handle_message.await_args_list]
+    assert not any("background subagent delegations" in text for text in texts)
+    assert any("deleg_profile_a" in text for text in texts)
+    assert any("deleg_profile_b" in text for text in texts)
 
 
 def test_single_async_event_latency_and_text_are_unchanged(

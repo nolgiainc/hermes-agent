@@ -9,6 +9,7 @@ Two strategies:
 """
 
 import asyncio
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -257,6 +258,32 @@ def test_persist_delegation_delivery_appends_delivery_row(tmp_path):
     assert meta["task_count"] == 2
     assert meta["failed_count"] == 1
     assert meta["duration_seconds"] == 12.5
+
+
+def test_persist_delegation_delivery_uses_origin_profile_scope(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from gateway.wake import persist_delegation_delivery
+    from hermes_constants import get_hermes_home
+
+    default_home = tmp_path / ".hermes"
+    profile_home = default_home / "profiles" / "alpha"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.setattr("hermes_cli.profiles._get_profiles_root", lambda: default_home / "profiles")
+    db = MagicMock()
+
+    class DbAdapter(ApiServerLikeAdapter):
+        def _ensure_session_db(self):
+            assert get_hermes_home() == profile_home
+            return db
+
+    asyncio.run(persist_delegation_delivery(
+        DbAdapter(), text="result", session_id="sid", profile="alpha",
+    ))
+
+    db.append_message.assert_called_once()
 
 
 def test_persist_delegation_delivery_raises_without_db():

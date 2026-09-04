@@ -40,8 +40,12 @@ class GatewayNotificationsMixin:
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
     # Coalescing keys: process completions (short-window fan-in) and async delegations (+ parent session).
-    _COMPLETION_BATCH_KEY_FIELDS = ("session_key", "platform", "chat_type", "chat_id", "thread_id", "user_id")
-    _ASYNC_GROUP_KEY_FIELDS = ("session_key", "parent_session_id", *_COMPLETION_BATCH_KEY_FIELDS[1:])
+    _COMPLETION_BATCH_KEY_FIELDS = (
+        "origin_profile", "session_key", "platform", "chat_type", "chat_id", "thread_id", "user_id",
+    )
+    _ASYNC_GROUP_KEY_FIELDS = (
+        "origin_profile", "session_key", "parent_session_id", *_COMPLETION_BATCH_KEY_FIELDS[2:],
+    )
 
     @dataclasses.dataclass
     class _UpdatePaths:
@@ -850,7 +854,10 @@ class GatewayNotificationsMixin:
         if evt.get("type") == "async_delegation":
             info = "Async delegation completion — persisting delivery row for api_server session %s (no wake turn)"
             fail = "Async delegation delivery persist failed for session %s: %s"
-            deliver = lambda: persist_delegation_delivery(adapter, text=synth_text, session_id=raw_sid, evt=evt)  # noqa: E731
+            deliver = lambda: persist_delegation_delivery(  # noqa: E731
+                adapter, text=synth_text, session_id=raw_sid, evt=evt,
+                profile=str(evt.get("origin_profile") or "").strip(),
+            )
         else:
             info = "Watch pattern notification — waking api_server session %s via self-post"
             fail = "Watch notification self-post wake failed for session %s: %s"

@@ -123,7 +123,9 @@ def _delegation_display_metadata(evt: dict) -> dict:
     return metadata
 
 
-async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: str, evt: Optional[dict] = None) -> None:
+async def persist_delegation_delivery(
+    adapter: Any, *, text: str, session_id: str, evt: Optional[dict] = None, profile: str = "",
+) -> None:
     """Persist an async-delegation completion as a durable DELIVERY row (see module docstring)
     WITHOUT running any agent turn. Raises on failure so the caller can release the durable claim
     and retry.
@@ -140,7 +142,23 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
         raise ValueError("persist_delegation_delivery: raw session id required to persist "
                          "the completion on the api_server session transcript")
     ensure = getattr(adapter, "_ensure_session_db", None)
-    db: Any = await asyncio.to_thread(ensure) if callable(ensure) else None
+    target_profile = str(profile or "").strip()
+    if target_profile:
+        from hermes_cli.profiles import get_profile_dir, profile_exists
+
+        if not profile_exists(target_profile):
+            raise RuntimeError(
+                f"persist_delegation_delivery: profile {target_profile!r} is unavailable"
+            )
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        home_token = set_hermes_home_override(str(get_profile_dir(target_profile)))
+        try:
+            db: Any = await asyncio.to_thread(ensure) if callable(ensure) else None
+        finally:
+            reset_hermes_home_override(home_token)
+    else:
+        db = await asyncio.to_thread(ensure) if callable(ensure) else None
     if db is None:
         raise RuntimeError("persist_delegation_delivery: api_server SessionDB unavailable — "
                            f"cannot persist completion for session {session_id}")

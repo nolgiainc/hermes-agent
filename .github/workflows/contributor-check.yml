@@ -64,7 +64,17 @@ jobs:
             # the file up case-insensitively before declaring the email
             # unmapped (upstream sync 2026-09-04: agent@Agents-Mac-mini.local
             # vs the committed agent@agents-Mac-mini.local).
-            if find contributors/emails -maxdepth 1 -iname "$email" -print -quit | grep -q .; then
+            email_folded=$(printf '%s' "$email" | tr '[:upper:]' '[:lower:]')
+            mapped=false
+            for candidate in contributors/emails/*; do
+              [ -f "$candidate" ] || continue
+              candidate_folded=$(basename "$candidate" | tr '[:upper:]' '[:lower:]')
+              if [ "$candidate_folded" = "$email_folded" ]; then
+                mapped=true
+                break
+              fi
+            done
+            if [ "$mapped" = true ]; then
               continue
             fi
 
