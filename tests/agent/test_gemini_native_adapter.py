@@ -81,6 +81,42 @@ def test_consecutive_user_messages_merge_for_gemini_alternation():
     assert roles == ["user", "model"], roles
 
 
+def test_file_parts_translate_to_native_gemini_video_parts():
+    from agent.gemini_native_adapter import _extract_multimodal_parts
+
+    encoded = "AAEC"
+    parts = _extract_multimodal_parts([
+        {
+            "type": "file",
+            "file": {
+                "file_data": f"data:video/mp4;base64,{encoded}",
+                "format": "video/mp4",
+                "video_metadata": {"fps": 1},
+                "detail": "low",
+            },
+        },
+        {
+            "type": "file",
+            "file": {
+                "file_data": "https://cdn.example.com/clip.webm",
+                "format": "video/webm",
+            },
+        },
+    ])
+
+    assert parts == [
+        {
+            "inlineData": {"mimeType": "video/mp4", "data": encoded},
+            "videoMetadata": {"fps": 1},
+            "mediaResolution": {"level": "MEDIA_RESOLUTION_LOW"},
+        },
+        {
+            "fileData": {
+                "mimeType": "video/webm",
+                "fileUri": "https://cdn.example.com/clip.webm",
+            },
+        },
+    ]
 
 
 def test_translate_native_response_surfaces_reasoning_and_tool_calls():

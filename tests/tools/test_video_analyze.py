@@ -355,9 +355,11 @@ class TestVideoMimeFromUrl:
 
 
 class _FakeHeadClient:
-    def __init__(self, content_type=None, error=None):
+    def __init__(self, content_type=None, error=None, response_url=None, response_hook=None):
         self._ct = content_type
         self._error = error
+        self._response_url = response_url
+        self._response_hook = response_hook
         self.calls = []
 
     async def __aenter__(self):
@@ -370,17 +372,46 @@ class _FakeHeadClient:
         self.calls.append((url, headers))
         if self._error:
             raise self._error
-        return SimpleNamespace(headers={"content-type": self._ct} if self._ct else {})
+        response = SimpleNamespace(
+            headers={"content-type": self._ct} if self._ct else {},
+            url=self._response_url or url,
+            status_code=200,
+        )
+        if self._response_hook:
+            await self._response_hook(response)
+        return response
 
 
 class TestProbeRemoteVideoMime:
     def _run(self, coro):
         return asyncio.get_event_loop().run_until_complete(coro)
 
-    def test_extension_wins_without_network(self):
-        with patch("tools.url_safety.create_ssrf_safe_async_client") as mk:
+    def test_extension_is_fallback_after_policy_probe(self):
+        client = _FakeHeadClient("application/octet-stream")
+        with patch("tools.url_safety.create_ssrf_safe_async_client", return_value=client):
             assert self._run(_probe_remote_video_mime(_HTTPS_MP4)) == "video/mp4"
-        mk.assert_not_called()
+        assert client.calls and client.calls[0][0] == _HTTPS_MP4
+
+    def test_final_url_is_checked_against_website_policy(self):
+        client = None
+
+        def make_client(**kwargs):
+            nonlocal client
+            hook = kwargs["event_hooks"]["response"][0]
+            client = _FakeHeadClient(
+                "video/mp4",
+                response_url="https://blocked.example/clip.mp4",
+                response_hook=hook,
+            )
+            return client
+
+        with patch("tools.url_safety.create_ssrf_safe_async_client", side_effect=make_client), \
+             patch("tools.url_safety.async_is_safe_url", new=AsyncMock(return_value=True)), \
+             patch("tools.vision_tools.check_website_access", side_effect=lambda url: (
+                 {"message": "blocked by policy"} if "blocked.example" in url else None
+             )):
+            with pytest.raises(PermissionError, match="blocked by policy"):
+                self._run(_probe_remote_video_mime(_HTTPS_MP4))
 
     def test_head_content_type_used_when_video(self):
         client = _FakeHeadClient("video/webm; charset=binary")
@@ -534,7 +565,7 @@ class TestVideoAnalyzeToolGemini:
             result = self._run(video_analyze_tool(str(video), "Describe", "gemini-3.8-flash"))
         data = json.loads(result)
         assert data["success"] is False
-        assert "Gemini inlines local video at most ~20 MB" in data["error"]
+        assert "roughly 0 MB of source video after base64 expansion" in data["error"]
         assert "https URL" in data["error"]
         assert "too large" in data["analysis"].lower()
         mock_llm.assert_not_awaited()

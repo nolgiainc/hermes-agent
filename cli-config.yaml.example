@@ -621,8 +621,9 @@ prompt_caching:
 #   # auxiliary.vision.model when empty (AUXILIARY_VIDEO_MODEL is the legacy
 #   # env override).  Gemini is the only route that attaches the clip through
 #   # an OpenAI-compatible proxy: Gemini models get a `file` part (https URLs
-#   # are fetched by Google; local files are inlined up to ~20 MB), every
-#   # other model keeps the `video_url` part (data URL, up to ~50 MB).
+#   # are fetched by Google; local source files are limited to roughly 14 MB
+#   # after base64 expansion), every other model keeps the `video_url` part
+#   # (data URL, up to ~50 MB).
 #   video:
 #     provider: ""           # empty = the vision task's provider; or e.g. "gemini", "main"
 #     model: ""              # e.g. "gemini-3.8-flash" (recommended), "google/gemini-2.5-flash"

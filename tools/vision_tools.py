@@ -1868,8 +1868,10 @@ _VIDEO_SIZE_WARN_BYTES = 20 * 1024 * 1024
 # Gemini's API rejects requests whose body exceeds ~20 MB, and a base64 data
 # URL inside a ``file`` part travels inline in that body — so a local file
 # sent to Gemini is bounded well below the 50 MB cap above. 19 MB leaves
-# headroom for the prompt and JSON framing.
+# headroom for the prompt and JSON framing, which permits roughly 14 MB of
+# source video after base64's 4/3 expansion.
 _GEMINI_INLINE_MAX_BASE64_BYTES = 19 * 1024 * 1024
+_GEMINI_INLINE_MAX_SOURCE_BYTES = (_GEMINI_INLINE_MAX_BASE64_BYTES // 4) * 3
 
 # Gemini samples ~2.8 fps when ``video_metadata.fps`` is omitted (measured
 # through the proxy: 91 video-tokens/s). ``fps: 1`` measured 32 tokens/s — a
@@ -1991,15 +1993,14 @@ def _video_mime_from_url(video_url: str) -> Optional[str]:
 async def _probe_remote_video_mime(video_url: str, timeout: float = 15.0) -> str:
     """Best-effort MIME type for a remote video that Google will fetch itself.
 
-    Extension first; otherwise a HEAD request (SSRF-guarded, redirects
-    validated) looking for a ``video/*`` Content-Type. Falls back to
-    ``video/mp4``: Gemini requires *some* MIME type on a ``fileData`` part
-    and treats mp4 as the generic container — it is also what works for
-    YouTube watch URLs, which report ``text/html``.
+    A HEAD request validates every redirect/final target against both SSRF and
+    website policies. Its ``video/*`` Content-Type is used when available,
+    otherwise the URL extension wins. Falls back to ``video/mp4``: Gemini
+    requires *some* MIME type on a ``fileData`` part and treats mp4 as the
+    generic container — it is also what works for YouTube watch URLs, which
+    report ``text/html``.
     """
     mime = _video_mime_from_url(video_url)
-    if mime:
-        return mime
     try:
         from tools.url_safety import (
             async_is_safe_url,
@@ -2007,17 +2008,24 @@ async def _probe_remote_video_mime(video_url: str, timeout: float = 15.0) -> str
             redirect_target_from_response,
         )
 
-        async def _ssrf_redirect_guard(response):
+        async def _redirect_guard(response):
+            targets = [str(response.url)]
             redirect_url = redirect_target_from_response(response)
-            if redirect_url and not await async_is_safe_url(redirect_url):
-                raise ValueError(
-                    f"Blocked redirect to private/internal address: {redirect_url}"
-                )
+            if redirect_url:
+                targets.append(redirect_url)
+            for target in targets:
+                if not await async_is_safe_url(target):
+                    raise PermissionError(
+                        f"Blocked redirect to private/internal address: {target}"
+                    )
+                blocked = check_website_access(target)
+                if blocked:
+                    raise PermissionError(blocked["message"])
 
         async with create_ssrf_safe_async_client(
             timeout=timeout,
             follow_redirects=True,
-            event_hooks={"response": [_ssrf_redirect_guard]},
+            event_hooks={"response": [_redirect_guard]},
         ) as client:
             response = await client.head(video_url, headers=dict(_VIDEO_FETCH_HEADERS))
         content_type = (
@@ -2025,9 +2033,11 @@ async def _probe_remote_video_mime(video_url: str, timeout: float = 15.0) -> str
         )
         if content_type.startswith("video/"):
             return content_type
-    except Exception as e:  # advisory only — the URL was already validated
+    except PermissionError:
+        raise
+    except Exception as e:  # MIME detection is advisory; security checks are not
         logger.debug("Video MIME probe failed for %s: %s", video_url[:80], e)
-    return "video/mp4"
+    return mime or "video/mp4"
 
 
 async def _download_video(video_url: str, destination: Path, max_retries: int = 3) -> Path:
@@ -2208,8 +2218,9 @@ async def video_analyze_tool(
                     f"Video too large to inline for Gemini: base64 payload is "
                     f"{data_size_mb:.1f} MB (limit "
                     f"{_GEMINI_INLINE_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB). "
-                    "Gemini inlines local video at most ~20 MB; pass an https URL "
-                    "to let Google fetch it, or compress/trim the video and retry."
+                    f"Gemini accepts roughly {_GEMINI_INLINE_MAX_SOURCE_BYTES / (1024 * 1024):.0f} MB "
+                    "of source video after base64 expansion; pass an https URL to let "
+                    "Google fetch it, or compress/trim the video and retry."
                 )
             if len(video_data_url) > _MAX_VIDEO_BASE64_BYTES:
                 raise ValueError(
@@ -2327,8 +2338,8 @@ async def video_analyze_tool(
         )):
             analysis = (
                 "The video is too large for the API. Try compressing or trimming "
-                "the video (max ~50 MB; Gemini inlines local files at most ~20 MB — "
-                f"pass an https URL so Google fetches it instead). Error: {e}"
+                "the video (max ~50 MB; Gemini accepts roughly 14 MB of local source "
+                f"video after base64 expansion, or an https URL). Error: {e}"
             )
         else:
             analysis = (
