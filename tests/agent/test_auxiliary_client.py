@@ -467,6 +467,18 @@ class TestBuildCallKwargsMaxTokens:
 
 
 
+class TestGeminiStrictFlashSampling:
+    def test_auxiliary_call_strips_temperature(self):
+        kwargs = _build_call_kwargs(
+            provider="vertex",
+            model="google/gemini-3.8-flash",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.7,
+        )
+
+        assert "temperature" not in kwargs
+
+
 class TestNousTagsScoping:
     def test_tags_injected_when_provider_is_nous(self, monkeypatch):
         import agent.auxiliary_client as aux

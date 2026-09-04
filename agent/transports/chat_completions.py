@@ -187,6 +187,17 @@ def _is_gemini_openai_compat_base_url(base_url: Any) -> bool:
     return bool(normalized) and "generativelanguage.googleapis.com" in normalized and normalized.endswith("/openai")
 
 
+def _strip_forbidden_sampling_params(
+    model: str, api_kwargs: dict[str, Any]
+) -> None:
+    """Remove sampling fields rejected by the selected model."""
+    from agent.gemini_native_adapter import is_gemini_flash_38_or_later
+
+    if is_gemini_flash_38_or_later(model):
+        for key in ("temperature", "top_p", "top_k"):
+            api_kwargs.pop(key, None)
+
+
 def _is_openai_api_base_url(base_url: Any) -> bool:
     """True only for the exact api.openai.com host (implies ``prompt_cache_key`` support).
 
@@ -429,11 +440,28 @@ class ChatCompletionsTransport(ProviderTransport):
             extra_body.update(params["extra_body_additions"])
         if extra_body:
             api_kwargs["extra_body"] = extra_body
+<<<<<<< HEAD
         if params.get("request_overrides"):
             api_kwargs.update(params["request_overrides"])
         return _finish_kwargs(
             api_kwargs, sanitized, params,
             supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key")) or _is_openai_api_base_url(base_url),
+=======
+
+        # Request overrides last (service_tier etc.)
+        overrides = params.get("request_overrides")
+        if overrides:
+            api_kwargs.update(overrides)
+
+        _strip_forbidden_sampling_params(model, api_kwargs)
+
+        _add_prompt_cache_key(
+            api_kwargs,
+            messages=sanitized,
+            tools=api_kwargs.get("tools"),
+            supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key"))
+            or _is_openai_api_base_url(params.get("base_url")),
+>>>>>>> 08a32bc41f (fix(gemini): enforce 3.8 sampling contract across transports)
         )
 
     def _build_kwargs_from_profile(self, profile, model, sanitized, tools, params):
@@ -481,8 +509,10 @@ class ChatCompletionsTransport(ProviderTransport):
                 extra_body = {k: v for k, v in extra_body.items() if k in ("thinking_config", "thinkingConfig")}
             if extra_body:
                 api_kwargs["extra_body"] = extra_body
+        _strip_forbidden_sampling_params(model, api_kwargs)
         return _finish_kwargs(
-            api_kwargs, sanitized, params, supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False)),
+            api_kwargs, sanitized, params,
+            supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False)),
         )
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:
