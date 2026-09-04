@@ -312,3 +312,41 @@ def test_vertex_default_model_estimates_cached_usage(monkeypatch):
 
     assert result.status == "estimated"
     assert result.amount_usd is not None and result.amount_usd > 0
+
+
+def test_gemini_38_flash_official_snapshot_entry():
+    """gemini-3.8-flash (GA 2026-09-02) must price from the Google official
+    snapshot on both the direct Gemini and the Vertex route, or sessions on
+    the new Flash report cost=unknown. Rates are Google's documented launch
+    rate (through 2026-12-31): $0.75 / $3.75 per 1M in / out, $0.075 cache
+    read — the entry is re-pinned when the 2027-01-01 step-up lands.
+    """
+    direct = get_pricing_entry("gemini-3.8-flash", provider="gemini")
+    assert direct is not None
+    assert direct.source == "official_docs_snapshot"
+    assert float(direct.input_cost_per_million) == 0.75
+    assert float(direct.output_cost_per_million) == 3.75
+    assert float(direct.cache_read_cost_per_million) == 0.075
+
+    vertex = get_pricing_entry("google/gemini-3.8-flash", provider="vertex")
+    assert vertex is not None
+    assert vertex.input_cost_per_million == direct.input_cost_per_million
+    assert vertex.output_cost_per_million == direct.output_cost_per_million
+    assert vertex.cache_read_cost_per_million == direct.cache_read_cost_per_million
+
+
+def test_every_curated_direct_gemini_and_vertex_model_is_billable():
+    """Invariant: every model the direct Gemini and Vertex pickers offer must
+    resolve to official-snapshot pricing. A curated entry without a snapshot
+    row shows cost=unknown for the whole session (the gap d259b24ede closed
+    for 3.6-flash / 3.5-flash-lite) — catch it when the list grows.
+    """
+    from hermes_cli.models import _PROVIDER_MODELS
+
+    for provider in ("gemini", "vertex"):
+        for model in _PROVIDER_MODELS[provider]:
+            entry = get_pricing_entry(model, provider=provider)
+            assert entry is not None, (provider, model)
+            assert entry.source == "official_docs_snapshot", (provider, model)
+            assert entry.input_cost_per_million is not None, (provider, model)
+            assert entry.output_cost_per_million is not None, (provider, model)
