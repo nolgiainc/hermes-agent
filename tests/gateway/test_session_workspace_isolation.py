@@ -838,8 +838,9 @@ class TestConcurrentSessionIsolation:
     @pytest.mark.asyncio
     async def test_idempotency_fingerprint_covers_workspace_id(self, scratch_base):
         """Same Idempotency-Key + different workspace_id is a DIFFERENT
-        submission: it must start a new run, not replay one that executed
-        against another session's scratch dir."""
+        submission: it must never replay a run that executed against another
+        session's scratch dir. The durable reservation store rejects the
+        mismatch as 409 idempotency_key_conflict (upstream's contract)."""
         adapter = _make_adapter()
         app = _create_runs_app(adapter)
 
@@ -876,8 +877,8 @@ class TestConcurrentSessionIsolation:
                     json={"input": "hi", "workspace_id": "bbbb2222"},
                     headers={"Idempotency-Key": "key-1"},
                 )
-                assert other.status == 202
-                assert (await other.json())["run_id"] != first_id
+                assert other.status == 409
+                assert (await other.json())["error"]["code"] == "idempotency_key_conflict"
 
 
 # ---------------------------------------------------------------------------
@@ -1113,7 +1114,10 @@ class TestAdvertisedRuntimeCwd:
             chat_id=sid, session_key=sid, session_id=sid
         )
         try:
-            assert runtime_cwd._session_cwd_override() == ""
+            # Upstream folded the fork's ``_session_cwd_override()`` reader into
+            # ``_resolve_configured_cwd``; the bound session cwd is the module
+            # ContextVar itself, so read it directly: unset or cleared, never a path.
+            assert runtime_cwd._SESSION_CWD.get() in (runtime_cwd._UNSET, "")
         finally:
             clear_session_vars(tokens)
 

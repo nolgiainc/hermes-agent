@@ -256,24 +256,57 @@ class TestAssemblyGuardEmptyAssistant:
                 assert m.get("tool_call_id") in declared, "orphan tool result"
 
     def test_surviving_messages_are_the_correct_ones(self):
-        """The FIRST id-holder (5251) and its results survive; the collided
-        duplicate turn (5258) is dropped along with its duplicate results."""
+        """Every surviving turn is provider-safe and correctly paired.
+
+        Mechanism (post upstream sync b0ab2e163a): upstream's
+        ``_dedupe_tool_call_ids`` now tracks OUTSTANDING (unanswered) calls
+        rather than every id ever seen — llama.cpp mints one constant id for
+        every call it ever returns, so a seen-once-drop-forever rule deleted
+        every tool result after the first (upstream's
+        ``test_sanitize_dedup_pass_rearms_constant_llamacpp_id``). An id
+        re-issued AFTER its earlier call was answered is therefore a legitimate
+        new call: row 5258 keeps its tool_calls and its own results instead of
+        being collapsed, and no empty assistant is produced for this shape.
+        The assembly guard stays the backstop for any payload-less assistant
+        that does reach it (``test_guard_drops_payloadless_final_assistant``).
+        """
         out = AIAgent._sanitize_api_messages(self._poisoned_history())
 
         assistants = [m for m in out if m.get("role") == "assistant"]
-        assert len(assistants) == 1
-        surviving_ids = [AIAgent._get_tool_call_id_static(tc)
-                         for tc in assistants[0]["tool_calls"]]
-        assert surviving_ids == ["tool_call_201", "tool_call_202", "tool_call_203"]
+        assert len(assistants) == 2
+        for a in assistants:
+            assert [AIAgent._get_tool_call_id_static(tc) for tc in a["tool_calls"]] == [
+                "tool_call_201", "tool_call_202", "tool_call_203",
+            ]
 
-        # Exactly one tool result per declared call, from the first (A*) turn.
-        tool_msgs = [m for m in out if m.get("role") == "tool"]
-        assert len(tool_msgs) == 3
-        assert {m["content"] for m in tool_msgs} == {"A1", "A2", "A3"}
+        # Each assistant is immediately followed by exactly the 3 results that
+        # answer it, in order: A* pair with 5251, B* with 5258 — positional
+        # pairing, never cross-wired.
+        # Positional (not ``list.index``) lookup: both assistant dicts compare equal.
+        idx_a, idx_b = [i for i, m in enumerate(out) if m.get("role") == "assistant"]
+        assert [m["content"] for m in out[idx_a + 1:idx_a + 4]] == ["A1", "A2", "A3"]
+        assert [m["content"] for m in out[idx_b + 1:idx_b + 4]] == ["B1", "B2", "B3"]
+        assert all(m.get("role") == "tool" for m in out[idx_a + 1:idx_a + 4] + out[idx_b + 1:idx_b + 4])
+        assert len([m for m in out if m.get("role") == "tool"]) == 6
 
         # The user turns (task + interrupted-turn note) are preserved.
         assert out[0] == {"role": "user", "content": "task"}
         assert out[-1]["role"] == "user"
+
+    def test_guard_drops_payloadless_final_assistant(self):
+        """The assembly guard's assistant branch: a payload-less assistant that
+        nothing upstream of it repairs. ``repair_empty_non_final_messages``
+        deliberately skips the FINAL message, so an interrupted turn that left
+        ``{"role": "assistant", "content": ""}`` at the tail (with or without an
+        empty ``tool_calls`` array) would otherwise ship exactly the Moonshot
+        "must not be empty" 400 shape. The guard drops it; the real turns stay.
+        """
+        for tail in (
+            {"role": "assistant", "content": ""},
+            {"role": "assistant", "content": "", "tool_calls": []},
+        ):
+            out = AIAgent._sanitize_api_messages([{"role": "user", "content": "hi"}, tail])
+            assert out == [{"role": "user", "content": "hi"}], out
 
     def test_reasoning_only_assistant_is_preserved(self):
         """A thinking-only assistant carries payload some providers require
