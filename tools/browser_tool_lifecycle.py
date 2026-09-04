@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
-from tools.browser_tool_origin import origin as _bt
+from tools.browser_tool_origin import origin as _bt, origin_module
 from tools import browser_tool_cdp as _cdp
 from tools import browser_tool_cloud as _cloud
 from tools import browser_tool_session as _session
@@ -670,8 +670,9 @@ def _cleanup_single_browser_session(task_id: str) -> None:
 
 def cleanup_all_browsers() -> None:
     """Clean up all active browser sessions (shutdown) and reset cached lookups."""
-    with _bt._cleanup_lock:
-        task_ids = list(_bt._active_sessions.keys())
+    origin = origin_module(2)
+    with origin._cleanup_lock:
+        task_ids = list(origin._active_sessions.keys())
     for task_id in task_ids:
         cleanup_browser(task_id)
 
@@ -691,5 +692,5 @@ def cleanup_all_browsers() -> None:
         ("_chromium_autoinstall_attempted", "_cached_chromium_installed"),
         ("_browser_engine_resolved", "_cached_browser_engine"),
     ):
-        setattr(_bt, flag, False)
-        setattr(_bt, cache, None)
+        setattr(origin, flag, False)
+        setattr(origin, cache, None)
