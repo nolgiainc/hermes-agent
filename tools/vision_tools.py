@@ -1865,6 +1865,34 @@ _VIDEO_MIME_TYPES = {
 _MAX_VIDEO_BASE64_BYTES = 50 * 1024 * 1024  # 50 MB hard cap
 _VIDEO_SIZE_WARN_BYTES = 20 * 1024 * 1024
 
+# Gemini's API rejects requests whose body exceeds ~20 MB, and a base64 data
+# URL inside a ``file`` part travels inline in that body — so a local file
+# sent to Gemini is bounded well below the 50 MB cap above. 19 MB leaves
+# headroom for the prompt and JSON framing, which permits roughly 14 MB of
+# source video after base64's 4/3 expansion.
+_GEMINI_INLINE_MAX_BASE64_BYTES = 19 * 1024 * 1024
+
+
+def _gemini_inline_source_cap_mb() -> float:
+    """Source-video MB that fit under ``_GEMINI_INLINE_MAX_BASE64_BYTES``.
+
+    Read at call time (not import time) so the figure in user-facing errors
+    tracks the cap wherever it is tuned or patched.
+    """
+    return (_GEMINI_INLINE_MAX_BASE64_BYTES // 4 * 3) / (1024 * 1024)
+
+# Gemini samples ~2.8 fps when ``video_metadata.fps`` is omitted (measured
+# through the proxy: 91 video-tokens/s). ``fps: 1`` measured 32 tokens/s — a
+# reproducible ~2.8x saving with no visible loss for "what happens in this
+# clip" questions. Fractional fps is NOT a reliable lever (0.5 cost more
+# than 1; 0.2 differed between identical runs).
+_GEMINI_VIDEO_DEFAULT_FPS = 1
+
+_VIDEO_FETCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "video/*,*/*;q=0.8",
+}
+
 
 def _detect_video_mime_type(video_path: Path) -> Optional[str]:
     """Return a video MIME type based on file extension, or None if unsupported."""
@@ -1878,6 +1906,146 @@ def _video_to_base64_data_url(video_path: Path, mime_type: Optional[str] = None)
     encoded = base64.b64encode(data).decode("ascii")
     mime = mime_type or _VIDEO_MIME_TYPES.get(video_path.suffix.lower(), "video/mp4")
     return f"data:{mime};base64,{encoded}"
+
+
+def _is_gemini_model(model: Optional[str]) -> bool:
+    """True when ``model`` names a Gemini model under any provider prefix.
+
+    Matches ``gemini-3.8-flash``, ``google/gemini-2.5-flash``,
+    ``gemini/gemini-3-flash``, ``vertex_ai/gemini-3.8-flash``, ... (case-
+    insensitive). ``None``/empty means "provider default" and keeps the
+    legacy wire shape.
+    """
+    if not model or not isinstance(model, str):
+        return False
+    return "gemini" in model.lower()
+
+
+def _normalize_video_fps(value: Any) -> Optional[float]:
+    """Coerce a configured ``fps`` into a positive number.
+
+    ``None``, ``0``, negatives, NaN and unparsable junk all mean "omit
+    ``video_metadata.fps`` and let Gemini sample at its own rate". Integral
+    values come back as ``int`` so the wire carries ``{"fps": 1}``.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        fps = float(value)
+    except (TypeError, ValueError):
+        return None
+    if fps != fps or fps <= 0:  # NaN or non-positive
+        return None
+    return int(fps) if fps.is_integer() else fps
+
+
+def _video_part_for_model(
+    model: Optional[str],
+    file_data: str,
+    mime: str,
+    fps: Optional[float] = None,
+    detail: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return the chat-completions content part that carries the video.
+
+    Gemini (LiteLLM's ``gemini/`` and ``vertex_ai/`` routes) only attaches
+    media that arrives as an OpenAI ``file`` part: ``file_data`` is the video
+    (an https URL Google fetches server-side, or a ``data:`` URL that is
+    inlined), ``format`` its MIME type, ``detail`` maps to the per-part
+    ``media_resolution`` on Gemini 3+, and ``video_metadata.fps`` sets the
+    frame-sampling rate. A ``video_url`` part is *silently dropped* by that
+    transformation — the request succeeds with no video attached and the
+    model answers from the text prompt alone.
+
+    Every other provider (vLLM, OpenRouter, Qwen-VL, ...) keeps the
+    ``video_url`` shape it has always received.
+    """
+    if not _is_gemini_model(model):
+        return {"type": "video_url", "video_url": {"url": file_data}}
+    file_part: Dict[str, Any] = {"file_data": file_data, "format": mime}
+    if detail:
+        file_part["detail"] = str(detail).strip().lower()
+    fps_value = _normalize_video_fps(fps)
+    if fps_value is not None:
+        file_part["video_metadata"] = {"fps": fps_value}
+    return {"type": "file", "file": file_part}
+
+
+def _gemini_rejects_sampling_overrides(model: Optional[str]) -> bool:
+    """True for gemini-3.8-flash and later Flash generations (any prefix).
+
+    Those models reject ``temperature``/``top_p`` outright and the proxy
+    strips them, so the tool does not put them on the wire at all. Every
+    other model keeps the configured temperature.
+    """
+    if not _is_gemini_model(model):
+        return False
+    try:
+        from agent.gemini_native_adapter import is_gemini_flash_38_or_later
+    except Exception:
+        return False
+    # Strip any ``<provider>/`` prefix (openrouter/google/, vertex_ai/, ...):
+    # the adapter helper only knows the google/ and gemini/ spellings.
+    return is_gemini_flash_38_or_later(model.rsplit("/", 1)[-1])
+
+
+def _video_mime_from_url(video_url: str) -> Optional[str]:
+    """MIME type from the URL path's extension, or None when unknown."""
+    try:
+        path = urlparse(video_url).path or ""
+    except ValueError:
+        return None
+    return _VIDEO_MIME_TYPES.get(Path(path).suffix.lower())
+
+
+async def _probe_remote_video_mime(video_url: str, timeout: float = 15.0) -> str:
+    """Best-effort MIME type for a remote video that Google will fetch itself.
+
+    A HEAD request validates every redirect/final target against both SSRF and
+    website policies. Its ``video/*`` Content-Type is used when available,
+    otherwise the URL extension wins. Falls back to ``video/mp4``: Gemini
+    requires *some* MIME type on a ``fileData`` part and treats mp4 as the
+    generic container — it is also what works for YouTube watch URLs, which
+    report ``text/html``.
+    """
+    mime = _video_mime_from_url(video_url)
+    try:
+        from tools.url_safety import (
+            async_is_safe_url,
+            create_ssrf_safe_async_client,
+            redirect_target_from_response,
+        )
+
+        async def _redirect_guard(response):
+            targets = [str(response.url)]
+            redirect_url = redirect_target_from_response(response)
+            if redirect_url:
+                targets.append(redirect_url)
+            for target in targets:
+                if not await async_is_safe_url(target):
+                    raise PermissionError(
+                        f"Blocked redirect to private/internal address: {target}"
+                    )
+                blocked = check_website_access(target)
+                if blocked:
+                    raise PermissionError(blocked["message"])
+
+        async with create_ssrf_safe_async_client(
+            timeout=timeout,
+            follow_redirects=True,
+            event_hooks={"response": [_redirect_guard]},
+        ) as client:
+            response = await client.head(video_url, headers=dict(_VIDEO_FETCH_HEADERS))
+        content_type = (
+            (response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+        )
+        if content_type.startswith("video/"):
+            return content_type
+    except PermissionError:
+        raise
+    except Exception as e:  # MIME detection is advisory; security checks are not
+        logger.debug("Video MIME probe failed for %s: %s", video_url[:80], e)
+    return mime or "video/mp4"
 
 
 async def _download_video(video_url: str, destination: Path, max_retries: int = 3) -> Path:
@@ -1908,13 +2076,7 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
                 follow_redirects=True,
                 event_hooks={"response": [_ssrf_redirect_guard]},
             ) as client:
-                response = await client.get(
-                    video_url,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                        "Accept": "video/*,*/*;q=0.8",
-                    },
-                )
+                response = await client.get(video_url, headers=dict(_VIDEO_FETCH_HEADERS))
                 response.raise_for_status()
 
                 cl = response.headers.get("content-length")
@@ -1959,21 +2121,36 @@ async def video_analyze_tool(
     video_url: str,
     user_prompt: str,
     model: str = None,
+    fps: Optional[float] = _GEMINI_VIDEO_DEFAULT_FPS,
+    detail: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> str:
-    """Analyze a video via multimodal LLM. Returns JSON {success, analysis}."""
+    """Analyze a video via multimodal LLM. Returns JSON {success, analysis}.
+
+    ``fps`` / ``detail`` only affect Gemini models (see
+    ``_video_part_for_model``): ``fps`` is sent as ``video_metadata.fps``
+    (``None``/``0`` omits it so Gemini samples at its own rate) and ``detail``
+    as the per-part ``media_resolution``. ``provider`` is an explicit
+    auxiliary provider override (``auxiliary.video.provider``).
+    """
     if not isinstance(user_prompt, str):
         user_prompt = str(user_prompt) if user_prompt is not None else ""
+    gemini = _is_gemini_model(model)
     debug_call_data = {
         "parameters": {
             "video_url": video_url,
             "user_prompt": user_prompt[:200] + "..." if len(user_prompt) > 200 else user_prompt,
             "model": model,
+            "fps": fps,
+            "detail": detail,
         },
         "error": None,
         "success": False,
         "analysis_length": 0,
         "model_used": model,
         "video_size_bytes": 0,
+        "video_part_type": "file" if gemini else "video_url",
+        "video_passthrough": False,
     }
 
     temp_video_path = None
@@ -1993,6 +2170,10 @@ async def video_analyze_tool(
             resolved_url = resolved_url[len("file://"):]
         local_path = Path(os.path.expanduser(resolved_url))
 
+        video_file_data: Optional[str] = None  # what goes on the wire
+        detected_mime: Optional[str] = None
+        video_size_bytes = 0
+
         if local_path.is_file():
             from agent.file_safety import raise_if_read_blocked
             raise_if_read_blocked(str(local_path))
@@ -2003,40 +2184,72 @@ async def video_analyze_tool(
             blocked = check_website_access(video_url)
             if blocked:
                 raise PermissionError(blocked["message"])
-            temp_dir = get_hermes_dir("cache/video", "temp_video_files")
-            temp_video_path = temp_dir / f"temp_video_{uuid.uuid4()}.mp4"
-            await _download_video(video_url, temp_video_path)
-            should_cleanup = True
+            if gemini and video_url.lower().startswith("https://"):
+                # Gemini fetches an https ``file_data`` URL server-side, so
+                # there is nothing to download, base64-encode or size-cap
+                # here. The SSRF and website-policy checks above still gate
+                # the URL exactly as they gate a download.
+                detected_mime = await _probe_remote_video_mime(video_url)
+                video_file_data = video_url
+                debug_call_data["video_passthrough"] = True
+                logger.info("Passing video URL through for Gemini to fetch (%s)", detected_mime)
+            else:
+                temp_dir = get_hermes_dir("cache/video", "temp_video_files")
+                temp_video_path = temp_dir / f"temp_video_{uuid.uuid4()}.mp4"
+                await _download_video(video_url, temp_video_path)
+                should_cleanup = True
         else:
             raise ValueError(
                 "Invalid video source. Provide an HTTP/HTTPS URL or a valid local file path."
             )
 
-        video_size_bytes = temp_video_path.stat().st_size
-        video_size_mb = video_size_bytes / (1024 * 1024)
-        logger.info("Video ready (%.1f MB)", video_size_mb)
+        if video_file_data is None:
+            video_size_bytes = temp_video_path.stat().st_size
+            video_size_mb = video_size_bytes / (1024 * 1024)
+            logger.info("Video ready (%.1f MB)", video_size_mb)
 
-        detected_mime = _detect_video_mime_type(temp_video_path)
-        if not detected_mime:
-            raise ValueError(
-                f"Unsupported video format: '{temp_video_path.suffix}'. "
-                f"Supported: {', '.join(sorted(_VIDEO_MIME_TYPES.keys()))}"
-            )
+            detected_mime = _detect_video_mime_type(temp_video_path)
+            if not detected_mime:
+                raise ValueError(
+                    f"Unsupported video format: '{temp_video_path.suffix}'. "
+                    f"Supported: {', '.join(sorted(_VIDEO_MIME_TYPES.keys()))}"
+                )
 
-        if video_size_bytes > _VIDEO_SIZE_WARN_BYTES:
-            logger.warning("Video is %.1f MB — may be slow or rejected", video_size_mb)
+            if video_size_bytes > _VIDEO_SIZE_WARN_BYTES:
+                logger.warning("Video is %.1f MB — may be slow or rejected", video_size_mb)
 
-        video_data_url = _video_to_base64_data_url(temp_video_path, mime_type=detected_mime)
-        data_size_mb = len(video_data_url) / (1024 * 1024)
+            video_data_url = _video_to_base64_data_url(temp_video_path, mime_type=detected_mime)
+            data_size_mb = len(video_data_url) / (1024 * 1024)
 
-        if len(video_data_url) > _MAX_VIDEO_BASE64_BYTES:
-            raise ValueError(
-                f"Video too large for API: base64 payload is {data_size_mb:.1f} MB "
-                f"(limit {_MAX_VIDEO_BASE64_BYTES / (1024 * 1024):.0f} MB). "
-                f"Compress or trim the video and retry."
-            )
+            if gemini and len(video_data_url) > _GEMINI_INLINE_MAX_BASE64_BYTES:
+                raise ValueError(
+                    f"Video too large to inline for Gemini: base64 payload is "
+                    f"{data_size_mb:.1f} MB (limit "
+                    f"{_GEMINI_INLINE_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB). "
+                    f"Gemini accepts roughly {_gemini_inline_source_cap_mb():.0f} MB "
+                    "of source video after base64 expansion; pass an https URL to let "
+                    "Google fetch it, or compress/trim the video and retry."
+                )
+            if len(video_data_url) > _MAX_VIDEO_BASE64_BYTES:
+                raise ValueError(
+                    f"Video too large for API: base64 payload is {data_size_mb:.1f} MB "
+                    f"(limit {_MAX_VIDEO_BASE64_BYTES / (1024 * 1024):.0f} MB). "
+                    f"Compress or trim the video and retry."
+                )
+            video_file_data = video_data_url
 
         debug_call_data["video_size_bytes"] = video_size_bytes
+
+        fps_value = _normalize_video_fps(fps)
+        if gemini and fps_value is not None and fps_value < 1:
+            logger.warning(
+                "auxiliary.video.fps=%s is fractional; measured non-reproducible "
+                "through Gemini — use 1 for a predictable saving",
+                fps_value,
+            )
+        video_part = _video_part_for_model(
+            model, video_file_data, detected_mime, fps=fps_value, detail=detail,
+        )
 
         messages = [
             {
@@ -2046,12 +2259,7 @@ async def video_analyze_tool(
                         "type": "text",
                         "text": user_prompt,
                     },
-                    {
-                        "type": "video_url",
-                        "video_url": {
-                            "url": video_data_url,
-                        },
-                    },
+                    video_part,
                 ],
             }
         ]
@@ -2071,12 +2279,19 @@ async def video_analyze_tool(
         call_kwargs = {
             "task": "vision",
             "messages": messages,
-            "temperature": vision_temperature,
             "max_tokens": 4000,
             "timeout": vision_timeout,
         }
+        if _gemini_rejects_sampling_overrides(model):
+            # gemini-3.8-flash+ rejects temperature/top_p and the proxy strips
+            # them anyway — keep them off the wire entirely.
+            logger.debug("%s rejects sampling overrides; not sending temperature", model)
+        else:
+            call_kwargs["temperature"] = vision_temperature
         if model:
             call_kwargs["model"] = model
+        if provider:
+            call_kwargs["provider"] = provider
 
         _load_auxiliary_client()
         response = await async_call_llm(**call_kwargs)
@@ -2123,7 +2338,7 @@ async def video_analyze_tool(
             analysis = (
                 f"The model does not support video analysis or the request was "
                 f"rejected. Ensure you're using a video-capable model "
-                f"(e.g. google/gemini-2.5-flash). Error: {e}"
+                f"(e.g. gemini-3.8-flash, set via auxiliary.video.model). Error: {e}"
             )
         elif any(hint in err_str for hint in (
             "too large", "payload", "413", "content_too_large",
@@ -2131,7 +2346,8 @@ async def video_analyze_tool(
         )):
             analysis = (
                 "The video is too large for the API. Try compressing or trimming "
-                f"the video (max ~50 MB). Error: {e}"
+                f"the video (max ~50 MB; Gemini accepts roughly {_gemini_inline_source_cap_mb():.0f} MB "
+                f"of local source video after base64 expansion, or an https URL). Error: {e}"
             )
         else:
             analysis = (
@@ -2188,6 +2404,48 @@ VIDEO_ANALYZE_SCHEMA = {
 }
 
 
+def _resolve_video_settings() -> Dict[str, Any]:
+    """Resolve ``video_analyze`` settings from config.yaml ``auxiliary.video``.
+
+    ``model`` falls back to ``auxiliary.vision.model`` and then to the legacy
+    ``AUXILIARY_VIDEO_MODEL`` / ``AUXILIARY_VISION_MODEL`` env vars.
+    ``provider`` is honored only when set on ``auxiliary.video`` (otherwise
+    the vision task's provider applies). ``fps`` defaults to
+    ``_GEMINI_VIDEO_DEFAULT_FPS``; an explicit ``0``/``null`` omits it.
+    ``detail`` passes through when set. ``fps``/``detail`` only matter for
+    Gemini models.
+    """
+    model = None
+    provider = None
+    fps: Any = _GEMINI_VIDEO_DEFAULT_FPS
+    detail = None
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        _cfg = load_config()
+        _vmodel = cfg_get(_cfg, "auxiliary", "video", "model") or cfg_get(_cfg, "auxiliary", "vision", "model")
+        if _vmodel:
+            model = str(_vmodel).strip() or None
+        _vprovider = cfg_get(_cfg, "auxiliary", "video", "provider")
+        if _vprovider:
+            provider = str(_vprovider).strip() or None
+        fps = cfg_get(_cfg, "auxiliary", "video", "fps", default=_GEMINI_VIDEO_DEFAULT_FPS)
+        _detail = cfg_get(_cfg, "auxiliary", "video", "detail")
+        if _detail:
+            detail = str(_detail).strip().lower() or None
+    except Exception:
+        pass
+    if not model:
+        model = os.getenv("AUXILIARY_VIDEO_MODEL", "").strip() or os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
+    if provider and provider.lower() == "auto":
+        provider = None
+    return {
+        "model": model,
+        "provider": provider,
+        "fps": _normalize_video_fps(fps),
+        "detail": detail,
+    }
+
+
 def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
     video_url = args.get("video_url", "")
     question = args.get("question", "")
@@ -2196,20 +2454,17 @@ def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
         "including visual content, motion, audio cues, text overlays, and scene "
         f"transitions. Then answer the following question:\n\n{question}"
     )
-    # Prefer config.yaml auxiliary.video.model (falling back to vision);
-    # env vars are a legacy override.
-    model = None
-    try:
-        from hermes_cli.config import cfg_get, load_config
-        _cfg = load_config()
-        _vmodel = cfg_get(_cfg, "auxiliary", "video", "model") or cfg_get(_cfg, "auxiliary", "vision", "model")
-        if _vmodel:
-            model = str(_vmodel).strip() or None
-    except Exception:
-        pass
-    if not model:
-        model = os.getenv("AUXILIARY_VIDEO_MODEL", "").strip() or os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return video_analyze_tool(video_url, full_prompt, model)
+    # Prefer config.yaml auxiliary.video.* (model falling back to vision);
+    # env vars are a legacy override for the model.
+    settings = _resolve_video_settings()
+    return video_analyze_tool(
+        video_url,
+        full_prompt,
+        settings["model"],
+        fps=settings["fps"],
+        detail=settings["detail"],
+        provider=settings["provider"],
+    )
 
 
 registry.register(

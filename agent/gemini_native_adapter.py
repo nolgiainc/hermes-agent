@@ -301,6 +301,33 @@ def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
                     }
                 }
             )
+        elif ptype == "file":
+            file_part = item.get("file") or {}
+            file_data = file_part.get("file_data")
+            mime = file_part.get("format")
+            if not isinstance(file_data, str) or not isinstance(mime, str):
+                continue
+            part: Dict[str, Any]
+            if file_data.startswith("data:"):
+                try:
+                    _, encoded = file_data.split(",", 1)
+                    base64.b64decode(encoded, validate=True)
+                except Exception:
+                    continue
+                part = {"inlineData": {"mimeType": mime, "data": encoded}}
+            elif file_data.startswith("https://"):
+                part = {"fileData": {"mimeType": mime, "fileUri": file_data}}
+            else:
+                continue
+            video_metadata = file_part.get("video_metadata")
+            if isinstance(video_metadata, dict):
+                part["videoMetadata"] = video_metadata
+            detail = file_part.get("detail")
+            if isinstance(detail, str) and detail:
+                part["mediaResolution"] = {
+                    "level": f"MEDIA_RESOLUTION_{detail.strip().upper()}"
+                }
+            parts.append(part)
     return parts
 
 

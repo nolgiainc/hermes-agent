@@ -869,6 +869,12 @@ DEFAULT_CONFIG = {
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
         },
+        "video": {
+            "provider": "",       # empty = auxiliary.vision provider
+            "model": "",          # empty = auxiliary.vision model
+            "fps": 1,             # Gemini frame sampling; 0/null = provider default
+            "detail": "",         # Gemini 3+ media resolution
+        },
         "web_extract": {
             "provider": "auto",
             "model": "",
