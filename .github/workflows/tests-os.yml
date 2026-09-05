@@ -147,9 +147,14 @@ jobs:
           # zero-tests guard above ran on the full list, so a renamed marker
           # still trips it; this filter only removes the named family.
           if [ "${FORK_SKIP_DESKTOP_UPDATER:-1}" = "1" ]; then
-            grep -v 'test_desktop_update_windows_' "$LIST" > "$LIST.fork" || true
+            # Same policy for the Windows installer hand-off tests
+            # (tests/test_install_ps1_*.py spawn scripts/install.ps1 with a
+            # 45 s PowerShell budget the shared runner exceeded on two
+            # consecutive attempts on 2026-09-05): the fleet installs from
+            # the container image, never from install.ps1.
+            grep -vE 'test_desktop_update_windows_|test_install_ps1_' "$LIST" > "$LIST.fork" || true
             mv "$LIST.fork" "$LIST"
-            echo "fork policy: desktop-update hand-off tests removed from the selected list"
+            echo "fork policy: desktop-update and install.ps1 hand-off tests removed from the selected list"
           fi
           # shellcheck disable=SC2046
           set -- $(cat "$LIST")
