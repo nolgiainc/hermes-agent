@@ -137,6 +137,20 @@ jobs:
           # Deliberately NOT `mapfile`: that is a bash 4 builtin and the macOS
           # runner's /bin/bash is 3.2. Word-splitting is safe here because the
           # helper emits repo-relative test paths, which contain no spaces.
+          # nolgiainc fork: drop the desktop-update hand-off tests from the
+          # selected list itself. ``--ignore-glob`` (below) does NOT apply to
+          # paths pytest receives as explicit arguments (Session._collectfile
+          # skips the ignore hooks for initial paths), and run_tests.sh hands
+          # every file to pytest as an explicit argument, so the deselect
+          # never took effect: on 2026-09-05 all three updater files still ran
+          # and failed at 99% of the lane after the flag was added. The
+          # zero-tests guard above ran on the full list, so a renamed marker
+          # still trips it; this filter only removes the named family.
+          if [ "${FORK_SKIP_DESKTOP_UPDATER:-1}" = "1" ]; then
+            grep -v 'test_desktop_update_windows_' "$LIST" > "$LIST.fork" || true
+            mv "$LIST.fork" "$LIST"
+            echo "fork policy: desktop-update hand-off tests removed from the selected list"
+          fi
           # shellcheck disable=SC2046
           set -- $(cat "$LIST")
           echo "selected $# file(s) for ${{ matrix.marker }}:"
