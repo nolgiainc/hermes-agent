@@ -1914,7 +1914,10 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
         path_key = str(config_path)
         cached = _RAW_CONFIG_CACHE.get(path_key)
-        if cached is not None and cached[:2] == cache_key:
+        # A same-size rewrite can retain the same mtime on coarse filesystems. Treat a
+        # freshly stamped file as racily clean and re-read it until the timestamp settles.
+        mtime_settled = time.time_ns() - st.st_mtime_ns > 2_000_000_000
+        if cached is not None and cached[:2] == cache_key and mtime_settled:
             return copy.deepcopy(cached[2]) if want_deepcopy else cached[2]
 
         try:
