@@ -6136,8 +6136,8 @@ def _build_call_kwargs(
 ) -> dict:
     """Build kwargs for .chat.completions.create() with model/provider adjustments."""
     kwargs: Dict[str, Any] = {"model": model, "messages": messages, "timeout": timeout}
-    # Per-model fixed/omitted temperature, then Opus 4.7+ sampling bans: it rejects any
-    # non-default temperature/top_p/top_k, so drop silently rather than 400 when the aux model flips.
+    # Per-model fixed/omitted temperature, then sampling bans for models that
+    # reject overrides. Drop silently rather than 400 when the aux model flips.
     fixed_temperature = _fixed_temperature_for_model(model, base_url)
     if fixed_temperature is OMIT_TEMPERATURE:
         temperature = None  # strip — let server choose
@@ -6145,7 +6145,9 @@ def _build_call_kwargs(
         temperature = fixed_temperature
     if temperature is not None:
         from agent.anthropic_adapter import _forbids_sampling_params
-        if not _forbids_sampling_params(model):
+        from agent.gemini_native_adapter import is_gemini_flash_38_or_later
+
+        if not (_forbids_sampling_params(model) or is_gemini_flash_38_or_later(model)):
             kwargs["temperature"] = temperature
     effective_base = base_url or (_current_custom_base_url() if provider == "custom" else "")
     provider_norm = str(provider or "").strip().lower()
@@ -6158,7 +6160,14 @@ def _build_call_kwargs(
     # ``extra_body.reasoning`` fallback.
     projection = _project_provider_profile(provider, provider_norm, model, effective_base, reasoning_config)
     kwargs.update(projection.top_level)
-    if merged_extra := _merge_aux_extra_body(extra_body, projection, reasoning_config, provider_norm):
+    merged_extra = _merge_aux_extra_body(extra_body, projection, reasoning_config, provider_norm)
+    from agent.gemini_native_adapter import is_gemini_flash_38_or_later
+
+    if is_gemini_flash_38_or_later(model):
+        for key in ("temperature", "top_p", "top_k"):
+            kwargs.pop(key, None)
+            merged_extra.pop(key, None)
+    if merged_extra:
         kwargs["extra_body"] = merged_extra
     # Anthropic Messages adapters take reasoning via a private kwarg that plain OpenAI SDK clients
     # would reject; Portal Claude is dual-wire, so include it only when the catalog id selects

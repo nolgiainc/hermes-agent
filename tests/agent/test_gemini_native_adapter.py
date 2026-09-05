@@ -718,6 +718,8 @@ def test_file_parts_translate_to_native_gemini_video_parts():
     [
         ("gemini-3.8-flash", True),
         ("google/gemini-3.8-flash", True),
+        ("google/gemini-3.8-flash:nitro", True),
+        ("google/gemini-3.8-flash:floor", True),
         ("models/gemini-3.8-flash", True),
         ("gemini-3.8-flash-lite", True),
         ("gemini-3.9-flash", True),
