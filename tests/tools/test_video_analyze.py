@@ -220,6 +220,63 @@ class TestVideoAnalyzeTool:
         assert content[1]["type"] == "video_url"
         assert "video_url" in content[1]
         assert content[1]["video_url"]["url"].startswith("data:video/mp4;base64,")
+        # No hardcoded output cap — the aux client omits max_tokens so the
+        # provider uses its full output budget (max-tokens-knob policy).
+        assert "max_tokens" not in captured_kwargs
+
+    def test_non_local_backend_reads_video_from_terminal_backend(self, tmp_path, monkeypatch):
+        """Non-local terminal backends must not read local host video paths.
+
+        The read routes through the shared media resolver
+        (tools.image_source, ``permitted=("video",)``) which exec-reads the
+        bytes inside the sandbox — so the analyzed video is the container's
+        file, never the host's.
+        """
+        host_video = tmp_path / "clip.mp4"
+        host_video.write_bytes(b"HOST-VIDEO")
+        remote_bytes = b"REMOTE-SANDBOX-VIDEO"
+        remote_b64 = base64.b64encode(remote_bytes).decode("ascii")
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+        import tools.image_source as isrc
+        import tools.terminal_tool as tt
+
+        env_lookups = []
+
+        def fake_get_active(task_id):
+            env_lookups.append(task_id)
+            return SimpleNamespace(
+                execute=lambda cmd, **kw: {"returncode": 0, "output": remote_b64}
+            )
+
+        monkeypatch.setattr(tt, "ensure_task_env", lambda *a, **k: None)
+        monkeypatch.setattr(isrc, "_get_active_env", fake_get_active)
+
+        captured_kwargs = {}
+
+        async def capture_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            mock_response = MagicMock()
+            mock_response.choices = [MagicMock()]
+            mock_response.choices[0].message.content = "sandbox video"
+            return mock_response
+
+        with (
+            patch("tools.vision_tools.async_call_llm", side_effect=capture_llm),
+            patch("tools.vision_tools.extract_content_or_reasoning", return_value="sandbox video"),
+        ):
+            result = self._run(
+                video_analyze_tool(str(host_video), "Describe this", task_id="task-123")
+            )
+
+        data = json.loads(result)
+        assert data["success"] is True
+        assert env_lookups == ["task-123"]
+        video_url = captured_kwargs["messages"][0]["content"][1]["video_url"]["url"]
+        uploaded_bytes = base64.b64decode(video_url.split(",", 1)[1])
+        assert uploaded_bytes == remote_bytes
+        assert uploaded_bytes != host_video.read_bytes()
 
 
 # ---------------------------------------------------------------------------
@@ -430,8 +487,37 @@ class TestResolveDownloadedVideoMime:
         assert _resolve_downloaded_video_mime(url, content_type) == expected
 
 
+class _FakeStreamResponse:
+    """The ``async with client.stream("GET", ...) as response`` object: the body arrives as one chunk."""
+
+    def __init__(self, body, headers, url, error=None):
+        self.headers = headers
+        self.url = url
+        self.status_code = 200
+        self._body = body
+        self._error = error
+
+    async def __aenter__(self):
+        if self._error:
+            raise self._error
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        pass
+
+    async def aiter_bytes(self):
+        yield self._body
+
+
 class _FakeGetClient:
-    """Stands in for the SSRF-safe httpx client in ``_download_video``."""
+    """Stands in for the SSRF-safe httpx client in ``_download_video``.
+
+    The download streams the response (``client.stream`` + ``aiter_bytes``) so the
+    chunk-by-chunk size cap applies; transport errors surface when the stream is entered.
+    """
 
     def __init__(self, body=b"", headers=None, error=None, response_url=None, fail_times=0):
         self._body = body
@@ -447,17 +533,12 @@ class _FakeGetClient:
     async def __aexit__(self, *exc):
         return False
 
-    async def get(self, url, headers=None):
+    def stream(self, method, url, headers=None):
         self.calls.append((url, headers))
+        error = None
         if self._error and (self._fail_times == 0 or len(self.calls) <= self._fail_times):
-            raise self._error
-        return SimpleNamespace(
-            headers=self._headers,
-            url=self._response_url or url,
-            content=self._body,
-            status_code=200,
-            raise_for_status=lambda: None,
-        )
+            error = self._error
+        return _FakeStreamResponse(self._body, self._headers, self._response_url or url, error=error)
 
 
 class TestDownloadVideo:
@@ -984,7 +1065,8 @@ class TestHandleVideoAnalyzePassesSettings:
         assert args[0] == _HTTPS_MP4
         assert "what?" in args[1]
         assert args[2] == "gemini-3.8-flash"
-        assert kwargs == {"fps": None, "detail": "low", "provider": "gemini"}
+        # task_id rides along for terminal-backend reads (upstream's video_analyze_tool signature).
+        assert kwargs == {"fps": None, "detail": "low", "provider": "gemini", "task_id": None}
 
 
 # ---------------------------------------------------------------------------

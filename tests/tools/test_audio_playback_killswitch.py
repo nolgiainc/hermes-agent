@@ -76,6 +76,7 @@ def test_play_beep_noop_when_disabled(monkeypatch):
 def test_stream_tts_display_only_when_disabled(monkeypatch):
     """stream_tts_to_speaker must not synthesize or play — display only."""
     import tools.tts_tool as tts_tool
+    import tools.tts_tool_speaker as tts_tool_speaker
     import tools.voice_mode as voice_mode
 
     monkeypatch.setenv("HERMES_DISABLE_AUDIO_PLAYBACK", "1")
@@ -89,7 +90,7 @@ def test_stream_tts_display_only_when_disabled(monkeypatch):
 
     with patch.object(tts_tool, "text_to_speech_tool") as mock_tts, \
          patch.object(voice_mode, "play_audio_file") as mock_play:
-        tts_tool.stream_tts_to_speaker(
+        tts_tool_speaker.stream_tts_to_speaker(
             text_q, stop_evt, done_evt,
             display_callback=lambda t: spoken.append(t),
         )

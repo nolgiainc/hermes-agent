@@ -29,10 +29,10 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from tools.vision_tools import (
-    _EMBED_TARGET_BYTES,
     _VISION_DEFAULT_PROBE_TIMEOUT,
     _VISION_DEFAULT_TIMEOUT,
     _VISION_SEND_MAX_DIMENSION,
+    _VISION_SEND_TARGET_BYTES,
     _reset_vision_timeout_streak,
     _resolve_vision_max_dimension,
     _resolve_vision_probe_timeout,
@@ -136,7 +136,7 @@ class TestPreflightDownscale:
         assert llm.await_count == 1  # first attempt, no size-error retry
         sent = _decode_sent_image(llm)
         assert max(sent.size) <= _VISION_SEND_MAX_DIMENSION
-        assert len(_sent_url(llm)) <= _EMBED_TARGET_BYTES
+        assert len(_sent_url(llm)) <= _VISION_SEND_TARGET_BYTES
 
     @pytest.mark.asyncio
     async def test_downscale_preserves_aspect_ratio(self):
