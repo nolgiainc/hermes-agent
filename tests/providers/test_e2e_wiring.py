@@ -85,6 +85,45 @@ class TestNvidiaProfileWiring:
         assert msgs[2]["tool_name"] == "terminal"
 
 
+class TestGeminiStrictFlashProfileWiring:
+    @pytest.mark.parametrize(
+        ("provider", "model"),
+        [
+            ("vertex", "google/gemini-3.8-flash"),
+            ("gemini", "gemini-3.8-flash"),
+            ("openrouter", "google/gemini-3.8-flash"),
+        ],
+    )
+    def test_strict_flash_strips_sampling_overrides(
+        self, transport, provider, model
+    ):
+        profile = get_provider_profile(provider)
+        kwargs = transport.build_kwargs(
+            model=model,
+            messages=_msgs(),
+            provider_profile=profile,
+            temperature=0.7,
+            request_overrides={"top_p": 0.9, "top_k": 40},
+        )
+
+        assert "temperature" not in kwargs
+        assert "top_p" not in kwargs
+        assert "top_k" not in kwargs
+
+    def test_earlier_flash_keeps_sampling_overrides(self, transport):
+        profile = get_provider_profile("vertex")
+        kwargs = transport.build_kwargs(
+            model="google/gemini-3.6-flash",
+            messages=_msgs(),
+            provider_profile=profile,
+            temperature=0.7,
+            request_overrides={"top_p": 0.9},
+        )
+
+        assert kwargs["temperature"] == 0.7
+        assert kwargs["top_p"] == 0.9
+
+
 class TestDeepSeekProfileWiring:
     def test_deepseek_no_forced_max_tokens(self, transport):
         profile = get_provider_profile("deepseek")

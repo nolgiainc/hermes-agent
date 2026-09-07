@@ -112,6 +112,7 @@ def is_gemini_flash_38_or_later(model: str) -> bool:
     name = bare_gemini_model_id(model).lower()
     if name.startswith("models/"):
         name = name[len("models/"):]
+    name = name.split(":", 1)[0]
     match = _GEMINI_FLASH_GENERATION_RE.match(name)
     if not match:
         return False
