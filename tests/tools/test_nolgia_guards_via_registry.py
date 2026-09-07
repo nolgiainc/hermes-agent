@@ -1,11 +1,18 @@
-"""nolgia-agent#228 at the model-facing boundary: the REGISTERED tools.
+"""nolgiainc/nolgia-agent#228 at the model-facing boundary: the REGISTERED tools.
 
-The unit-level pins live in ``test_terminal_binary_first_token_guard.py`` and
-``test_nolgia_sandbox_env_grant.py``. This module drives the same two shapes through
-``tools.registry.registry.dispatch`` — the registered ``terminal`` handler with a compiled
-``nolgia`` binary as the first token, and the registered ``execute_code`` handler with a real
-local kernel reading the config-granted environment — so the contract the model sees is
-exercised end to end, not only its parts.
+Prod cust-2774ee97 (2026-09-06) asked a customer to paste a PAT. Two runtime shapes, each pinned
+through ``tools.registry.registry.dispatch`` so the contract the model sees is what is asserted:
+
+1. ``terminal`` with the compiled ``nolgia`` binary as the first token failed with
+   ``Failed to execute command: open: embedded null character in path`` — the gateway lifecycle
+   guard walked into the ELF as a "referenced script", the remote-read fallback handed back its
+   decoded bytes, and a NUL-bearing path token crashed ``os.open`` past an ``OSError``-only
+   handler. The registered tool must run such a command and still block a real lifecycle script.
+2. ``execute_code`` scrubs the child env to an allowlist, so sandbox-spawned ``nolgia`` calls ran
+   anonymous (401). The grant is ordinary operator configuration — ``terminal.env_passthrough:
+   [NOLGIA_TOKEN, NOLGIA_API_URL]``, seeded by the nolgia-agent chart — and the registered tool
+   must show a real child exactly those two names (run-scoped token substituted, NOL-413) with
+   the grant, and neither without it.
 """
 
 from __future__ import annotations
@@ -23,6 +30,9 @@ from gateway.session_context import clear_session_vars, reset_session_vars, set_
 from tools.code_kernel import shutdown_all_kernels
 from tools.registry import registry
 
+# ELF magic + header padding, then machine-code-shaped bytes that tokenize into a NUL-bearing
+# absolute path and a literal lifecycle phrase. Neither may be scanned: a binary the user executes
+# is not a referenced *shell script*.
 ELF_BYTES = (
     b"\x7fELF\x02\x01\x01\x00"
     + bytes(64)
@@ -30,9 +40,59 @@ ELF_BYTES = (
     + b"\x90" * 4096
 )
 
+# What the nolgia-agent chart seeds on an unattended platform pod: the grant plus approvals off
+# (the pod mirrors HERMES_YOLO_MODE=1 in config so headless sessions never wait on a prompt).
+GRANTED_CONFIG = """\
+terminal:
+  env_passthrough:
+    - NOLGIA_TOKEN
+    - NOLGIA_API_URL
+approvals:
+  mode: "off"
+code_execution:
+  mode: strict
+  timeout: 30
+"""
+
+# The same pod before the chart carried the grant (the #228 failure mode).
+UNGRANTED_CONFIG = """\
+approvals:
+  mode: "off"
+code_execution:
+  mode: strict
+  timeout: 30
+"""
+
+SANDBOX_PROBE = (
+    "import json, os\n"
+    "print(json.dumps({name: os.environ.get(name) for name in (\n"
+    "    'NOLGIA_TOKEN', 'NOLGIA_API_URL', 'OPENAI_API_KEY', 'API_SERVER_KEY')}))"
+)
+
+
+@pytest.fixture(autouse=True)
+def fresh_sandbox_state():
+    shutdown_all_kernels()
+    env_passthrough._config_passthrough = None
+    env_passthrough.clear_env_passthrough()
+    config_module._RAW_CONFIG_CACHE.clear()
+    reset_session_vars()
+    yield
+    shutdown_all_kernels()
+    env_passthrough._config_passthrough = None
+    env_passthrough.clear_env_passthrough()
+    config_module._RAW_CONFIG_CACHE.clear()
+    reset_session_vars()
+
+
+# --- terminal ---------------------------------------------------------------------------------
+
 
 @pytest.fixture
 def terminal_env(tmp_path, monkeypatch):
+    """Registered terminal tool inside a supervised gateway, on a fake local backend whose
+    ``head -c`` read (the guard's remote fallback) returns the binary's decoded bytes — exactly
+    what the fallback returned before the upstream hardening."""
     binary = tmp_path / "bin" / "nolgia"
     binary.parent.mkdir()
     binary.write_bytes(ELF_BYTES)
@@ -74,12 +134,22 @@ def terminal_env(tmp_path, monkeypatch):
     return binary, fake_env
 
 
-def test_registered_terminal_runs_binary_first_token(terminal_env):
+@pytest.mark.parametrize(
+    "shape",
+    ["elf-first-token", "nul-in-path-token"],
+)
+def test_registered_terminal_runs_binary_shaped_commands(terminal_env, shape):
+    """The incident command (a 12 MB ELF as the first token) and its residue (a NUL-bearing
+    path token, how the recursion re-tokenized machine code) both reach the backend."""
     binary, fake_env = terminal_env
-    command = f"{binary} skills show nolgia-video-prompting"
+    command = (
+        f"{binary} skills show nolgia-video-prompting"
+        if shape == "elf-first-token"
+        else "bash ./run\x00me.sh"
+    )
 
     result = json.loads(
-        registry.dispatch("terminal", {"command": command}, task_id="binary-first-token")
+        registry.dispatch("terminal", {"command": command}, task_id=f"binary-{shape}")
     )
 
     assert result == {
@@ -91,6 +161,8 @@ def test_registered_terminal_runs_binary_first_token(terminal_env):
 
 
 def test_registered_terminal_still_blocks_lifecycle_script(terminal_env):
+    """Skipping binaries must not blunt the guard: a wrapper script that restarts the gateway,
+    sitting next to the binary, is still blocked before the backend sees it."""
     binary, fake_env = terminal_env
     wrapper = binary.parent / "restart.sh"
     wrapper.write_text("#!/bin/bash\nhermes gateway restart\n", encoding="utf-8")
@@ -107,80 +179,56 @@ def test_registered_terminal_still_blocks_lifecycle_script(terminal_env):
     assert fake_env.calls == []
 
 
-# --- execute_code -------------------------------------------------------------------------
+# --- execute_code -----------------------------------------------------------------------------
 
 
-# What the nolgia-agent chart seeds on an unattended platform pod: the grant plus approvals off
-# (the pod mirrors HERMES_YOLO_MODE=1 in config so headless sessions never wait on a prompt).
-SEEDED_CONFIG = """\
-terminal:
-  env_passthrough:
-    - NOLGIA_TOKEN
-    - NOLGIA_API_URL
-approvals:
-  mode: "off"
-code_execution:
-  mode: strict
-  timeout: 30
-"""
-
-
-@pytest.fixture(autouse=True)
-def fresh_sandbox_state():
-    shutdown_all_kernels()
-    env_passthrough._config_passthrough = None
-    env_passthrough.clear_env_passthrough()
-    config_module._RAW_CONFIG_CACHE.clear()
-    reset_session_vars()
-    yield
-    shutdown_all_kernels()
-    env_passthrough._config_passthrough = None
-    env_passthrough.clear_env_passthrough()
-    config_module._RAW_CONFIG_CACHE.clear()
-    reset_session_vars()
-
-
-def test_registered_execute_code_observes_only_config_granted_nolgia_env(
-    tmp_path, monkeypatch
-):
+def _pod(tmp_path, monkeypatch, config_text: str) -> None:
+    """A customer pod's env, reduced to the names whose fate the scrub decides: the platform
+    pair, the LiteLLM virtual key and the relay secret (both must keep being withheld)."""
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir()
-    (hermes_home / "config.yaml").write_text(SEEDED_CONFIG, encoding="utf-8")
+    (hermes_home / "config.yaml").write_text(config_text, encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("TERMINAL_ENV", "local")
-    # The platform pod runs unattended (chart: HERMES_YOLO_MODE=1 / approvals.mode "off");
-    # without it the execute_code approval gate blocks arbitrary code in a headless process.
-    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
     monkeypatch.setenv("NOLGIA_TOKEN", "nol_pod_scoped_pat")
     monkeypatch.setenv("NOLGIA_API_URL", "https://api.stg.nolgia.ai")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-litellm-virtual-key")
     monkeypatch.setenv("API_SERVER_KEY", "relay-shared-secret")
 
+
+def _observed_in_sandbox(task_id: str) -> dict:
     tokens = set_session_vars(platform="api_server", nolgia_token="nolt_run_turn")
     try:
         result = json.loads(
             registry.dispatch(
-                "execute_code",
-                {
-                    "code": (
-                        "import json, os\n"
-                        "print(json.dumps({name: os.environ.get(name) for name in (\n"
-                        "    'NOLGIA_TOKEN', 'NOLGIA_API_URL', 'OPENAI_API_KEY', "
-                        "'API_SERVER_KEY')}))"
-                    ),
-                    "reset": True,
-                },
-                task_id="nolgia-env-grant",
+                "execute_code", {"code": SANDBOX_PROBE, "reset": True}, task_id=task_id
             )
         )
     finally:
         clear_session_vars(tokens)
-
     assert result["status"] == "success", result
-    observed = json.loads(result["output"])
-    assert observed == {
-        "NOLGIA_TOKEN": "nolt_run_turn",
+    return json.loads(result["output"])
+
+
+def test_registered_execute_code_observes_only_config_granted_nolgia_env(tmp_path, monkeypatch):
+    _pod(tmp_path, monkeypatch, GRANTED_CONFIG)
+
+    assert _observed_in_sandbox("nolgia-env-grant") == {
+        "NOLGIA_TOKEN": "nolt_run_turn",  # the bound run token, not the pod-wide bearer
         "NOLGIA_API_URL": "https://api.stg.nolgia.ai",
+        "OPENAI_API_KEY": None,
+        "API_SERVER_KEY": None,
+    }
+
+
+def test_registered_execute_code_without_the_grant_is_anonymous(tmp_path, monkeypatch):
+    """The #228 failure mode, kept explicit so the chart dependency is: without the seeded
+    grant the sandbox sees neither name — a bound run token must not smuggle one in."""
+    _pod(tmp_path, monkeypatch, UNGRANTED_CONFIG)
+
+    assert _observed_in_sandbox("nolgia-env-ungranted") == {
+        "NOLGIA_TOKEN": None,
+        "NOLGIA_API_URL": None,
         "OPENAI_API_KEY": None,
         "API_SERVER_KEY": None,
     }
