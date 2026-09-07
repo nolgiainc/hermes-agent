@@ -418,6 +418,23 @@ class TestFocusRegainRedraw:
 
         assert calls == ["redraw"]
 
+    def test_first_focus_regain_redraws_on_a_freshly_booted_clock(self, bare_cli, monkeypatch):
+        """``time.monotonic()`` counts from boot on Linux. With the "last redraw" default at
+        ``0.0``, a host whose uptime was still below ``min_interval`` treated the clock origin
+        as a recent redraw and swallowed the first repaint — deterministic on fresh CI
+        runners, where this very class failed with ``[] == ['redraw']``. Never-redrawn must
+        mean never, whatever the clock reads."""
+        import hermes_cli.cli_terminal_mixin as mixin
+
+        monkeypatch.setattr(mixin.time, "monotonic", lambda: 5.0)
+        calls = []
+        bare_cli._force_full_redraw = lambda: calls.append("redraw")
+
+        bare_cli._schedule_focus_regain_redraw(min_interval=60.0)
+        bare_cli._schedule_focus_regain_redraw(min_interval=60.0)
+
+        assert calls == ["redraw"]
+
     def test_focus_regain_redraw_fires_again_after_interval(self, bare_cli):
         calls = []
         bare_cli._force_full_redraw = lambda: calls.append("redraw")
