@@ -135,7 +135,11 @@ class CLITerminalMixin:
         stacks on stale content (#60920, #25337); terminals without it never emit ``CSI I``.
         """
         now = time.monotonic()
-        if now - getattr(self, "_last_focus_regain_redraw", 0.0) < min_interval:
+        # ``None`` = never redrawn. A ``0.0`` default read the monotonic clock's origin as a
+        # redraw "at boot", so on a host whose uptime was still under ``min_interval`` (fresh
+        # CI runners, a just-booted machine) the FIRST focus-regain repaint was swallowed.
+        last = getattr(self, "_last_focus_regain_redraw", None)
+        if last is not None and now - last < min_interval:
             return
         self._last_focus_regain_redraw = now
         self._force_full_redraw()
