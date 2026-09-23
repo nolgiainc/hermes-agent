@@ -415,6 +415,104 @@ class TestSweeperScope:
         assert path.exists()
 
 
+class TestGitWorkingTrees:
+    """NOL-554: tracked files in a checkout are never "redundant media".
+
+    The admin pod mirrors every org repo under HERMES_HOME/github.com. Eleven
+    preset thumbnails in its nolgia.com mirror had been uploaded to the
+    library, so the sweep content-matched and deleted them from the checkout
+    three times, and each time the mirror stopped fast-forwarding. Skipping the
+    ``.git`` directory alone never protected the files beside it.
+    """
+
+    @staticmethod
+    def _library_holding(payload):
+        return {
+            len(payload): [
+                {"id": _ASSET_ID, "signed_url": "https://gcs.test/o", "size_bytes": len(payload)}
+            ]
+        }
+
+    def test_checkout_files_are_not_swept_even_when_the_library_holds_them(
+        self, platform_env, tmp_path, monkeypatch
+    ):
+        payload = b"preset-thumbnail-bytes"
+        repo = tmp_path / "github.com" / "org" / "web"
+        (repo / ".git").mkdir(parents=True)
+        tracked = [
+            _write_media(repo / "public" / "presets" / "commercial.jpg", payload, age_hours=72),
+            _write_media(repo / "logo.png", payload, age_hours=72),
+            _write_media(repo / "a" / "b" / "c" / "deep.mp4", payload, age_hours=72),
+        ]
+        # A generated file outside any checkout, same bytes: still reclaimed,
+        # which proves the sweep ran with a matching library and chose to keep
+        # the checkout files rather than never getting that far.
+        outside = _write_media(tmp_path / "gen" / "download.jpg", payload, age_hours=72)
+        monkeypatch.setattr(
+            nolgia_media_gc, "_build_library_size_index", lambda: self._library_holding(payload)
+        )
+        monkeypatch.setattr(
+            nolgia_media_gc, "_gcs_object_md5", lambda url: (_md5_b64(payload), len(payload))
+        )
+
+        deleted, _freed = nolgia_media_gc.sweep_once(tmp_path)
+
+        assert deleted == 1
+        assert not outside.exists()
+        assert all(p.exists() for p in tracked)
+
+    def test_linked_worktree_with_a_git_file_is_not_swept(
+        self, platform_env, tmp_path, monkeypatch
+    ):
+        """A linked worktree or submodule marks itself with a .git FILE."""
+        payload = b"worktree-thumbnail"
+        worktree = tmp_path / "work" / "lane-1"
+        worktree.mkdir(parents=True)
+        (worktree / ".git").write_text("gitdir: /elsewhere/.git/worktrees/lane-1\n")
+        tracked = _write_media(worktree / "public" / "hero.png", payload, age_hours=72)
+        monkeypatch.setattr(
+            nolgia_media_gc,
+            "_build_library_size_index",
+            lambda: pytest.fail("a git working tree entered the confirmation path"),
+        )
+
+        assert nolgia_media_gc.sweep_once(tmp_path) == (0, 0)
+        assert tracked.exists()
+
+    def test_upload_from_inside_a_checkout_keeps_the_file(self, platform_env, tmp_path):
+        """The post-upload hook is the other door: uploading a tracked file
+        must record it (so MEDIA: resolution still works) but never unlink it."""
+        repo = tmp_path / "github.com" / "org" / "web"
+        (repo / ".git").mkdir(parents=True)
+        path = _write_media(repo / "public" / "presets" / "music-video.jpg")
+        size, mtime_ns = _stat_pair(path)
+
+        nolgia_media_gc.on_confirmed_upload(path, size, mtime_ns, _ASSET_ID)
+
+        assert path.exists()
+        assert nolgia_media_gc._get_ledger().uploaded_asset_for(
+            str(path), size, mtime_ns
+        ) == _ASSET_ID
+
+    def test_a_repo_above_hermes_home_does_not_disable_gc(
+        self, platform_env, tmp_path, monkeypatch
+    ):
+        """Only trees at or below HERMES_HOME count: a dotfiles repo that
+        happens to contain the agent home must not stop every reclaim."""
+        outer = tmp_path / "dotfiles"
+        (outer / ".git").mkdir(parents=True)
+        home = outer / "hermes-home"
+        home.mkdir()
+        monkeypatch.setattr(nolgia_media_gc, "get_hermes_home", lambda: home)
+        nolgia_media_gc._reset_ledger_for_tests()
+        path = _write_media(home / "gen" / "clip.mp4")
+        size, mtime_ns = _stat_pair(path)
+
+        nolgia_media_gc.on_confirmed_upload(path, size, mtime_ns, _ASSET_ID)
+
+        assert not path.exists()
+
+
 class TestGcsHashProbe:
     def test_parses_md5_and_total_size_from_ranged_get(self, monkeypatch):
         """GCS answers a 1-byte range with the object's md5 and full size."""
