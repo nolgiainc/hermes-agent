@@ -39,6 +39,17 @@ Two mechanisms, both logged per deletion (path, size, confirmation basis):
    Anything unconfirmed — no ledger entry, no size match, hash mismatch, API
    error, file modified since confirmation — is kept, always.
 
+Neither mechanism ever deletes inside a git working tree (a directory holding a
+``.git`` entry, or anything below one). Tracked files in a checkout are not
+redundant local media even when their bytes match a library asset: deleting
+one leaves the checkout dirty, and a mirror that only fast-forwards clean trees
+stops advancing. This happened on the Nolgia admin pod (nolgia-agent NOL-554):
+eleven preset thumbnails in its nolgia.com mirror had been uploaded to the
+library, so the sweep matched and deleted them three times, and each time the
+mirror stopped syncing. Skipping ``.git`` itself does not protect the tree
+around it, so the rule is checked on every directory the walk enters and again
+at the unlink.
+
 Config (env, deployment-owned):
 
 - ``NOLGIA_MEDIA_GC=0``            — master off switch (default ON in
@@ -99,9 +110,11 @@ _GET_ASSET_TIMEOUT_SECONDS = 30.0
 _HASH_PROBE_TIMEOUT_SECONDS = 30.0
 
 # Directory names never descended into (relative to any level): dot-dirs are
-# skipped wholesale (covers .git — never touch a repo working tree — plus
-# .ssh/.cache and friends), and these Hermes/platform-managed trees hold
-# nothing that is ever "redundant local media".
+# skipped wholesale (.git, .ssh, .cache and friends), and these
+# Hermes/platform-managed trees hold nothing that is ever "redundant local
+# media". Skipping the ``.git`` directory does NOT protect a repo's working
+# tree: the tracked files sit beside it, not inside it. Working trees are
+# excluded separately by _is_git_worktree_root / _inside_git_worktree.
 _PROTECTED_DIRNAMES = frozenset(
     {
         "logs",
@@ -309,6 +322,45 @@ def _is_under_hermes_home(path: Path) -> bool:
         return False
 
 
+_GIT_MARKER = ".git"
+
+
+def _is_git_worktree_root(directory: str, dirnames, filenames) -> bool:
+    """True when ``directory`` is the top of a git working tree.
+
+    ``.git`` is a directory in an ordinary clone and a file in a linked
+    worktree or submodule, so both spellings count.
+    """
+    return _GIT_MARKER in dirnames or _GIT_MARKER in filenames
+
+
+def _inside_git_worktree(path: Path) -> bool:
+    """True when ``path`` lives in a git working tree at or below HERMES_HOME.
+
+    Walks the ancestors of ``path`` up to and including HERMES_HOME. The walk
+    stops there on purpose: a directory ABOVE HERMES_HOME that is kept in git
+    (say a dotfiles repo holding ``~/.hermes``) must not switch GC off for all
+    generated media, and anything outside HERMES_HOME is refused by
+    _is_under_hermes_home anyway. On any error it answers True, so the caller
+    keeps the file.
+    """
+    try:
+        home = get_hermes_home().resolve()
+        current = path.resolve().parent
+        while True:
+            if (current / _GIT_MARKER).exists():
+                return True
+            if current == home or current.parent == current:
+                return False
+            try:
+                current.relative_to(home)
+            except ValueError:
+                return False
+            current = current.parent
+    except (OSError, RuntimeError):
+        return True
+
+
 def _delete_confirmed(
     path: Path, size: int, mtime_ns: int, asset_id: str, basis: str
 ) -> bool:
@@ -317,8 +369,16 @@ def _delete_confirmed(
     Re-stats immediately before the unlink: the file must still be a regular
     non-symlink file with the confirmed size and mtime_ns (i.e. untouched
     since the library was proven to hold this content). Any drift or error
-    keeps the file.
+    keeps the file. A file inside a git working tree is always kept, whatever
+    the library holds (NOL-554).
     """
+    if _inside_git_worktree(path):
+        logger.info(
+            "[nolgia_media_gc] %s is inside a git working tree; keeping it "
+            "(tracked files are not redundant media)",
+            path,
+        )
+        return False
     try:
         stat = path.lstat()
         if not stat_module.S_ISREG(stat.st_mode):
@@ -520,12 +580,18 @@ def _build_library_size_index() -> Dict[int, List[dict]]:
 def _iter_candidate_files(root: Path, min_age_seconds: float):
     """Yield (path, stat) for old-enough media files under ``root``.
 
-    Skips dot-directories (which covers ``.git`` working trees), the
-    protected Hermes-managed trees, and every symlink.
+    Skips every git working tree (the directory holding ``.git`` and all of
+    it), dot-directories, the protected Hermes-managed trees, and every
+    symlink.
     """
     extensions = _media_extensions()
     now = time.time()
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        if _is_git_worktree_root(dirpath, dirnames, filenames):
+            # A checkout: its files are tracked content, not generated media.
+            # Prune the whole subtree and yield nothing from this directory.
+            dirnames[:] = []
+            continue
         dirnames[:] = [
             name
             for name in dirnames
