@@ -34,10 +34,25 @@ _SUBAGENT_EVENT_KEYS = (
     "output_tokens", "reasoning_tokens", "api_calls", "cost_usd", "files_read", "files_written",
     "output_tail")
 _SUBAGENT_TEXT_KEYS = ("goal", "summary", "output_tail")
-# Terminal usage payload: (wire key, agent attribute), in wire order.
+# Terminal usage payload: (wire key, agent attribute), in wire order. ``input_tokens`` is the
+# FULL prompt count, cache reads and writes included; ``cache_read_tokens`` and
+# ``cache_write_tokens`` are the parts of it the provider served from, or wrote to, its prompt
+# cache. A caller that bills the run (nolgia-api's agent-turn meter, NOL-1216) prices those at
+# the provider's cache rates instead of the full input rate: on a tool loop that re-sends the
+# same context every iteration they are ~90% of the prompt, and pricing them at the input rate
+# over-bills the turn ~5x.
 _USAGE_FIELDS = (
     ("input_tokens", "session_prompt_tokens"), ("output_tokens", "session_completion_tokens"),
-    ("total_tokens", "session_total_tokens"))
+    ("total_tokens", "session_total_tokens"), ("cache_read_tokens", "session_cache_read_tokens"),
+    ("cache_write_tokens", "session_cache_write_tokens"))
+
+
+def _usage_count(agent: Any, attr: str) -> int:
+    """One usage counter off the agent as a plain non-negative int (0 when absent or not a count)."""
+    value = getattr(agent, attr, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
 # Tool-progress event -> SSE payload fields (tool_name, preview, kwargs); key order is wire format.
 _FIXED_EVENT_FIELDS = {
     "tool.started": lambda tool, preview, kw: {"tool": tool, "preview": preview},
@@ -652,7 +667,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 for token, reset in resets:
                     with suppress(Exception):
                         reset(token)
-        return r, {key: getattr(agent, attr, 0) or 0 for key, attr in _USAGE_FIELDS}
+        return r, {key: _usage_count(agent, attr) for key, attr in _USAGE_FIELDS}
 
 
 def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Dict[str, Any]], None]:

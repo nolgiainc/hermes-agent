@@ -2550,6 +2550,65 @@ class TestSteerRunRelayContract:
 
 
 # ---------------------------------------------------------------------------
+# Usage payload carries prompt-cache reads and writes (NOL-1216)
+# ---------------------------------------------------------------------------
+
+
+class TestRunUsageCacheTokens:
+    """nolgia-api meters an agent turn on the run's usage report. ``input_tokens``
+    is the full prompt; the cache fields are the parts the provider served from
+    (or wrote to) its prompt cache, which it bills at a fraction of the input
+    rate. Without them the meter prices a cache-heavy tool loop ~5x too high."""
+
+    @staticmethod
+    async def _run_usage(adapter, mock_agent) -> dict:
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_create.return_value = mock_agent
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                status = await _wait_terminal(cli, run_id)
+        assert status["status"] == "completed"
+        return status["usage"]
+
+    @pytest.mark.asyncio
+    async def test_usage_reports_cache_reads_and_writes(self, adapter):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "done"}
+        # The Cover reveal turn of 2026-09-24: 5,282,839 prompt tokens, 4,790,392
+        # of them cache reads, 20,291 output tokens.
+        mock_agent.session_prompt_tokens = 5_282_839
+        mock_agent.session_completion_tokens = 20_291
+        mock_agent.session_total_tokens = 5_303_130
+        mock_agent.session_cache_read_tokens = 4_790_392
+        mock_agent.session_cache_write_tokens = 1_024
+        usage = await self._run_usage(adapter, mock_agent)
+        assert usage == {
+            "input_tokens": 5_282_839,
+            "output_tokens": 20_291,
+            "total_tokens": 5_303_130,
+            "cache_read_tokens": 4_790_392,
+            "cache_write_tokens": 1_024,
+        }
+
+    @pytest.mark.asyncio
+    async def test_missing_or_non_integer_counters_report_zero(self, adapter):
+        """An agent that never set the cache counters (a MagicMock attribute here,
+        a legacy agent in production) reports 0, never an unserializable value."""
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "done"}
+        mock_agent.session_prompt_tokens = 7
+        mock_agent.session_completion_tokens = 3
+        mock_agent.session_total_tokens = 10
+        usage = await self._run_usage(adapter, mock_agent)
+        assert usage["input_tokens"] == 7
+        assert usage["cache_read_tokens"] == 0
+        assert usage["cache_write_tokens"] == 0
+
+
+# ---------------------------------------------------------------------------
 # Durable terminal run statuses (NOL-93)
 # ---------------------------------------------------------------------------
 
