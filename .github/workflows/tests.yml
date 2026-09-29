@@ -246,6 +246,10 @@ jobs:
           NOUS_API_KEY: ""
 
   e2e-upgrade-plan:
+    # Fork (nolgiainc): these suites drive `hermes update` from the previous upstream release tag
+    # to HEAD. The fork publishes no releases and its fleet ships container images, never
+    # `hermes update`, so the suites cannot apply here; e2e-upgrade skips with its plan.
+    if: github.repository != 'nolgiainc/hermes-agent'
     # One e2e-upgrade shard per suite directory: the files directly under
     # tests/e2e/core/upgrade ("core") plus every subdirectory that holds
     # test_*.py (pm, git, handoff, network, hosts, ...). A new suite
@@ -297,21 +301,6 @@ jobs:
           # N-1 = `git describe --tags --abbrev=0 HEAD~1`.
           fetch-depth: 0
           fetch-tags: true
-
-      # Fork (nolgiainc): the fork carries no release tags, so the N-1 lookup
-      # above finds nothing and every upgrade suite fails at setup. Borrow
-      # upstream's public release tags into this checkout only (never pushed).
-      - name: Fetch upstream release tags (fork)
-        run: |
-          set -euo pipefail
-          if [ -z "$(git tag -l 'v20[0-9][0-9].*')" ]; then
-            for n in 1 2 3; do
-              git fetch --no-tags --quiet https://github.com/NousResearch/hermes-agent.git \
-                'refs/tags/v20*:refs/tags/v20*' && break
-              sleep $((n * 10))
-            done
-          fi
-          git describe --tags --abbrev=0 --match 'v20[0-9][0-9].*' HEAD~1
 
       - name: Set up Node
         # `hermes update` builds the web UI / TUI workspaces.

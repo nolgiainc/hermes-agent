@@ -207,6 +207,9 @@ jobs:
     # interpreter selection, non-ASCII profile paths and tool ACLs, partial-clone fetch and
     # venv holders. Its own workflow so wine2e-install/** pushes can run it alone.
     name: Windows install + update E2E
+    # Fork (nolgiainc): install.ps1 and `hermes update` pull upstream's GitHub releases, which this
+    # fork does not publish; our fleet ships hermes as container images and never runs either.
+    if: github.repository != 'nolgiainc/hermes-agent'
     uses: ./.github/workflows/windows-install-update-e2e.yml
 
   e2e-windows:
