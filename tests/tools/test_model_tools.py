@@ -550,6 +550,10 @@ def test_tool_defs_cache_key_sees_config_replacement_with_pinned_mtime(tmp_path)
         st = cfg.stat()
         other = tmp_path / "other.yaml"
         other.write_text("mcp_servers:\n  bb: {command: b}\n", encoding="utf-8")
+        # ctime ticks at the kernel's coarse clock (~4 ms): an in-place rewrite inside the tick of the
+        # recorded signature leaves every stat field equal. Wait until the fs clock has passed that ctime.
+        while other.stat().st_ctime_ns <= st.st_ctime_ns:
+            os.utime(other)
         shutil.copy2(other, cfg)
         os.utime(cfg, ns=(st.st_atime_ns, st.st_mtime_ns))
         assert _tool_defs_cache_key(None, None, False) != before

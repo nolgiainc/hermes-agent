@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 
 import tui_gateway.server as server
@@ -53,6 +54,12 @@ def test_sessions_signature_changes_for_session_metadata_updates(tmp_path, monke
     monkeypatch.setattr(server, "_served_profile_homes", [])
 
     before = getattr(server, "_sessions_sig")()
+    # The digest is cached behind the DB mtime: on a coarse fs clock (~4 ms) the UPDATE can land in
+    # the same mtime tick as the seed. Wait for the clock to pass it so the cache is re-checked.
+    tick = tmp_path / "tick"
+    tick.write_text("", encoding="utf-8")
+    while tick.stat().st_mtime_ns <= db_path.stat().st_mtime_ns:
+        os.utime(tick)
     conn = sqlite3.connect(db_path)
     conn.execute("UPDATE sessions SET title = 'Renamed' WHERE id = 'session-1'")
     conn.commit()

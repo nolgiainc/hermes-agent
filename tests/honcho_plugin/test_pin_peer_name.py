@@ -568,6 +568,12 @@ class TestPinTransition:
 
         cfg_path.write_text(json.dumps({**base, "hosts": {"hermes": {"workspace": "old"}}}))
         sig_old = provider.identity_signature()["workspace"]
+        # The memo keys on (mtime, size) and "old"/"new" are the same size: on a coarse fs clock
+        # (~4 ms) the rewrite can land in the same mtime tick. Wait for the clock to pass it.
+        tick = tmp_path / "tick"
+        tick.write_text("", encoding="utf-8")
+        while tick.stat().st_mtime_ns <= cfg_path.stat().st_mtime_ns:
+            os.utime(tick)
         cfg_path.write_text(json.dumps({**base, "hosts": {"hermes": {"workspace": "new"}}}))
         sig_new = provider.identity_signature()["workspace"]
 
