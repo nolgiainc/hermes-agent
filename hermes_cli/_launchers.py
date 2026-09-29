@@ -342,6 +342,13 @@ def _owns_launcher(target: Path, root: Path) -> bool:
     return False
 
 
+def _file_identity(path: Path) -> tuple[int, int]:
+    # Inode as well as mtime: _write_atomic's os.replace always lands a new inode, while a rewrite
+    # within one coarse fs clock tick can keep the old mtime_ns and read as "unchanged".
+    st = path.lstat()
+    return st.st_ino, st.st_mtime_ns
+
+
 def _publish_conveniences(root: Path, out_dir: Path, names, *, create: bool = True) -> dict[Path, bool]:
     """User-bin commands forward to durable local launchers, not a Python pin."""
     if create:
@@ -353,12 +360,12 @@ def _publish_conveniences(root: Path, out_dir: Path, names, *, create: bool = Tr
         target = out_dir / name
         if (not create or target.exists() or target.is_symlink()) and not _owns_launcher(target, root):
             continue
-        before = target.lstat().st_mtime_ns if target.exists() or target.is_symlink() else None
+        before = _file_identity(target) if target.exists() or target.is_symlink() else None
         command = ([str(root / ".hermes/bin/hermes"), "--run-module", "run_agent"]
                    if name == "hermes-agent" else [str(root / ".hermes/bin" / name)])
         if _write_shell(target, command) is None:
             raise OSError(f"could not publish launcher {target}")
-        published[target] = before != target.lstat().st_mtime_ns
+        published[target] = before != _file_identity(target)
     return published
 
 
