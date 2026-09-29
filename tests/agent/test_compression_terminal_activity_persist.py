@@ -56,7 +56,9 @@ def _mid_compression_durable_stamp(agent, db: SessionDB, session_id: str) -> Non
 
     heartbeat = _CompressionActivityHeartbeat(agent, interval_seconds=3600.0)
     # Open the persist window so the tick writes through, exactly like a >60s compression.
-    agent._session_activity_last_persist_mono = 0.0
+    # -inf, not 0.0: monotonic() counts from boot, so on a host up for less than the heartbeat
+    # interval a 0.0 stamp still reads as "just persisted" and the window stays shut.
+    agent._session_activity_last_persist_mono = float("-inf")
     heartbeat._touch("context compression in progress")
     row = db.get_session(session_id)
     assert row["last_activity_description"] == "context compression in progress"
