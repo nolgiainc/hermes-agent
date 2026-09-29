@@ -1,7 +1,10 @@
+import re
 from types import SimpleNamespace
 
 from agent.usage_pricing import (
+    _OFFICIAL_DOCS_PRICING,
     CanonicalUsage,
+    fast_mode_pricing_model,
     format_cost_label,
     estimate_usage_cost,
     get_pricing_entry,
@@ -305,6 +308,30 @@ def test_fireworks_router_fast_tier_prices_distinctly():
     assert standard is not None and fast is not None
     assert fast.input_cost_per_million > standard.input_cost_per_million
     assert fast.output_cost_per_million > standard.output_cost_per_million
+
+
+def test_anthropic_fast_mode_bills_at_the_fast_row():
+    """Anthropic Fast Mode sends the STANDARD id with speed="fast" (/fast,
+    agent.fast_mode); a request served fast must price at that model's "-fast"
+    row, and a model without one must keep its standard row."""
+    fast_ids = [m for p, m in _OFFICIAL_DOCS_PRICING if p == "anthropic" and m.endswith("-fast")]
+    assert fast_ids
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000)
+    for fast_id in fast_ids:
+        standard_id = fast_id.removesuffix("-fast")
+        dotted_id = re.sub(r"(\d+)-(\d+)$", r"\1.\2", standard_id)
+        for requested in (standard_id, dotted_id):
+            priced = fast_mode_pricing_model(requested, provider="anthropic")
+            assert get_pricing_entry(priced, provider="anthropic") is _OFFICIAL_DOCS_PRICING[("anthropic", fast_id)]
+        assert (
+            estimate_usage_cost(fast_id, usage, provider="anthropic").amount_usd
+            > estimate_usage_cost(standard_id, usage, provider="anthropic").amount_usd
+        )
+    no_fast_row = next(
+        m for p, m in _OFFICIAL_DOCS_PRICING
+        if p == "anthropic" and not m.endswith("-fast") and ("anthropic", f"{m}-fast") not in _OFFICIAL_DOCS_PRICING
+    )
+    assert fast_mode_pricing_model(no_fast_row, provider="anthropic") == no_fast_row
 
 
 

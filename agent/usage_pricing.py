@@ -175,8 +175,9 @@ _SNAPSHOTS: tuple[tuple[str, Optional[str], str, dict], ...] = (
         "claude-opus-4-8-fast": ("10.00", "50.00", "1.00", "12.50"),
     }),
     # Claude Opus 5.5: $4/$20, below Opus 5's $5/$25 despite being the newer
-    # model. Cache read $0.20/M, cache write 1.25x input. Fast mode is a
-    # separate id at a 2x premium ($8/$40), same shape as opus-4-8-fast above.
+    # model. Cache read $0.20/M, cache write 1.25x input. Fast mode bills at a
+    # 2x premium ($8/$40); requests keep the standard id with speed="fast", and
+    # fast_mode_pricing_model() routes usage.speed=="fast" onto this row.
     ("anthropic", _ANTHROPIC_URL, "anthropic-pricing-2026-09", {
         "claude-opus-5-5": ("4.00", "20.00", "0.20", "5.00"),
         "claude-opus-5-5-fast": ("8.00", "40.00", "0.40", "10.00"),
@@ -394,6 +395,17 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
     normalize = _MODEL_NORMALIZERS.get(route.provider)
     normalized = normalize(model) if normalize else model
     return _OFFICIAL_DOCS_PRICING.get((route.provider, normalized)) if normalized != model else None
+
+
+def fast_mode_pricing_model(
+    model_name: str, provider: Optional[str] = None, base_url: Optional[str] = None
+) -> str:
+    """Model id to price a request Anthropic served in Fast Mode (``usage.speed == "fast"``).
+    The request keeps the standard id but bills at the dedicated ``<id>-fast`` rate, so use
+    that bundled row when one exists; otherwise the standard id."""
+    fast_model = f"{model_name}-fast"
+    route = resolve_billing_route(fast_model, provider=provider, base_url=base_url)
+    return fast_model if _lookup_official_docs_pricing(route) else model_name
 
 
 def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:

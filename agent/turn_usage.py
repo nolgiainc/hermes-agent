@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from agent.model_metadata import capture_usage_anchor
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import estimate_usage_cost, fast_mode_pricing_model, normalize_usage
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -190,6 +190,12 @@ def record_response_usage(
         _agg_cost_model = _agg_slot["model"]
         _agg_cost_provider = _agg_slot.get("provider") or agent.provider
         _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
+    # Anthropic Fast Mode keeps the standard model id and reports the tier it actually
+    # served in usage.speed; bill that at the model's "-fast" rate.
+    if getattr(response.usage, "speed", None) == "fast":
+        _agg_cost_model = fast_mode_pricing_model(
+            _agg_cost_model, provider=_agg_cost_provider, base_url=_agg_cost_base_url,
+        )
     cost_result = estimate_usage_cost(
         _agg_cost_model, aggregator_usage, provider=_agg_cost_provider,
         base_url=_agg_cost_base_url, api_key=getattr(agent, "api_key", ""),
