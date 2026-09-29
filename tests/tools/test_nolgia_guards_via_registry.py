@@ -73,13 +73,13 @@ SANDBOX_PROBE = (
 @pytest.fixture(autouse=True)
 def fresh_sandbox_state():
     shutdown_all_kernels()
-    env_passthrough._config_passthrough = None
+    env_passthrough._config_passthrough.clear()
     env_passthrough.clear_env_passthrough()
     config_module._RAW_CONFIG_CACHE.clear()
     reset_session_vars()
     yield
     shutdown_all_kernels()
-    env_passthrough._config_passthrough = None
+    env_passthrough._config_passthrough.clear()
     env_passthrough.clear_env_passthrough()
     config_module._RAW_CONFIG_CACHE.clear()
     reset_session_vars()

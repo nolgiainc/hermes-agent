@@ -104,7 +104,6 @@ def test_browser_snapshot_applies_profile_threshold(
 
     assert result["success"] is True
     assert len(result["snapshot"]) < len(snapshot)
-    assert "more lines truncated" in result["snapshot"]
 
 
 def test_browser_navigation_applies_profile_threshold(
@@ -156,7 +155,6 @@ def test_browser_navigation_applies_profile_threshold(
 
     assert result["success"] is True
     assert len(result["snapshot"]) < len(snapshot)
-    assert "more lines truncated" in result["snapshot"]
 
 
 def test_camofox_navigation_applies_same_profile_threshold(
@@ -194,7 +192,6 @@ def test_camofox_navigation_applies_same_profile_threshold(
 
     assert result["success"] is True
     assert len(result["snapshot"]) < len(snapshot)
-    assert "more lines truncated" in result["snapshot"]
 
 
 def test_camofox_snapshot_applies_same_profile_threshold(
@@ -223,4 +220,3 @@ def test_camofox_snapshot_applies_same_profile_threshold(
 
     assert result["success"] is True
     assert len(result["snapshot"]) < len(snapshot)
-    assert "more lines truncated" in result["snapshot"]

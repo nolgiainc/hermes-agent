@@ -21,7 +21,7 @@ Search arXiv papers by keyword, author, category, or ID.
 | License | MIT |
 | Platforms | linux, macos, windows |
 | Tags | `Research`, `Arxiv`, `Papers`, `Academic`, `Science`, `API` |
-| Related skills | [`pdf`](/docs/user-guide/skills/bundled/productivity/productivity-pdf) |
+| Related skills | [`pdf`](../../bundled/productivity/productivity-pdf.md) |
 
 ## Reference: full SKILL.md
 

@@ -21,7 +21,7 @@ Stock quotes, history, search, compare, crypto via Yahoo.
 | License | MIT |
 | Platforms | linux, macos, windows |
 | Tags | `Stocks`, `Finance`, `Market`, `Crypto`, `Investing` |
-| Related skills | [`dcf-model`](/docs/user-guide/skills/optional/finance/finance-dcf-model), [`comps-analysis`](/docs/user-guide/skills/optional/finance/finance-comps-analysis), [`lbo-model`](/docs/user-guide/skills/optional/finance/finance-lbo-model) |
+| Related skills | [`dcf-model`](../../optional/finance/finance-dcf-model.md), [`comps-analysis`](../../optional/finance/finance-comps-analysis.md), [`lbo-model`](../../optional/finance/finance-lbo-model.md) |
 
 ## Reference: full SKILL.md
 

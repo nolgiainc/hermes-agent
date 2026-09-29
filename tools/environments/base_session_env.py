@@ -38,6 +38,9 @@ _SNAPSHOT_EXCLUDED_ENV_PATTERNS = (
     "HERMES_CRON_AUTO_DELIVER_",
     "HERMES_CRON_SESSION",
     "HERMES_BROWSER_CONTROL_",
+    "HERMES_DELEGATED_CHILD_CONTEXT",
+    "HERMES_RPC_",
+    "HERMES_KERNEL_DIR",
     "NOLGIA_TOKEN=",
 )
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
@@ -143,6 +146,15 @@ def _export_dump_excluding_session_vars(
         # by every wrapper with ${VAR:-default} semantics; persisting them would
         # let the FIRST command's value override a later outer-harness value.
         "AI_AGENT HERMES_AGENT "
+        # Scope markers stamped onto a delegate_task child's / cron run's subprocess
+        # env; a snapshot taken inside that window would re-assert them on every
+        # later ``source`` and fence the PARENT session's kanban CLI (#90782).
+        "HERMES_DELEGATED_CHILD_CONTEXT HERMES_CRON_SESSION "
+        # Remote code-execution channel vars (RPC token, kernel/rpc dirs): a
+        # leaked token in the snapshot would re-export into every later command
+        # on the backend and outlive the private dir it protects.
+        "${!HERMES_RPC_*} HERMES_KERNEL_DIR "
+        f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
         # NOLGIA_TOKEN: the per-command run-scoped override must never persist
         # (see _SNAPSHOT_EXCLUDED_ENV_PATTERNS).
         f"HERMES_UI_SESSION_ID NOLGIA_TOKEN{extra_unset} 2>/dev/null; "
