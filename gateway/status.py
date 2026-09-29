@@ -429,8 +429,29 @@ def terminate_pid(
         os.kill(pid, signal.SIGTERM)
         return
     if result.returncode != 0:
+        # /T kills the children first, and a venv python.exe redirector exits on its own once its
+        # interpreter child dies, so taskkill can report "no running instance" for a tree that is
+        # already dead. The contract is a dead process, not taskkill's return code: succeed when
+        # the process we identified is gone (or its PID now names another process).
+        if _process_gone(pid, expected_start_time):
+            return
         details = (result.stderr or result.stdout or "").strip()
         raise OSError(details or f"taskkill failed for PID {pid}")
+
+
+def _process_gone(pid: int, expected_start_time: Optional[float], wait: float = 2.0) -> bool:
+    """True once ``pid`` no longer names the process whose start time was ``expected_start_time``."""
+    deadline = time.monotonic() + wait
+    while True:
+        current = _get_process_start_time(pid)
+        try:
+            if current is None or not _start_times_agree(current, expected_start_time):
+                return True
+        except (TypeError, ValueError):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
 
 
 def _start_times_agree(current: Any, *recorded: Any) -> bool:

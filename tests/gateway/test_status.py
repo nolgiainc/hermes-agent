@@ -711,6 +711,30 @@ class TestTerminatePid:
         assert calls == []
 
 
+    @pytest.mark.platforms("windows")
+    def test_windows_taskkill_error_for_an_already_dead_tree_is_success(self, monkeypatch):
+        # The venv redirector exits once taskkill /T has killed its interpreter child, so taskkill
+        # reports "no running instance" for the root; the process is gone, which is the contract.
+        monkeypatch.setattr(status.subprocess, "run", lambda *a, **k: SimpleNamespace(
+            returncode=128, stdout="", stderr="ERROR: There is no running instance of the task."))
+        readings = iter([456, None])
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: next(readings))
+
+        status.terminate_pid(123, force=True, expected_start_time=456)
+
+    @pytest.mark.platforms("windows")
+    def test_windows_taskkill_error_raises_while_the_process_lives(self, monkeypatch):
+        monkeypatch.setattr(status.subprocess, "run", lambda *a, **k: SimpleNamespace(
+            returncode=1, stdout="", stderr="ERROR: Access is denied."))
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 456)
+        monkeypatch.setattr(status.time, "sleep", lambda s: None)
+        clock = iter(range(0, 100))
+        monkeypatch.setattr(status.time, "monotonic", lambda: float(next(clock)))
+
+        with pytest.raises(OSError, match="Access is denied"):
+            status.terminate_pid(123, force=True, expected_start_time=456)
+
+
 class TestPidExistsZombieProbe:
     """#115578: the psutil ``status()`` zombie probe is POSIX-only. On Windows it costs ~7 ms per
     pid, runs once per registry entry inside the session-registry file lock, and can never
