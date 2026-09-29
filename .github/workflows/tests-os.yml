@@ -177,6 +177,15 @@ jobs:
             echo "desktop_updater hand-off tests skipped (fork policy): tests/test_desktop_update_windows_*.py"
             EXTRA_ARGS+=(--ignore-glob='*test_desktop_update_windows_*.py')
           fi
+          # nolgiainc fork: two PowerShell bootstrap tests (new with the 2026-09-29 sync) spawn
+          # powershell.exe with a 30 s budget that the shared windows-latest runner's PowerShell
+          # start-up exceeded (TimeoutExpired, PR #51). Same family and rationale as the
+          # install.ps1 filter above: the fleet never runs these Windows bootstrap scripts.
+          # --deselect (unlike --ignore-glob) applies to explicitly passed files.
+          if [ "${FORK_SKIP_DESKTOP_UPDATER:-1}" = "1" ]; then
+            EXTRA_ARGS+=(--deselect=tests/scripts/test_bootstrap_mirror.py::test_generated_windows_pins_match_the_shared_authority)
+            EXTRA_ARGS+=(--deselect=tests/scripts/test_source_build_env.py::test_powershell_build_children_stamp_old_and_new_without_changing_parent)
+          fi
 
           scripts/run_tests.sh \
             "$@" \
