@@ -114,7 +114,6 @@ jobs:
         # matrix job via --files. Previously each job re-discovered files and
         # re-ran LPT independently — redundant N times.
         run: |
-          source .venv/bin/activate
           scripts/run_tests.sh --files '${{ matrix.slice.files }}'
         env:
           # Ensure tests don't accidentally call real APIs
