@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import signal
 import subprocess
 import time
@@ -82,10 +81,7 @@ def turn(sb: I.Sandbox, provider: FakeLLMServer, marker: str, *, env: dict | Non
 
 def login_shell(sb: I.Sandbox, script: str, *, path: str = "/usr/local/bin:/usr/bin:/bin") -> subprocess.CompletedProcess:
     """Run ``script`` in a new interactive login bash: PATH comes only from the rc files."""
-    env = dict(sb.env, PATH=path)
-    bash = shutil.which("bash")
-    assert bash is not None, "bash required"
-    return H.run([bash, "-lic", script], env=env, cwd=sb.root, writable=[sb.root], timeout=120)
+    return H.run_login_shell(script, env=dict(sb.env, PATH=path), cwd=sb.root, writable=[sb.root])
 
 
 def interpreter_paths(sb: I.Sandbox, python: str | None = None) -> dict:

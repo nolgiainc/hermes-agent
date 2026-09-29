@@ -56,9 +56,7 @@ def _login_shell_hermes(sb: I.Sandbox) -> str:
     """Resolve `hermes` the way a new login shell would: PATH comes only from the rc files."""
     env = dict(sb.env)
     env["PATH"] = "/usr/local/bin:/usr/bin:/bin"
-    bash = shutil.which("bash")
-    assert bash is not None, "bash required for install.sh and the login-shell probe"
-    cp = H.run([bash, "-lic", "command -v hermes"], env=env, cwd=sb.root, writable=[sb.root], timeout=60)
+    cp = H.run_login_shell("command -v hermes", env=env, cwd=sb.root, writable=[sb.root], timeout=60)
     assert cp.returncode == 0, H.describe(cp)
     return cp.stdout.strip()
 

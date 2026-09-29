@@ -202,6 +202,23 @@ def run(
     return subprocess.CompletedProcess(list(argv), proc.returncode, out, err)
 
 
+def run_login_shell(script: str, *, env: dict[str, str], cwd: Path, writable: Iterable[Path],
+                    timeout: float = 120) -> subprocess.CompletedProcess:
+    """``bash -lic script`` whose startup reads only HOME's rc files.
+
+    The CI host's own ``/etc/profile`` chain is not a distro skeleton: on the Blacksmith runners a
+    login shell there never reached the sandbox HOME's ``.bash_profile`` / ``.profile`` at all, so
+    an empty file is bound over ``/etc/profile`` and the probe sees exactly what the user's rc
+    files (and the installer's line in them) put on PATH.
+    """
+    bash = shutil.which("bash")
+    assert bash is not None, "bash required for the login-shell probe"
+    empty_profile = Path(cwd) / ".empty-etc-profile"
+    empty_profile.write_text("", encoding="utf-8")
+    return run([bash, "-lic", script], env=env, cwd=cwd, writable=writable, timeout=timeout,
+               ro_binds=[(empty_profile, Path("/etc/profile"))])
+
+
 def kill_tree(proc: subprocess.Popen) -> None:
     """SIGKILL the process group we started (the sandbox's PID namespace dies with it)."""
     try:
