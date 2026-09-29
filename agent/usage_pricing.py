@@ -478,7 +478,9 @@ def _served_fast(usage: CanonicalUsage) -> bool:
 
 
 def _anthropic_fast_mode_entry(model: str) -> Optional[PricingEntry]:
-    name = model.lower()
+    # turn_usage already swaps in the "<id>-fast" id via fast_mode_pricing_model();
+    # this table is keyed by the standard id, so both spellings must resolve here.
+    name = model.lower().removesuffix("-fast")
     return _ANTHROPIC_FAST_MODE_PRICING.get(name) or _ANTHROPIC_FAST_MODE_PRICING.get(
         _normalize_anthropic_model_name(name))
 

@@ -13,19 +13,12 @@ jobs:
       checks: ${{ steps.set-matrix.outputs.checks }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Set up the locked JS build toolchain
-        id: node
-        uses: ./.github/actions/setup-pm
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          # Desktop checks also run Python payload and icon build helpers, and
-          # the electron contracts drive real hermes_cli/pm code through
-          # HERMES_PYTHON, which needs the application dependencies.
-          toolchain: all
-          extras: '[]'
-          test-environment: 'true'
+          node-version: 26
+          cache: npm
 
-      - name: Install zsh and a virtual display for Electron
-        if: runner.os == 'Linux'
+      - name: grab npm 12
         run: |
           npm i -g npm@12
 
@@ -71,14 +64,23 @@ jobs:
       fail-fast: false # report all failures, not just the first one
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - name: Set up the locked JS build toolchain
+        id: node
+        uses: ./.github/actions/setup-pm
         with:
-          node-version: 26
-          cache: npm
+          # Desktop checks also run Python payload and icon build helpers, and
+          # the electron contracts drive real hermes_cli/pm code through
+          # HERMES_PYTHON, which needs the application dependencies.
+          toolchain: all
+          extras: '[]'
+          test-environment: 'true'
 
-      - name: grab npm 12
+      - name: Install zsh and a virtual display for Electron
+        if: runner.os == 'Linux'
         run: |
-          npm i -g npm@12
+          sudo apt-get install -y zsh xvfb \
+            libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 \
+            xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2t64
 
       - uses: ./.github/actions/retry
         with:

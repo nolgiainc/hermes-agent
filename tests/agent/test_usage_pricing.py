@@ -957,6 +957,21 @@ def test_anthropic_fast_mode_responses_price_from_the_fast_rate_row():
     )
 
 
+def test_anthropic_fast_response_priced_at_the_caller_fast_id_matches_the_standard_id():
+    """turn_usage passes fast_mode_pricing_model()'s "<id>-fast" id with the same
+    speed="fast" usage; it must bill the same premium, not fall to unknown."""
+    from agent.model_metadata import _ANTHROPIC_FAST_MODE_MODELS
+
+    for model in _ANTHROPIC_FAST_MODE_MODELS:
+        usage = _anthropic_usage("fast")
+        via_caller = estimate_usage_cost(
+            fast_mode_pricing_model(model, provider="anthropic"), usage, provider="anthropic",
+        )
+        direct = estimate_usage_cost(model, usage, provider="anthropic")
+        assert via_caller.amount_usd is not None, model
+        assert via_caller.amount_usd == direct.amount_usd, model
+
+
 def test_anthropic_fast_response_without_a_fast_rate_is_unknown():
     result = estimate_usage_cost("claude-sonnet-4-6", _anthropic_usage("fast"), provider="anthropic")
     assert result.amount_usd is None
