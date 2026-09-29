@@ -142,22 +142,17 @@ def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
     update_id = request["receipt"]["update_id"]
     from hermes_cli.venv_sync import (
         arm_completion, collect_superseded_generations, refuse_foreign_owned_venv,
-        source_update_extras,
     )
 
     refuse_foreign_owned_venv(root)
     arm_completion(root)
-    # A retry after an older updater died mid-pull reaches here with no PM
-    # ledger; syncing with extras=None would drop the extras its venv held.
-    extras = source_update_extras(root)
     with receipt.worker_context(update_id):
         try:
             # This file runs from the new tree, so its lockfile carries the new
             # pins; tools (incl. bumped uv/python) land before the sync uses them.
             ensure_tools_for_sync()
             # An update never fails because of a plugin: misfits are disabled and reported.
-            pm.sync_venv(extras=extras, explicit=True, project_root=root,
-                         evict_incompatible_plugins=True)
+            pm.sync_venv(explicit=True, project_root=root, evict_incompatible_plugins=True)
             collect_superseded_generations(root)
         finally:
             request["pm_receipt"] = receipt.last_for_update(update_id)
