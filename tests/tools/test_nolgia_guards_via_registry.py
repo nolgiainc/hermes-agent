@@ -165,7 +165,7 @@ def test_registered_terminal_still_blocks_lifecycle_script(terminal_env):
     sitting next to the binary, is still blocked before the backend sees it."""
     binary, fake_env = terminal_env
     wrapper = binary.parent / "restart.sh"
-    wrapper.write_text("#!/bin/bash\nhermes gateway restart\n", encoding="utf-8")
+    wrapper.write_text("#!/usr/bin/env bash\nhermes gateway restart\n", encoding="utf-8")
 
     result = json.loads(
         registry.dispatch(
