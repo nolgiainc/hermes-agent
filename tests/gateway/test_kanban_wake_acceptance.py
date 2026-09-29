@@ -15,46 +15,6 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 
 
-# TEMP DIAGNOSTIC (Nolgia fork, remove once the CI-only stall is understood): on CI this file
-# has taken 93 s and 300 s+ (locally 2.4 s). Dump every thread and pending asyncio task to the
-# real stderr (outside pytest's capture) at 20 s and 60 s WITHOUT stopping, and exit at 240 s
-# so the per-file runner prints the output instead of SIGKILLing at 300 s. A test that needed
-# a dump fails at teardown, since the runner shows output only for failing files.
-@pytest.fixture(autouse=True)
-def _hang_dump(request):
-    import faulthandler, gc, os, sys, threading, time
-    capman = request.config.pluginmanager.getplugin("capturemanager")
-    started = time.monotonic()
-    dumped = []
-    def _dump(stop):
-        dumped.append(stop)
-        with capman.global_and_fixture_disabled():
-            sys.stderr.write(f"\n=== HANG DUMP +{time.monotonic() - started:.0f}s "
-                             f"(uptime {time.monotonic():.0f}s): {request.node.nodeid} ===\n")
-            sys.stderr.flush()
-            faulthandler.dump_traceback(all_threads=True)
-            for loop in [o for o in gc.get_objects() if isinstance(o, asyncio.AbstractEventLoop)]:
-                try:
-                    tasks = asyncio.all_tasks(loop)
-                except RuntimeError:
-                    continue
-                for task in tasks:
-                    sys.stderr.write(f"--- task {task!r}\n"); task.print_stack(file=sys.stderr)
-            sys.stderr.flush()
-        if stop:
-            os._exit(3)
-    timers = [threading.Timer(20, _dump, (False,)), threading.Timer(60, _dump, (False,)),
-              threading.Timer(240, _dump, (True,))]
-    for timer in timers:
-        timer.daemon = True
-        timer.start()
-    yield
-    for timer in timers:
-        timer.cancel()
-    if dumped:  # the runner prints a file's output only when it fails
-        pytest.fail(f"took {time.monotonic() - started:.0f}s; see HANG DUMP in stderr above")
-
-
 def setup_route(raft=False):
     if raft:
         from plugins.platforms.raft.adapter import RaftAdapter
