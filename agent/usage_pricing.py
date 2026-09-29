@@ -174,6 +174,13 @@ _SNAPSHOTS: tuple[tuple[str, Optional[str], str, dict], ...] = (
     ("anthropic", "https://openrouter.ai/anthropic/claude-opus-4.8-fast", "anthropic-pricing-2026-05", {
         "claude-opus-4-8-fast": ("10.00", "50.00", "1.00", "12.50"),
     }),
+    # Claude Opus 5.5: $4/$20, below Opus 5's $5/$25 despite being the newer
+    # model. Cache read $0.20/M, cache write 1.25x input. Fast mode is a
+    # separate id at a 2x premium ($8/$40), same shape as opus-4-8-fast above.
+    ("anthropic", _ANTHROPIC_URL, "anthropic-pricing-2026-09", {
+        "claude-opus-5-5": ("4.00", "20.00", "0.20", "5.00"),
+        "claude-opus-5-5-fast": ("8.00", "40.00", "0.40", "10.00"),
+    }),
     # Claude Sonnet 5: introductory $2/$10 through 2026-08-31, then $3/$15
     # (matching Sonnet 4.6). Update this entry when the intro window closes.
     ("anthropic", _ANTHROPIC_URL, "anthropic-pricing-2026-06-intro", {

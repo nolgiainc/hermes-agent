@@ -87,7 +87,12 @@ _NO_XHIGH_CLAUDE_SUBSTRINGS = ("claude-opus-4-6", "claude-opus-4.6", "claude-son
 # Adaptive families where thinking is mandatory: ``thinking: {"type": "disabled"}`` answers HTTP
 # 400 (Portal flags them ``reasoning.mandatory``). The failure is asymmetric — a missing entry
 # 400s the turn, a spurious one only leaves thinking on — so when in doubt, add the family.
-_MANDATORY_THINKING_CLAUDE_SUBSTRINGS = ("claude-fable",)
+# Opus 5.5 rejects thinking:{"type": "disabled"} at EVERY effort level (Opus 5
+# only 400s at xhigh/max), so it must be listed here while plain "claude-opus-5"
+# must NOT — the substring match would swallow 5.5's predecessor and wrongly
+# force thinking on for it. Effort is Opus 5.5's only depth control, and its
+# default is medium rather than high.
+_MANDATORY_THINKING_CLAUDE_SUBSTRINGS = ("claude-fable", "claude-opus-5-5", "claude-opus-5.5")
 _FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-8", "opus-4.8", "opus-5")
 
 
