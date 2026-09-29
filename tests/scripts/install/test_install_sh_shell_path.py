@@ -61,7 +61,9 @@ def _wire(home: Path, runs: int = 1) -> None:
 
 
 def _login_path(home: Path) -> list[str]:
-    result = subprocess.run(["bash", "-lc", 'printf %s "$PATH"'],
+    # Replays the per-user login step only: the host's /etc/profile is not part of the Fedora
+    # scenario, and some CI images' system profile drops the temp HOME's ~/.bash_profile effect.
+    result = subprocess.run(["bash", "--noprofile", "--norc", "-c", '. "$HOME/.bash_profile"; printf %s "$PATH"'],
                             env={"HOME": str(home), "PATH": "/usr/local/bin:/usr/bin:/bin"},
                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr

@@ -1947,7 +1947,8 @@ def _raw_config_mtime_settled(st: os.stat_result) -> bool:
     catches atomic replaces, but on a coarse-timestamp filesystem ctime shares mtime's
     granularity: a same-size in-place rewrite inside that window keeps the whole signature, so
     a freshly stamped file is treated as racily clean and re-read until the timestamp settles.
-    Applied on BOTH the lock-free fast path and the locked re-check."""
+    Applied on BOTH the lock-free fast path (which re-reads without the lock) and the locked
+    re-check."""
     return time.time_ns() - st.st_mtime_ns > 2_000_000_000
 
 
@@ -1961,8 +1962,15 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         config_path = get_config_path()
         st = config_path.stat()
         hit = _raw_config_cache_hit(str(config_path), file_signature(st))
-        if hit is not None and _raw_config_mtime_settled(st):
-            return copy.deepcopy(hit) if want_deepcopy else hit
+        if hit is not None:
+            if _raw_config_mtime_settled(st):
+                return copy.deepcopy(hit) if want_deepcopy else hit
+            # Racily clean: re-read the file here rather than queue behind a writer holding
+            # _CONFIG_LOCK. Writers replace the file atomically, so this sees a whole version.
+            with open(config_path, encoding="utf-8-sig") as f:
+                data = fast_safe_load(f) or {}
+            if isinstance(data, dict):
+                return data
     except Exception:
         pass
 

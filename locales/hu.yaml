@@ -667,6 +667,7 @@ gateway:
     rate_limited: "⏱️ Az AI-modellszolgáltatás korlátozza a kérések számát. Várj egy kicsit, majd használd a /retry parancsot."
     auth_failed: "⚠️ Nem sikerült bejelentkezni az AI-modellszolgáltatásba. Jelentkezz be újra a /login paranccsal, vagy kérd meg a bot üzemeltetőjét, hogy futtassa a `hermes doctor` parancsot a gépen."
     bad_request: "⚠️ Az AI-modellszolgáltatás visszautasította ezt a kérést. Fogalmazd át az üzenetet, vagy válts modellt a /model paranccsal."
+    request_malformed: "⚠️ Belső hiba történt az MI-modellszolgáltatásnak szóló kérés összeállításakor (hibásan formázott üzenet a beszélgetésben), ez nem szolgáltatáskimaradás. Az előzmények meg lettek tisztítva — küldd el újra az üzenetet (vagy használd a /retry parancsot), és át kell mennie. A diagnosztika a gateway naplójában található (`hermes logs`)."
     connection_interrupted: "⚠️ Az AI-modellszolgáltatással a kapcsolat megszakadt a kérés közben — ez általában átmeneti. Próbáld újra a /retry paranccsal; ha ismétlődik, futtasd a `hermes doctor` parancsot a gépen."
     unreachable: "⚠️ Az AI-modellszolgáltatás jelenleg nem érhető el — a beállított modellvégpont nem fut, vagy nem elérhető. Várj egy kicsit, és használd a /retry parancsot; ha nem oldódik meg, futtasd a `hermes doctor` parancsot a gépen."
     connection_unknown: "⚠️ A Hermes nem érte el az AI-modellszolgáltatást (az SDK nem adott további részletet). Próbáld újra a /retry paranccsal; ha nem oldódik meg, futtasd a `hermes doctor` parancsot a gépen."

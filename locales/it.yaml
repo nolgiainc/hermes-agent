@@ -657,6 +657,7 @@ gateway:
     rate_limited: "⏱️ Il servizio del modello AI sta limitando le richieste. Attendi un momento, poi usa /retry."
     auth_failed: "⚠️ Accesso al servizio del modello AI non riuscito. Usa /login per accedere di nuovo, oppure chiedi a chi gestisce questo bot di eseguire `hermes doctor` sull'host."
     bad_request: "⚠️ Il servizio del modello AI ha rifiutato questa richiesta. Prova a riformulare il messaggio, oppure usa /model per cambiare modello."
+    request_malformed: "⚠️ Ho riscontrato un errore interno nel costruire la richiesta al servizio del modello di IA (un messaggio malformato nella conversazione), non un'interruzione del servizio. La cronologia è stata ripulita — invia di nuovo il messaggio (o usa /retry) e dovrebbe andare a buon fine. La diagnostica è nel log del gateway (`hermes logs`)."
     connection_interrupted: "⚠️ La connessione al servizio del modello AI si è interrotta a metà richiesta — di solito è un problema temporaneo. Usa /retry per riprovare; se continua, esegui `hermes doctor` sull'host."
     unreachable: "⚠️ Il servizio del modello AI non è raggiungibile al momento — l'endpoint del modello configurato non è in esecuzione o è irraggiungibile. Attendi un momento e usa /retry; se persiste, esegui `hermes doctor` sull'host."
     connection_unknown: "⚠️ Hermes non è riuscito a raggiungere il servizio del modello AI (nessun altro dettaglio dall'SDK). Usa /retry per riprovare; se persiste, esegui `hermes doctor` sull'host."

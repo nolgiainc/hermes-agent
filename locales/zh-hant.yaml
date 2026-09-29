@@ -657,6 +657,7 @@ gateway:
     rate_limited: "⏱️ AI 模型服務正在限制請求速率。請稍候，再使用 /retry。"
     auth_failed: "⚠️ 登入 AI 模型服務失敗。請使用 /login 重新登入，或請這個 bot 的管理者在主機上執行 `hermes doctor`。"
     bad_request: "⚠️ AI 模型服務拒絕了這個請求。請試著換個說法，或使用 /model 切換模型。"
+    request_malformed: "⚠️ 建構傳送至 AI 模型服務的請求時發生內部錯誤（對話中有格式錯誤的訊息），並非服務中斷。歷史記錄已清理 — 重新傳送你的訊息（或使用 /retry）即可順利通過。診斷資訊位於閘道記錄中（`hermes logs`）。"
     connection_interrupted: "⚠️ 與 AI 模型服務的連線在請求途中中斷 — 通常是暫時性的。請使用 /retry 重試；若持續發生，請在主機上執行 `hermes doctor`。"
     unreachable: "⚠️ 目前無法連上 AI 模型服務 — 設定的模型端點未在執行或無法連線。請稍候再使用 /retry；若問題持續，請在主機上執行 `hermes doctor`。"
     connection_unknown: "⚠️ Hermes 無法連上 AI 模型服務（SDK 未提供更多細節）。請使用 /retry 重試；若問題持續，請在主機上執行 `hermes doctor`。"

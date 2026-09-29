@@ -657,6 +657,7 @@ gateway:
     rate_limited: "⏱️ Die KI-modeldiens beperk tans die tempo van versoeke. Wag 'n oomblik en gebruik dan /retry."
     auth_failed: "⚠️ Aanmelding by die KI-modeldiens het misluk. Gebruik /login om weer aan te meld, of vra die persoon wat hierdie bot bedryf om `hermes doctor` op die gasheer uit te voer."
     bad_request: "⚠️ Die KI-modeldiens het hierdie versoek verwerp. Probeer jou boodskap anders formuleer, of gebruik /model om modelle te wissel."
+    request_malformed: "⚠️ Ek het 'n interne fout gekry terwyl ek die versoek aan die KI-modeldiens gebou het ('n misvormde boodskap in die gesprek), nie 'n diensonderbreking nie. Die geskiedenis is skoongemaak — stuur jou boodskap weer (of gebruik /retry) en dit behoort deur te gaan. Diagnostiek is in die gateway-log (`hermes logs`)."
     connection_interrupted: "⚠️ Die verbinding met die KI-modeldiens is halfpad deur die versoek onderbreek — gewoonlik tydelik. Gebruik /retry om weer te probeer; as dit aanhou gebeur, voer `hermes doctor` op die gasheer uit."
     unreachable: "⚠️ Die KI-modeldiens is tans nie bereikbaar nie — die opgestelde model-eindpunt loop nie of is onbereikbaar. Wag 'n oomblik en gebruik /retry; as dit voortduur, voer `hermes doctor` op die gasheer uit."
     connection_unknown: "⚠️ Hermes kon nie die KI-modeldiens bereik nie (geen verdere besonderhede van die SDK nie). Gebruik /retry om weer te probeer; as dit voortduur, voer `hermes doctor` op die gasheer uit."

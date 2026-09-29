@@ -657,6 +657,7 @@ gateway:
     rate_limited: "⏱️ AI 모델 서비스가 요청을 제한하고 있어요. 잠시 기다린 뒤 /retry를 사용하세요."
     auth_failed: "⚠️ AI 모델 서비스 로그인에 실패했어요. /login으로 다시 로그인하거나, 이 봇 운영자에게 호스트에서 `hermes doctor`를 실행해 달라고 요청하세요."
     bad_request: "⚠️ AI 모델 서비스가 이 요청을 거부했어요. 메시지를 다르게 표현해 보거나 /model로 모델을 바꿔 보세요."
+    request_malformed: "⚠️ AI 모델 서비스로 보낼 요청을 만드는 중 내부 오류가 발생했습니다(대화 내 잘못된 형식의 메시지). 서비스 장애가 아닙니다. 기록을 정리했으니 메시지를 다시 보내면(또는 /retry 사용) 정상적으로 처리될 것입니다. 진단 정보는 게이트웨이 로그(`hermes logs`)에 있습니다."
     connection_interrupted: "⚠️ 요청 도중 AI 모델 서비스와의 연결이 끊어졌어요 — 대개 일시적인 문제예요. /retry로 다시 시도하고, 계속 반복되면 호스트에서 `hermes doctor`를 실행하세요."
     unreachable: "⚠️ 지금은 AI 모델 서비스에 연결할 수 없어요 — 설정된 모델 엔드포인트가 실행 중이 아니거나 접근할 수 없어요. 잠시 기다린 뒤 /retry를 사용하고, 계속되면 호스트에서 `hermes doctor`를 실행하세요."
     connection_unknown: "⚠️ Hermes가 AI 모델 서비스에 연결하지 못했어요 (SDK에서 추가 정보를 제공하지 않았어요). /retry로 다시 시도하고, 계속되면 호스트에서 `hermes doctor`를 실행하세요."

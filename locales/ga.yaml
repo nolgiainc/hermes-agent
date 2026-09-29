@@ -657,6 +657,7 @@ gateway:
     rate_limited: "⏱️ Tá seirbhís na samhla AI ag teorannú ráta na n-iarratas. Fan nóiméad, ansin úsáid /retry."
     auth_failed: "⚠️ Theip ar shíniú isteach i seirbhís na samhla AI. Úsáid /login chun síniú isteach arís, nó iarr ar an duine a ritheann an bot seo `hermes doctor` a rith ar an óstach."
     bad_request: "⚠️ Dhiúltaigh seirbhís na samhla AI don iarratas seo. Bain triail as do theachtaireacht a athfhoclú, nó úsáid /model chun samhail eile a roghnú."
+    request_malformed: "⚠️ Tharla earráid inmheánach agus an t-iarratas chuig seirbhís an mhúnla IS á thógáil (teachtaireacht mhífhoirmithe sa chomhrá), ní briseadh seirbhíse é. Glanadh an stair — seol do theachtaireacht arís (nó úsáid /retry) agus ba cheart go rachadh sí tríd. Tá na diagnóisicí i log an gheata (`hermes logs`)."
     connection_interrupted: "⚠️ Briseadh an ceangal le seirbhís na samhla AI i lár an iarratais — is neamhbhuan é de ghnáth. Úsáid /retry le triail eile a bhaint as; má leanann sé ar aghaidh, rith `hermes doctor` ar an óstach."
     unreachable: "⚠️ Ní féidir seirbhís na samhla AI a shroicheadh faoi láthair — níl críochphointe na samhla cumraithe ag rith nó tá sé dosroichte. Fan nóiméad agus úsáid /retry; má leanann sé ar aghaidh, rith `hermes doctor` ar an óstach."
     connection_unknown: "⚠️ Níorbh fhéidir le Hermes seirbhís na samhla AI a shroicheadh (gan sonraí eile ón SDK). Úsáid /retry le triail eile a bhaint as; má leanann sé ar aghaidh, rith `hermes doctor` ar an óstach."
