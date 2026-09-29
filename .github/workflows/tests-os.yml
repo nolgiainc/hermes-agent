@@ -67,7 +67,7 @@ jobs:
             marker: macos
           - name: Windows-only tests
             runner: windows-latest
-            marker: windows_only
+            marker: windows
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -181,7 +181,7 @@ jobs:
           scripts/run_tests.sh \
             "$@" \
             ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
-            -m "${{ matrix.marker }} and not integration" \
+            -m "platforms and not integration" \
             -v --tb=short
         env:
           # Platform regressions stay blocking even if a retry would pass.
