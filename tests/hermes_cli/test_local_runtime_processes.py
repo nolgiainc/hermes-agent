@@ -174,7 +174,10 @@ def test_failed_setup_never_runs_child_and_releases_handles(tmp_path, monkeypatc
 
     def assign(job, proc):
         children.append(proc)
-        assert psutil.Process(proc.pid).status() == psutil.STATUS_STOPPED
+        # CREATE_SUSPENDED parks the initial thread with a kernel APC delivered the first
+        # time it is scheduled, before any user-mode code; on a loaded runner psutil can
+        # still see that thread Ready (reported "running") right after Popen returns.
+        assert _wait(lambda: psutil.Process(proc.pid).status() == psutil.STATUS_STOPPED)
         assert not marker.exists()
         # Query the actual kernel object, not implementation source/constants.
         limits = processes._ExtendedLimits()
