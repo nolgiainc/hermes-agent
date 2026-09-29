@@ -35,6 +35,7 @@ stable signal rather than a flaky one.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -103,11 +104,17 @@ def sandbox(tmp_path_factory: pytest.TempPathFactory) -> Path:
     # so it needs the committed file as its starting point.
     shutil.copy2(SIDEBARS, root / "website" / "sidebars.ts")
 
+    # The generator imports repo modules (hermes_yaml) from the root it derives from its own
+    # location, which here is the sandbox. Only the import path points at the real checkout;
+    # every path it reads and writes stays in the sandbox.
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(REPO_ROOT), env.get("PYTHONPATH", "")) if p)
     proc = subprocess.run(
         [sys.executable, str(script)],
         capture_output=True,
         text=True,
         cwd=root,
+        env=env,
     )
     assert proc.returncode == 0, (
         f"generate-skill-docs.py failed (exit {proc.returncode}):\n"
