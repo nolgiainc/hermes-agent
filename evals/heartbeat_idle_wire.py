@@ -66,8 +66,11 @@ async def main(base_poller):
         return "wire reply"
 
     async def drain():
-        while adapter._background_tasks:
-            await asyncio.gather(*list(adapter._background_tasks))
+        # Wait on live tasks only: gather() over already-finished tasks completes without yielding
+        # (3.12+), so a finished task whose queued set-discard callback has not run yet would spin
+        # this loop forever and starve that very callback.
+        while live := [task for task in adapter._background_tasks if not task.done()]:
+            await asyncio.gather(*live)
 
     def snapshot():
         return {"turns": len(received), "queue_depth": runner._queue_depth(key, adapter=adapter),
