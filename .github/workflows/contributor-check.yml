@@ -78,7 +78,7 @@ jobs:
               continue
             fi
 
-            if ! grep -qF "\"${email}\"" scripts/release.py 2>/dev/null; then
+            if ! grep -qF "\"${email}\"" scripts/releases/authors_legacy.py 2>/dev/null; then
               AUTHOR=$(git log --author="$email" --format='%an' -1)
               MISSING="${MISSING}\n  ${email} (${AUTHOR})"
             fi
