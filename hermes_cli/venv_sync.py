@@ -327,13 +327,23 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
     clear_completion(root)
 
 
+def source_update_extras(root: Path) -> list[str] | None:
+    """Extras a source update must select for *root*.
+
+    Main-era installs have no PM ledger; carry what their venv held.
+    Established PM installs retain their recorded extras and plugin union instead.
+    """
+    from pm.environments import runtime_facts_path
+    from pm.extras import legacy_selection
+
+    return legacy_selection(root) if not runtime_facts_path(root).is_file() else None
+
+
 def _sync_source_dependencies(root: Path, *, arm: bool) -> None:
     """Commit the tree's dependency generation; *arm* also owes the tail afterwards."""
     import sys
     import pm
     from pm.client import ensure_tools_for_sync
-    from pm.environments import runtime_facts_path
-    from pm.extras import legacy_selection
 
     if not arm:
         print("hermes: preparing dependencies for this update...", file=sys.stderr, flush=True)
@@ -342,9 +352,7 @@ def _sync_source_dependencies(root: Path, *, arm: bool) -> None:
         # Owed from before the sync commits: a crash between the commit and the
         # tail must leave the tail, not a "current" install with nothing built.
         arm_completion(root)
-    # Main-era installs have no PM ledger; carry what their venv held.
-    # Established PM installs retain their recorded extras and plugin union instead.
-    extras = legacy_selection(root) if not runtime_facts_path(root).is_file() else None
+    extras = source_update_extras(root)
     # Same order as `hermes update`: an interrupted update or a hand-run
     # `git pull` leaves this tree's lockfile ahead of the installed tools.
     ensure_tools_for_sync()
