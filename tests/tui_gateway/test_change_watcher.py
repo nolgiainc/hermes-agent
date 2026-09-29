@@ -284,7 +284,11 @@ def test_pairing_probe_reuses_live_profile_roots_until_the_profile_set_moves(wat
     _profile("play")
     os.utime(home / "profiles", ns=(0, 10**18))  # deterministic parent-mtime bump
     server._broadcast_watched_changes(now=20.0)
-    (home / "profiles" / "play" / "platforms" / "pairing" / "discord-approved.json").write_text("{}", encoding="utf-8")
+    ledger = home / "profiles" / "play" / "platforms" / "pairing" / "discord-approved.json"
+    ledger.write_text("{}", encoding="utf-8")
+    # A coarse fs clock can stamp both ledgers in the same tick; the probe signals on the newest mtime.
+    newer = (home / "profiles" / "work" / "platforms" / "pairing" / "telegram-pending.json").stat().st_mtime_ns + 10**9
+    os.utime(ledger, ns=(newer, newer))
     server._broadcast_watched_changes(now=30.0)
     assert events == [("pairing.changed", {})] * 2
     assert sorted(live_calls) == ["play", "work", "work"]

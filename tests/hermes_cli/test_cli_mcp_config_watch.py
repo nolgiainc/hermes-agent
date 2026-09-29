@@ -224,6 +224,10 @@ def test_pinned_mtime_same_size_replacement_triggers_reload(tmp_path):
     obj._config_sig = file_signature(cfg_file.stat())
     other = tmp_path / "other.yaml"
     other.write_text("mcp_servers:\n  aa: {command: a}\n")
+    # ctime ticks at the kernel's coarse clock (~4 ms): an in-place rewrite inside the tick of the
+    # recorded signature leaves every stat field equal. Wait until the fs clock has passed that ctime.
+    while other.stat().st_ctime_ns <= obj._config_sig[3]:
+        os.utime(other)
     shutil.copy2(other, cfg_file)
     os.utime(cfg_file, ns=(obj._config_sig[0], obj._config_sig[0]))
 

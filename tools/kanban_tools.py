@@ -512,7 +512,9 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
 # worker context (no ``HERMES_KANBAN_TASK``). - No durable note on these auto-heartbeats; that's reserved
 # for the explicit tool which carries a model-supplied note.
 _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
-_auto_heartbeat_last_attempt: float = 0.0
+# -inf, not 0.0: time.monotonic() counts from host boot, so 0.0 throttled a worker's first beat on a host
+# up for under a minute (fresh CI VMs, containers).
+_auto_heartbeat_last_attempt: float = float("-inf")
 _auto_heartbeat_fence_warned = False
 
 
