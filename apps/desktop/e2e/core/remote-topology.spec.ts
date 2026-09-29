@@ -66,7 +66,7 @@ function imageParts(body: any): string[] {
 }
 
 /** The sidebar session row showing `text` (rows own a [data-row-actions] cluster; chat bubbles do not). */
-function sidebarRow(page: Page, text: string) {
+function sidebarRow(page: Page, text: RegExp | string) {
   const row = '*:has(> [data-row-actions])'
 
   return page.locator(`${row}:not(${row} *)`).filter({ hasText: text, visible: true }).first()
@@ -184,7 +184,10 @@ test('remote backend: first chat, image bytes not client paths, rename across a 
 
     await test.step('a sidebar rename survives a backend kill + restart (#121192)', async () => {
       const title = `Renamed ${nonce}`
-      const row = sidebarRow(page, U(1))
+      // Untitled, so the row shows a preview: the backend's is the first user
+      // message, but a send stamps the latest one locally until the next
+      // session-list refresh, which need not come before this step.
+      const row = sidebarRow(page, new RegExp(`${U(1)}|${U(2)}`))
       await expect(row).toBeVisible({ timeout: 60_000 })
       await row.click({ button: 'right' })
       await page
