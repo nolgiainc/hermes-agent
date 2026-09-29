@@ -140,7 +140,13 @@ def test_serve_tree_kill_leaves_no_orphans_and_reboots(tmp_path: Path) -> None:
             assert first.pid in owned, f"ownership scan cannot see serve pid {first.pid} (saw {owned})"
 
             killed = taskkill_tree(first.pid)
-            assert killed.returncode == 0, killed.stderr
+            # taskkill /T terminates children first, and the venv python.exe redirector exits
+            # on its own once its interpreter child dies, so taskkill can find the root already
+            # gone ("no running instance", rc 255). The contract is a dead tree, not its rc.
+            try:
+                first.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                pytest.fail(f"serve pid {first.pid} outlived taskkill /T /F: {killed.stdout!r} {killed.stderr!r}")
             # Ownership, not ancestry: anything the backend spawned detached (a broken
             # parent link taskkill /T cannot follow) still carries this profile's
             # HERMES_HOME / cwd, and is an orphan the Desktop quit leaves behind.
