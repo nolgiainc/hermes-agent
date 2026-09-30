@@ -581,7 +581,9 @@ hermes-acp = "acp_adapter.entry:main"
 # build with --all-extras and pass --no-extra for each of these, so their
 # closures never ship. KittenTTS pulls torch, transformers and spaCy through
 # misaki[en]: installed when the user picks it, not preinstalled.
-opt-in-extras = ["kittentts"]
+# nolgia-ugc (Nolgia fork) is pod-only: the Dockerfile names it explicitly, and
+# opencv-python-headless has no win_arm64 wheel, so desktop bundles skip it.
+opt-in-extras = ["kittentts", "nolgia-ugc"]
 
 # Per-extra platform gates (settled 2026-09-02): an extra listed here is
 # only installable on platforms matching the marker. pm consults this
