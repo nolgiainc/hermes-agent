@@ -195,6 +195,12 @@ jobs:
         env:
           # Platform regressions stay blocking even if a retry would pass.
           HERMES_TEST_FILE_RETRIES: "0"
+          # nolgiainc fork: 900 (runner default 300). On the shared windows-latest
+          # runner tests/pm/test_windows_build_deps.py (five PowerShell children)
+          # takes 194-287 s and test_bootstrap_mirror.py ~275 s; the former hit the
+          # flat 300 s cap mid-test on PR #51. This job does not restore
+          # test_durations.json, so the runner's duration-based scaling never applies.
+          HERMES_TEST_FILE_TIMEOUT: "900"
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
           OPENROUTER_API_KEY: ''
