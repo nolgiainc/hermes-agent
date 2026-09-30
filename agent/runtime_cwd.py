@@ -44,6 +44,21 @@ def clear_session_cwd() -> None:
     _SESSION_CWD.set("")
 
 
+def scoped_session_cwd() -> str:
+    """Return the current session's declared cwd without local path validation.
+
+    Remote and container paths may not exist on the Hermes host. Callers that only need
+    logical workspace identity should preserve the declared value instead of resolving it.
+    """
+    value = _SESSION_CWD.get()
+    return "" if value is _UNSET else str(value).strip()
+
+
+def reset_session_cwd(token: Token) -> None:
+    """Restore the logical cwd that was active before the matching ``set_session_cwd``."""
+    _SESSION_CWD.reset(token)
+
+
 def scope_terminal_cwd() -> str:
     """Scope-aware TERMINAL_CWD value (may be empty) — every cwd consumer reads through this.
 
@@ -66,24 +81,31 @@ def _existing_dir(raw: str, label: str) -> Path | None:
     return None
 
 
-def _resolve_configured_cwd(*, override_is_final: bool, ignore_scratch_override: bool = False) -> Path | None:
+def _resolve_configured_cwd(
+    *, override_is_final: bool, include_session_override: bool = True,
+    ignore_scratch_override: bool = False,
+) -> Path | None:
     """Session override, then TERMINAL_CWD; each validated as a real directory.
 
     ``override_is_final``: a set-but-missing session override yields None
     instead of falling through to TERMINAL_CWD.
 
+    ``include_session_override``: skip a session cwd known to be a launch artifact
+    while still consulting the active profile's TERMINAL_CWD.
+
     ``ignore_scratch_override`` (NOL-414): a session override equal to the turn's bound
     scratch workspace (``_session_scratch_dir``) is treated as unset, so resolution falls
     through to TERMINAL_CWD exactly as it did before the bind.
     """
-    override = _SESSION_CWD.get()
-    override = "" if override is _UNSET else str(override).strip()
-    if override and ignore_scratch_override and override == _session_scratch_dir():
-        override = ""
-    if override:
-        p = _existing_dir(override, "configured working directory")
-        if p is not None or override_is_final:
-            return p
+    if include_session_override:
+        override = _SESSION_CWD.get()
+        override = "" if override is _UNSET else str(override).strip()
+        if override and ignore_scratch_override and override == _session_scratch_dir():
+            override = ""
+        if override:
+            p = _existing_dir(override, "configured working directory")
+            if p is not None or override_is_final:
+                return p
     raw = scope_terminal_cwd().strip()
     return _existing_dir(raw, "TERMINAL_CWD") if raw else None
 
@@ -112,7 +134,7 @@ def resolve_agent_cwd() -> Path:
     return _resolve_configured_cwd(override_is_final=False) or Path(os.getcwd())
 
 
-def resolve_context_cwd() -> Path | None:
+def resolve_context_cwd(*, include_session_override: bool = True) -> Path | None:
     """Configured cwd for context-file discovery, or None (build_context_files_prompt then falls back to the
     launch dir). An existing configured path is honored verbatim — including the Hermes source tree, a
     legitimate workspace when developing Hermes; fallback-directory policy lives in the caller.
@@ -122,5 +144,12 @@ def resolve_context_cwd() -> Path | None:
     (resolve_agent_cwd, the prompt's "Current working directory" line, tool cwd records all
     agree), but doctrine discovery must keep anchoring where it did before the bind — the
     TERMINAL_CWD/home fallback — or every API-server turn on a session-workspace deployment
-    silently loses its workspace AGENTS.md."""
-    return _resolve_configured_cwd(override_is_final=True, ignore_scratch_override=True)
+    silently loses its workspace AGENTS.md.
+
+    Launch-artifact callers can skip the session override while still honoring the active
+    profile's TERMINAL_CWD.
+    """
+    return _resolve_configured_cwd(
+        override_is_final=True, include_session_override=include_session_override,
+        ignore_scratch_override=True,
+    )

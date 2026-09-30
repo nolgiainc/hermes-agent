@@ -19,6 +19,7 @@ The leak-safety properties under test mirror the existing
   credential to every other run's later commands).
 """
 
+import base64
 import re
 import threading
 import time
@@ -92,6 +93,15 @@ async def _wait_completed(cli, run_id, tries=100, headers=None):
 
         await asyncio.sleep(0.02)
     raise AssertionError("run never settled")
+
+
+def _session_db_stub(tips=None) -> MagicMock:
+    """A session DB whose ids resolve to themselves unless *tips* maps one to a compression tip:
+    /v1/chat/completions and the in-process wake adopt the live tip before binding (#98619)."""
+    return MagicMock(
+        get_messages_as_conversation=MagicMock(return_value=[]),
+        resolve_resume_session_id=MagicMock(side_effect=lambda sid: (tips or {}).get(sid, sid)),
+    )
 
 
 class TestSessionContextVar:
@@ -402,9 +412,7 @@ class TestWakeContinuationRetainedToken:
 
                 # 2. Wake continuation: same session id, NO token in the
                 #    request — exactly gateway.wake's self-post shape.
-                adapter._session_db = MagicMock(
-                    get_messages_as_conversation=MagicMock(return_value=[])
-                )
+                adapter._session_db = _session_db_stub()
                 resp = await cli.post(
                     "/v1/chat/completions",
                     headers={"X-Hermes-Session-Id": "sess-wake", **auth},
@@ -441,9 +449,7 @@ class TestWakeContinuationRetainedToken:
             agent._last_compaction_in_place = False
             return agent
 
-        adapter._session_db = MagicMock(
-            get_messages_as_conversation=MagicMock(return_value=[])
-        )
+        adapter._session_db = _session_db_stub()
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_create_agent", side_effect=_fake_create_agent):
                 resp = await cli.post(
@@ -485,9 +491,7 @@ class TestWakeContinuationRetainedToken:
             agent._last_compaction_in_place = False
             return agent
 
-        adapter._session_db = MagicMock(
-            get_messages_as_conversation=MagicMock(return_value=[])
-        )
+        adapter._session_db = _session_db_stub()
         # A later turn on this session has already overwritten the retained
         # token; the wake must NOT pick that one up.
         adapter._retain_session_run_token("sess-wake", "nolt_newer_turn")
@@ -510,6 +514,83 @@ class TestWakeContinuationRetainedToken:
             "bound_token": "nolt_origin_run",
             "child_env_token": "nolt_origin_run",
         }
+
+    @pytest.mark.asyncio
+    async def test_rotated_session_continuation_keeps_the_submitted_runs_token(self):
+        """A compression rotation mints a tip with no retained credential of its own. The
+        continuation addressed to the id the run was submitted with adopts the tip (#98619) and
+        must still bind that run's token, found under the addressed id."""
+        adapter = _make_adapter(api_key="sk-secret")
+        app = _create_runs_app(adapter)
+        app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+        seen: dict = {}
+
+        def _observing_run(user_message=None, conversation_history=None, task_id=None, **_kw):
+            seen["bound_token"] = get_session_env("HERMES_SESSION_NOLGIA_TOKEN")
+            seen["child_env_token"] = _simulated_cli_spawn_env().get("NOLGIA_TOKEN")
+            return {"final_response": "done"}
+
+        def _fake_create_agent(**kwargs):
+            seen["session_id"] = kwargs.get("session_id")
+            agent = MagicMock()
+            agent.run_conversation.side_effect = _observing_run
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            agent.session_id = "sess-wake-tip"
+            agent._last_compaction_in_place = False
+            return agent
+
+        adapter._session_db = _session_db_stub({"sess-wake": "sess-wake-tip"})
+        adapter._retain_session_run_token("sess-wake", "nolt_wake")
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_fake_create_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "sess-wake", "Authorization": "Bearer sk-secret"},
+                    json={"messages": [{"role": "user", "content": "delegation finished"}]},
+                )
+                assert resp.status == 200
+
+        assert seen == {
+            "session_id": "sess-wake-tip",
+            "bound_token": "nolt_wake",
+            "child_env_token": "nolt_wake",
+        }
+
+    @pytest.mark.asyncio
+    async def test_in_process_wake_carries_the_originating_runs_credential(self, monkeypatch):
+        """A served profile's wake runs in-process (no HTTP payload to carry the credential). The
+        originating run's token must still reach the turn, and absent one the token retained
+        under the addressed id binds even after the id resolves to a compression tip."""
+        from gateway.wake import _self_post_chat_completion
+
+        adapter = _make_adapter(api_key="sk-secret")
+        adapter._session_db = _session_db_stub({"sess-parent": "sess-tip"})
+        seen: list = []
+
+        async def _fake_run_agent(**kwargs):
+            seen.append((kwargs["session_id"], kwargs.get("nolgia_token")))
+            return {}, {}
+
+        async def _existing(session_id):
+            return {"id": session_id}, None
+
+        async def _history(session_id):
+            return []
+
+        monkeypatch.setattr(adapter, "_run_agent", _fake_run_agent)
+        monkeypatch.setattr(adapter, "_get_existing_session_or_404", _existing)
+        monkeypatch.setattr(adapter, "_conversation_history_for_session", _history)
+        monkeypatch.setattr(adapter, "_select_request_route", lambda *a, **k: (None, {}, None))
+
+        await _self_post_chat_completion(adapter, text="wake", session_id="sess-parent",
+                                         nolgia_token="nolt_origin_run", profile="builder")
+        adapter._retain_session_run_token("sess-parent", "nolt_retained", profile="builder")
+        await _self_post_chat_completion(adapter, text="wake", session_id="sess-parent",
+                                         profile="builder")
+
+        assert seen == [("sess-tip", "nolt_origin_run"), ("sess-tip", "nolt_retained")]
 
     @pytest.mark.asyncio
     async def test_continuation_rejects_a_malformed_credential(self):
@@ -912,12 +993,18 @@ class TestRemoteSandboxCredentialDelivery:
     """How the granted credential reaches a remote sandbox script. A
     ``VAR=value cmd`` prefix lands in the wrapping shell's argv, which any
     co-tenant process in the sandbox can read out of /proc (and which backends
-    are free to log), so the value travels on stdin instead."""
+    are free to log), so the value rides the owner-only sandbox env file —
+    shipped as stdin_data and sourced inside a subshell — instead."""
 
-    def _script_call(self, env) -> tuple:
-        script_calls = [c for c in env.calls if "python3 script.py" in c[0]]
-        assert len(script_calls) == 1, script_calls
-        return script_calls[0]
+    def _launch_call(self, env) -> tuple:
+        launch_calls = [c for c in env.calls if "python3 script.py" in c[0]]
+        assert len(launch_calls) == 1, launch_calls
+        return launch_calls[0]
+
+    def _env_file(self, env) -> str:
+        writes = [c for c in env.calls if "sandbox.env" in c[0] and "base64 -d" in c[0]]
+        assert len(writes) == 1, writes
+        return base64.b64decode(writes[0][1]).decode("utf-8")
 
     def _run(self, monkeypatch, env, token="nolt_run"):
         import tools.code_execution_tool as cet
@@ -927,29 +1014,28 @@ class TestRemoteSandboxCredentialDelivery:
         monkeypatch.setattr(cet, "_rpc_poll_loop", lambda *_a, **_kw: None)
         cet._execute_remote("print(1)", "task-remote", ["read_file"])
 
-    def test_credential_travels_on_stdin_not_in_the_command(self, monkeypatch):
+    def test_credential_travels_in_the_env_file_not_in_any_command(self, monkeypatch):
         env = _FakeRemoteEnv()
         self._run(monkeypatch, env)
-        command, stdin_data = self._script_call(env)
-        assert stdin_data == "nolt_run\n"
-        assert "NOLGIA_TOKEN" in command, "the script still gets the override"
-        # Not in this command, and not in any other command of the execution.
+        assert "NOLGIA_TOKEN=nolt_run\n" in self._env_file(env)
+        command, stdin_data = self._launch_call(env)
+        assert stdin_data is None
+        assert "( set -a && . ./sandbox.env && set +a && exec python3 script.py )" in command
+        # Not in the launch command, and not in any other command of the execution.
         assert all("nolt_run" not in cmd for cmd, _stdin in env.calls)
 
-    def test_unavailable_credential_leaves_the_command_untouched(self, monkeypatch):
+    def test_unavailable_credential_ships_no_token(self, monkeypatch):
         env = _FakeRemoteEnv()
         self._run(monkeypatch, env, token="")
-        command, stdin_data = self._script_call(env)
-        assert stdin_data is None
-        assert "NOLGIA_TOKEN" not in command
+        assert "NOLGIA_TOKEN" not in self._env_file(env)
+        assert all("NOLGIA_TOKEN" not in cmd for cmd, _stdin in env.calls)
 
     def test_heredoc_backend_keeps_its_pod_credential(self, monkeypatch):
         """Heredoc backends splice stdin back INTO the command text, which would
-        reintroduce the same argv exposure — they keep the pod-wide bearer
+        put the env file's payload in argv — they keep the pod-wide bearer
         rather than gain a better-attributed but leaked credential."""
         env = _FakeRemoteEnv(stdin_mode="heredoc")
         self._run(monkeypatch, env)
-        command, stdin_data = self._script_call(env)
-        assert stdin_data is None
-        assert "NOLGIA_TOKEN" not in command
-        assert all("nolt_run" not in cmd for cmd, _stdin in env.calls)
+        assert "NOLGIA_TOKEN" not in self._env_file(env)
+        assert all("nolt_run" not in cmd and "nolt_run" not in (stdin or "")
+                   for cmd, stdin in env.calls)

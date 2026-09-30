@@ -99,7 +99,7 @@ def _visible_entries(path: str) -> list:
 
 def _write_config(mapping: dict) -> Path:
     """Write config.yaml under the test-isolated HERMES_HOME."""
-    import yaml
+    import hermes_yaml as yaml
 
     from hermes_cli.config import get_config_path
 

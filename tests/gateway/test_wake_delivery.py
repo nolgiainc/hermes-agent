@@ -130,17 +130,18 @@ def test_deliver_wake_carries_the_originating_runs_credential():
     assert "nolgia_token" not in seen["body"]
 
 
-def test_deliver_wake_targets_the_originating_profiles_route(monkeypatch):
+def test_deliver_wake_targets_the_originating_profiles_runtime():
     """A multiplexed session lives in ITS profile's runtime (own HERMES_HOME /
-    state.db / secret scope / retained-credential scope), so the self-post must
-    re-enter through /p/<profile>/... with THAT profile's API_SERVER_KEY —
-    posting to the unprefixed route would run the continuation in the default
-    profile, where neither the session history nor its retained credential
-    exists (NOL-413)."""
+    state.db / secret scope / retained-credential scope). A served profile's
+    wake runs IN-PROCESS under that profile — never an unprefixed self-post,
+    which would run the continuation in the default profile where neither the
+    session history nor its retained credential exists — and still carries the
+    originating run's credential (NOL-413). The default profile, however it is
+    spelled, self-posts to the unprefixed route with the listener's key."""
     from aiohttp import web
-    import gateway.wake as wake
 
     seen = {}
+    internal = []
 
     async def handler(request):
         seen["path"] = request.path
@@ -148,46 +149,39 @@ def test_deliver_wake_targets_the_originating_profiles_route(monkeypatch):
         seen["session_id"] = request.headers.get("X-Hermes-Session-Id")
         return web.json_response({"choices": []})
 
-    async def serve_both(handler):
-        app = web.Application()
-        app.router.add_post("/v1/chat/completions", handler)
-        app.router.add_post("/p/alpha/v1/chat/completions", handler)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "127.0.0.1", 0)
-        await site.start()
-        return runner, site._server.sockets[0].getsockname()[1]
+    class InProcessAdapter(ApiServerLikeAdapter):
+        async def run_internal_session_turn(self, **kwargs):
+            internal.append(kwargs)
 
-    async def run(profile):
-        runner, port = await serve_both(handler)
+    async def run(profile, token=""):
+        runner, port = await _serve(handler)
         try:
-            adapter = ApiServerLikeAdapter(port=port, key="listener-key")
+            adapter = InProcessAdapter(port=port, key="listener-key")
             await deliver_wake(
-                adapter, text="done", session_id="sid-p", profile=profile
+                adapter, text="done", session_id="sid-p", profile=profile, nolgia_token=token
             )
         finally:
             await runner.cleanup()
 
-    monkeypatch.setattr(wake, "_profile_scoped_api_key", lambda _p: "alpha-key")
-    asyncio.run(run("alpha"))
-    assert seen["path"] == "/p/alpha/v1/chat/completions"
-    assert seen["auth"] == "Bearer alpha-key"
-    assert seen["session_id"] == "sid-p"
+    asyncio.run(run("alpha", token="nolt_origin_run"))
+    assert seen == {}
+    assert internal == [{"session_id": "sid-p", "text": "done", "profile": "alpha",
+                         "notification_category": "result", "nolgia_token": "nolt_origin_run"}]
 
-    # The default profile has no prefixed route of its own to prefer.
-    for default_spelling in ("", "default"):
+    for default_spelling in ("", "default", " default "):
         seen.clear()
+        internal.clear()
         asyncio.run(run(default_spelling))
-        assert seen["path"] == "/v1/chat/completions"
-        assert seen["auth"] == "Bearer listener-key"
+        assert internal == []
+        assert seen == {"path": "/v1/chat/completions", "auth": "Bearer listener-key",
+                        "session_id": "sid-p"}
 
-    # No usable profile-scoped key: fall back to the unprefixed route rather
-    # than post an unauthenticated (guaranteed-401) request.
-    seen.clear()
-    monkeypatch.setattr(wake, "_profile_scoped_api_key", lambda _p: "")
-    asyncio.run(run("alpha"))
-    assert seen["path"] == "/v1/chat/completions"
-    assert seen["auth"] == "Bearer listener-key"
+
+def test_served_profile_wake_fails_closed_without_in_process_delivery():
+    """An adapter that cannot run a served profile's turn in-process must RAISE (so the caller
+    rewinds) rather than self-post it into the default profile."""
+    with pytest.raises(RuntimeError, match="requires in-process session delivery"):
+        asyncio.run(deliver_wake(ApiServerLikeAdapter(), text="done", session_id="sid", profile="alpha"))
 
 
 def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
@@ -269,10 +263,13 @@ def test_persist_delegation_delivery_uses_origin_profile_scope(tmp_path, monkeyp
     default_home = tmp_path / ".hermes"
     profile_home = default_home / "profiles" / "alpha"
     profile_home.mkdir(parents=True)
+    # A live profile carries an identity marker; a bare directory is a ghost shell.
+    (profile_home / "config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(default_home))
     monkeypatch.setattr("hermes_cli.profiles._get_profiles_root", lambda: default_home / "profiles")
     db = MagicMock()
+    db.resolve_resume_session_id.side_effect = lambda sid: sid
 
     class DbAdapter(ApiServerLikeAdapter):
         def _ensure_session_db(self):
@@ -283,7 +280,8 @@ def test_persist_delegation_delivery_uses_origin_profile_scope(tmp_path, monkeyp
         DbAdapter(), text="result", session_id="sid", profile="alpha",
     ))
 
-    db.append_message.assert_called_once()
+    db.append_delegation_delivery.assert_called_once()
+    assert db.append_delegation_delivery.call_args.args[:2] == ("sid", "result")
 
 
 def test_persist_delegation_delivery_raises_without_db():

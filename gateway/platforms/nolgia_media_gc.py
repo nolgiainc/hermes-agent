@@ -206,7 +206,7 @@ class _Ledger:
             return
         self._loaded = True
         try:
-            raw_lines = self._path.read_text(encoding="utf-8").splitlines()
+            raw_lines = self._path.read_text(encoding="utf-8-sig").splitlines()
         except OSError:
             return
         for line in raw_lines:
@@ -241,7 +241,7 @@ class _Ledger:
 
     def _maybe_compact_locked(self) -> None:
         try:
-            with open(self._path, "r", encoding="utf-8") as handle:
+            with open(self._path, "r", encoding="utf-8-sig") as handle:
                 lines = handle.readlines()
             if len(lines) <= _LEDGER_COMPACT_LINES:
                 return

@@ -377,7 +377,7 @@ def _claim_workspace(path: str, raw_id: str) -> bool:
         fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
         try:
-            with open(marker, "r", encoding="utf-8", errors="replace") as fh:
+            with open(marker, "r", encoding="utf-8-sig", errors="replace") as fh:
                 return fh.read(4096).strip() == raw_id
         except OSError:
             logger.debug("session workspace owner marker unreadable: %s", marker)

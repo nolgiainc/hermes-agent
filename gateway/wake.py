@@ -14,12 +14,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any, Optional
-from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
-# Wire spelling of the default profile: ``/p/default/...`` and the unprefixed routes are the same
-# runtime, so it needs no prefix (see gateway.platforms.api_server._DEFAULT_PROFILE_NAME).
+# Wire spelling of the default profile: its wake self-posts over HTTP; every other served profile
+# runs in-process (see gateway.platforms.api_server._DEFAULT_PROFILE_NAME).
 _DEFAULT_PROFILE_NAME = "default"
 
 # A wake self-post runs the whole agent turn synchronously (stream=false); generous ceiling so long
@@ -32,32 +31,6 @@ WAKE_TURN_TIMEOUT_SECONDS = 600.0
 _RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
 
 
-def _profile_scoped_api_key(profile: str) -> str:
-    """Resolve *profile*'s own ``API_SERVER_KEY``, or ``""``.
-
-    Mirrors ``ApiServerAdapter._expected_api_key``: a ``/p/<profile>/`` request
-    is authenticated against the key in THAT profile's secret scope, not the
-    listener owner's, so a self-post through the mirror must present it. Never
-    logs the key or the underlying error text.
-    """
-    try:
-        from agent.secret_scope import get_secret
-        from gateway.run import _profile_runtime_scope
-        from hermes_cli.auth import has_usable_secret
-        from hermes_cli.profiles import get_profile_dir
-
-        with _profile_runtime_scope(get_profile_dir(profile)):
-            key = get_secret("API_SERVER_KEY", "") or ""
-        return key if has_usable_secret(key, min_length=16) else ""
-    except Exception as exc:
-        logger.warning(
-            "Could not resolve a profile-scoped API_SERVER_KEY for %r: %s",
-            profile,
-            type(exc).__name__,
-        )
-        return ""
-
-
 def adapter_supports_push(adapter: Any) -> bool:
     """Whether this adapter can push a message to the user after a turn ends. Reads
     ``supports_async_delivery`` off the adapter class rather than the request-scoped contextvar
@@ -66,22 +39,70 @@ def adapter_supports_push(adapter: Any) -> bool:
     return bool(getattr(adapter, "supports_async_delivery", True))
 
 
+class WakeNotAccepted(RuntimeError):
+    """No adapter admission: retry without treating a healthy chat as dead."""
+
+
+def session_owned_by_profile(config: Any, profile: Optional[str], session_id: Any) -> bool:
+    """True when a stateless (``api_server``) destination's raw session id is canonically owned by
+    served *profile*'s own session store.
+
+    A shared-listener mirror platform has no chat/thread/guild anchor a ``profile_routes`` entry
+    could match, so the session store itself is the ownership proof: the row must exist in that
+    profile's ``state.db`` under its own home and carry that profile's stamp (a NULL legacy stamp
+    belongs to the store's own profile — the same rule the dashboard's session routes apply). An
+    unserved profile, a missing row, a row stamped for another profile, or an unreadable store all
+    fail closed. Shared by the Kanban notifier and the background-process wake path.
+    """
+    import contextlib
+    from pathlib import Path
+    if not session_id or not profile:
+        return False
+    profile = str(profile)
+    try:
+        from gateway.run import _multiplex_profile_homes
+        home = dict(_multiplex_profile_homes(config)).get(profile)
+        if home is None:
+            return False
+        from hermes_state import SessionDB
+        db = SessionDB(Path(home) / "state.db", read_only=True)
+    except Exception as exc:
+        logger.debug("wake: session ownership check unavailable for %s/%s: %s", profile, session_id, exc)
+        return False
+    try:
+        row = db.get_session(str(session_id))
+    except Exception as exc:
+        logger.debug("wake: session ownership lookup failed for %s/%s: %s", profile, session_id, exc)
+        return False
+    finally:
+        with contextlib.suppress(Exception):
+            db.close()
+    return bool(row) and (row.get("profile_name") or profile) == profile
+
+
+async def admit_internal_event(adapter: Any, event: Any) -> None:
+    """Require a concrete adapter admission, not merely a handler returning None.
+
+    The public handler return stays unchanged. This receipt means scheduled/queued,
+    not model execution, authorization of a later turn, or successful outbound delivery.
+    """
+    event._gateway_accepted = False
+    await adapter.handle_message(event)
+    if event._gateway_accepted is not True:
+        raise WakeNotAccepted("internal wake not accepted by adapter")
+
+
 async def deliver_wake(
     adapter: Any, *, text: str, session_id: str = "", source: Any = None,
-    nolgia_token: str = "", profile: str = "",
+    nolgia_token: str = "", notification_category: str = "result",
+    profile: Optional[str] = None,
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
-    ``SessionSource`` for the synthetic event — required for push-capable adapters. Raises on
-    failure so the caller can rewind/retry.
-
-    ``profile`` is the multiplex profile of the session being woken (the profile that served the
-    originating turn). A multiplexed session lives in ITS profile's runtime — own HERMES_HOME/state,
-    own secret scope, own retained-credential scope — so the self-post must re-enter through that
-    profile's ``/p/<profile>/...`` route; the unprefixed route would run the continuation under the
-    DEFAULT profile, where the session's history and its retained turn credential do not exist
-    (NOL-413). ``""`` (or ``"default"``) keeps the unprefixed route. Push-capable adapters ignore
-    it: their wake re-enters through the normal message pipeline, already bound to the right profile.
+    ``SessionSource`` for the synthetic event — required for push-capable adapters. ``profile``
+    names the served profile that canonically owns a non-push destination; a non-default value is
+    delivered in-process under the caller's profile scope (see ``_self_post_chat_completion``).
+    Raises on failure so the caller can rewind/retry.
 
     ``nolgia_token`` is the run-scoped Nolgia credential of the ORIGINATING turn (the run whose
     detached work this wake reports). Carried on the self-post so the continuation's CLI work
@@ -92,16 +113,23 @@ async def deliver_wake(
     if adapter_supports_push(adapter):
         if source is None:
             raise ValueError("deliver_wake: push-capable adapter requires a SessionSource")
-        from gateway.platforms.base import MessageEvent, MessageType
-        synth_event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=True)
-        await adapter.handle_message(synth_event)
+        from gateway.platforms.event import MessageEvent, MessageType
+        synth_event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=True,
+                                   metadata={"notification_category": notification_category})
+        await admit_internal_event(adapter, synth_event)
         return
     if not session_id:
         raise ValueError("deliver_wake: non-push adapter (supports_async_delivery=False) "
                          "requires the raw session id to self-post the wake turn")
-    # Forward the NOL-413 attribution/profile fields only when set: the historical two-argument
-    # self-post shape stays byte-for-byte the same for wakes that carry neither.
-    extra = {k: v for k, v in (("nolgia_token", nolgia_token), ("profile", profile)) if v}
+    # Forward the NOL-413 attribution field and upstream's routing/category fields only when
+    # set: the historical two-argument self-post shape stays byte-for-byte the same otherwise.
+    extra: dict = {}
+    if nolgia_token:
+        extra["nolgia_token"] = nolgia_token
+    if profile:
+        extra["profile"] = profile
+    if notification_category == "diagnostic":
+        extra["notification_category"] = notification_category
     await _self_post_chat_completion(adapter, text=text, session_id=session_id, **extra)
 
 
@@ -117,6 +145,12 @@ def _delegation_display_metadata(evt: dict) -> dict:
     metadata = {"delegation_id": str(evt.get("delegation_id") or ""), "task_count": task_count,
                 "completed_count": completed_count or task_count - failed_count,
                 "failed_count": failed_count}
+    if evt.get("task_failure_notice"):
+        metadata["delivery_notice"] = f"task_failure:{results[0].get('task_index', '') if results else ''}"
+        metadata["notification_category"] = "diagnostic"
+        from gateway.warning_notifications import warning_notifications_enabled
+        if not warning_notifications_enabled("api_server"):
+            metadata["presentation_suppressed"] = True
     duration = evt.get("total_duration_seconds") or evt.get("duration_seconds")
     if isinstance(duration, (int, float)):
         metadata["duration_seconds"] = duration
@@ -162,28 +196,57 @@ async def persist_delegation_delivery(
     if db is None:
         raise RuntimeError("persist_delegation_delivery: api_server SessionDB unavailable — "
                            f"cannot persist completion for session {session_id}")
+    # #98619: the parent run may have compressed/rotated between dispatch and this detached
+    # completion — the captured origin id is then a closed parent and the append below is
+    # rejected with CompressionSessionClosedError forever (the watcher retries the same stale
+    # id). Adopt the live continuation tip first, the same canonical resolution
+    # /api/sessions/{id}/messages reads use, so the delivery row lands where the next run and
+    # the messages endpoint both resolve. Fails open to the original id.
+    resolver = getattr(db, "resolve_resume_session_id", None)
+    if callable(resolver):
+        try:
+            resolved = await asyncio.to_thread(resolver, session_id)
+            if resolved:
+                session_id = str(resolved)
+        except Exception:
+            logger.debug("delegation delivery continuation resolve failed for %s", session_id, exc_info=True)
     await asyncio.to_thread(
-        db.append_message, session_id, "user", content=text,
-        display_kind="async_delegation_complete", display_metadata=_delegation_display_metadata(evt or {}),
+        db.append_delegation_delivery, session_id, text, _delegation_display_metadata(evt or {}),
     )
     logger.info(
         "async delegation completion persisted as delivery row for api_server session %s (no wake turn)", session_id
     )
 
 
-async def _self_post_chat_completion(
-    adapter: Any, *, text: str, session_id: str, nolgia_token: str = "", profile: str = "",
-) -> None:
+async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str,
+                                      nolgia_token: str = "",
+                                      notification_category: str = "result",
+                                      profile: Optional[str] = None) -> None:
     """POST the wake text to the in-pod API server as a normal session turn, using the adapter's
     own bind host/port/key. Session continuation via ``X-Hermes-Session-Id`` is 403-gated on
     ``API_SERVER_KEY``, so a missing key is a hard error rather than a wake in a fresh session
     nobody watches.
 
-    A named ``profile`` posts through that profile's ``/p/<profile>/`` mirror (see ``deliver_wake``),
-    authenticated with the profile's OWN ``API_SERVER_KEY`` — the multiplex auth gate resolves the
-    expected key through the profile secret scope, so the listener owner's key is rejected there. A
-    profile whose key cannot be resolved keeps the historical unprefixed post rather than turning
-    every wake into a 401."""
+    ``profile`` (a served secondary under ``gateway.multiplex_profiles``) takes the IN-PROCESS
+    route instead of the HTTP one: the shared listener's ``/p/<profile>/`` mirror authenticates
+    with that profile's own ``API_SERVER_KEY`` — which a route-only profile legitimately does not
+    have — and an unprefixed self-post would resume the session in the DEFAULT profile's store.
+    The caller already holds the owner profile's runtime scope, so the turn lands in that profile's
+    own session. A non-default profile whose adapter cannot run in-process fails closed.
+    """
+    target_profile = str(profile or "").strip()
+    if target_profile and target_profile != _DEFAULT_PROFILE_NAME:
+        in_process: Any = getattr(adapter, "run_internal_session_turn", None)
+        if not callable(in_process):
+            raise RuntimeError(
+                f"wake self-post for served profile {profile!r} requires in-process session "
+                "delivery; refusing to self-post as the default profile")
+        # The originating run's credential rides the in-process turn exactly as it rides the
+        # HTTP payload below (NOL-413); passed only when set, like every other optional field.
+        await in_process(session_id=session_id, text=text, profile=target_profile,
+                         notification_category=notification_category,
+                         **({"nolgia_token": nolgia_token} if nolgia_token else {}))
+        return
     import aiohttp
     host = str(getattr(adapter, "_host", "") or "127.0.0.1")
     if host in ("0.0.0.0", "::", "*"):
@@ -194,20 +257,9 @@ async def _self_post_chat_completion(
         raise RuntimeError("wake self-post requires API_SERVER_KEY: session continuation via "
                            "X-Hermes-Session-Id is rejected (403) on an unauthenticated API "
                            "server, so the wake cannot reach the target session")
-    path_prefix = ""
-    target_profile = str(profile or "").strip()
-    if target_profile and target_profile != _DEFAULT_PROFILE_NAME:
-        profile_key = _profile_scoped_api_key(target_profile)
-        if profile_key:
-            path_prefix = "/p/" + quote(target_profile, safe="")
-            api_key = profile_key
-        else:
-            logger.warning(
-                "wake self-post for session %s cannot resolve a usable API_SERVER_KEY for profile "
-                "%r; falling back to the default-profile route", session_id, target_profile)
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"  # bare IPv6 literal
-    url = f"http://{host}:{port}{path_prefix}/v1/chat/completions"
+    url = f"http://{host}:{port}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "X-Hermes-Session-Id": session_id}
     payload = {"model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),
                "messages": [{"role": "user", "content": text}], "stream": False}
@@ -216,6 +268,8 @@ async def _self_post_chat_completion(
         # subprocesses (nolgia CLI uploads) name the turn whose work this wake finishes. Loopback
         # POST on the in-pod API server, gated by the same bearer as every other request; never logged.
         payload["nolgia_token"] = nolgia_token
+    if notification_category == "diagnostic":
+        payload["hermes_notification_category"] = "diagnostic"
     last_err: Optional[BaseException] = None
     attempts = 1 + len(_RETRY_DELAYS_SECONDS)
     for attempt in range(attempts):

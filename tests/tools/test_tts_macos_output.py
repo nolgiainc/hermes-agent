@@ -40,7 +40,7 @@ def _run_stream(monkeypatch):
     # HERMES_DISABLE_AUDIO_PLAYBACK=1, which short-circuits stream_tts_to_speaker
     # to display-only); everything below is mocked, no sound can result.
     monkeypatch.setenv("HERMES_DISABLE_AUDIO_PLAYBACK", "0")
-    monkeypatch.setattr("tools.tts_tool.get_env_value",
+    monkeypatch.setattr("hermes_cli.config.get_env_value",
                         lambda name, default=None: "fake-key"
                         if name == "ELEVENLABS_API_KEY" else default)
     monkeypatch.setattr("tools.tts_tool._load_tts_config", lambda: {})
@@ -79,12 +79,12 @@ def _run_stream(monkeypatch):
     return sd_called["hit"]
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_streaming_tts_skips_sounddevice_on_macos(monkeypatch):
     assert _run_stream(monkeypatch) is False
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_streaming_tts_uses_sounddevice_off_macos(monkeypatch):
     # Off macOS the OutputStream setup runs; _import_sounddevice raising here
     # is caught by the function's own guard, so the call itself is what we assert.

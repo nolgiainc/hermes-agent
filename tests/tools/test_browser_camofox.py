@@ -5,14 +5,10 @@ from unittest.mock import MagicMock, patch
 
 
 from tools.browser_camofox import (
-    camofox_back,
     camofox_click,
     camofox_close,
-    camofox_console,
     camofox_get_images,
     camofox_navigate,
-    camofox_press,
-    camofox_scroll,
     camofox_snapshot,
     camofox_type,
     camofox_vision,
@@ -194,16 +190,6 @@ class TestCamofoxInteractions:
         assert "sk-pro" in raw_result
 
 
-    @patch("tools.browser_camofox.requests.post")
-    def test_press(self, mock_post, monkeypatch):
-        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
-        mock_post.return_value = _mock_response(json_data={"tabId": "tab8", "url": "https://x.com"})
-        camofox_navigate("https://x.com", task_id="t8")
-
-        mock_post.return_value = _mock_response(json_data={"ok": True})
-        result = json.loads(camofox_press("Enter", task_id="t8"))
-        assert result["success"] is True
-        assert result["pressed"] == "Enter"
 
 
 # ---------------------------------------------------------------------------
@@ -235,13 +221,6 @@ class TestCamofoxClose:
 # ---------------------------------------------------------------------------
 
 
-class TestCamofoxConsole:
-    def test_console_returns_empty_with_note(self, monkeypatch):
-        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
-        result = json.loads(camofox_console(task_id="t_console"))
-        assert result["success"] is True
-        assert result["total_messages"] == 0
-        assert "not available" in result["note"]
 
 
 # ---------------------------------------------------------------------------

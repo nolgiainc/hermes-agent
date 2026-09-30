@@ -73,13 +73,13 @@ SANDBOX_PROBE = (
 @pytest.fixture(autouse=True)
 def fresh_sandbox_state():
     shutdown_all_kernels()
-    env_passthrough._config_passthrough = None
+    env_passthrough._config_passthrough.clear()
     env_passthrough.clear_env_passthrough()
     config_module._RAW_CONFIG_CACHE.clear()
     reset_session_vars()
     yield
     shutdown_all_kernels()
-    env_passthrough._config_passthrough = None
+    env_passthrough._config_passthrough.clear()
     env_passthrough.clear_env_passthrough()
     config_module._RAW_CONFIG_CACHE.clear()
     reset_session_vars()
@@ -165,7 +165,7 @@ def test_registered_terminal_still_blocks_lifecycle_script(terminal_env):
     sitting next to the binary, is still blocked before the backend sees it."""
     binary, fake_env = terminal_env
     wrapper = binary.parent / "restart.sh"
-    wrapper.write_text("#!/bin/bash\nhermes gateway restart\n", encoding="utf-8")
+    wrapper.write_text("#!/usr/bin/env bash\nhermes gateway restart\n", encoding="utf-8")
 
     result = json.loads(
         registry.dispatch(

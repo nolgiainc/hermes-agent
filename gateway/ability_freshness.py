@@ -141,7 +141,7 @@ class AbilityInstaller:
         """The version recorded in the slug's marker ('' when absent/unreadable)."""
         marker = self.skills_dir / slug / MARKER
         try:
-            with open(marker, encoding="utf-8") as fh:
+            with open(marker, encoding="utf-8-sig") as fh:
                 return str(json.load(fh).get("version") or "")
         except (OSError, ValueError):
             return ""
@@ -180,7 +180,7 @@ class AbilityInstaller:
             root = staging
             if len(entries) == 1 and os.path.isdir(os.path.join(staging, entries[0])):
                 root = os.path.join(staging, entries[0])
-            with open(os.path.join(root, MARKER), "w", encoding="utf-8") as fh:
+            with open(os.path.join(root, MARKER), "w", encoding="utf-8") as fh:  # windows-footgun: ok (write; nested-call mode not parsed)
                 json.dump({"slug": slug, "version": version}, fh)
 
             version_dir = slug_store / version
@@ -388,7 +388,7 @@ class AbilityFreshnessManager:
 
     def last_event_id(self) -> str:
         try:
-            return self._state_path().read_text(encoding="utf-8").strip()
+            return self._state_path().read_text(encoding="utf-8-sig").strip()
         except OSError:
             return ""
 
