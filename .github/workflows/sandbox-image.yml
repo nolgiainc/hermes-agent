@@ -45,10 +45,10 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: blacksmith-8vcpu-ubuntu-2404
+            runner: ubuntu-latest
             platform: linux/amd64
           - arch: arm64
-            runner: blacksmith-8vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
             platform: linux/arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -83,10 +83,10 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: blacksmith-8vcpu-ubuntu-2404
+            runner: ubuntu-latest
             platform: linux/amd64
           - arch: arm64
-            runner: blacksmith-8vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
             platform: linux/arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
