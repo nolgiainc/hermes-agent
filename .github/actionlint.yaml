@@ -8,8 +8,6 @@ self-hosted-runner:
     - ubuntu-latest-32-arm-core
     - windows-latest-32-core
     - windows-latest-32-arm-core
-    # Fork (nolgiainc): the org has no GitHub larger runners, so the workflows
-    # map upstream's 32/96-core labels onto Blacksmith and standard runners.
-    - blacksmith-4vcpu-ubuntu-2404
-    - blacksmith-8vcpu-ubuntu-2404
-    - blacksmith-8vcpu-ubuntu-2404-arm
+    # Fork (nolgiainc): the org has no GitHub larger runners and does not use
+    # Blacksmith (banned 2026-10-02), so the workflows map upstream's
+    # 32/96-core and blacksmith-* labels onto standard GitHub-hosted runners.

@@ -2360,7 +2360,7 @@ jobs:
     name: Verify published candidate files
     needs: validate
     if: inputs.release-phase == 'publish'
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     environment: release-signing
     timeout-minutes: 90
     env:

@@ -206,7 +206,7 @@ def run_login_shell(script: str, *, env: dict[str, str], cwd: Path, writable: It
                     timeout: float = 120) -> subprocess.CompletedProcess:
     """``bash -lic script`` whose startup reads only HOME's rc files.
 
-    The CI host's own ``/etc/profile`` chain is not a distro skeleton: on the Blacksmith runners a
+    The CI host's own ``/etc/profile`` chain is not a distro skeleton: on the fork's CI runners a
     login shell there never reached the sandbox HOME's ``.bash_profile`` / ``.profile`` at all, so
     an empty file is bound over ``/etc/profile`` and the probe sees exactly what the user's rc
     files (and the installer's line in them) put on PATH.

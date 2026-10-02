@@ -72,7 +72,7 @@ jobs:
     if: >-
       github.event_name == 'release'
       || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     environment: site-publish
     timeout-minutes: 30
     steps:
@@ -97,7 +97,7 @@ jobs:
     if: >-
       github.repository == 'NousResearch/hermes-agent'
       && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     environment:
       name: github-pages

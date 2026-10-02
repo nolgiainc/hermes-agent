@@ -168,7 +168,7 @@ concurrency:
 jobs:
   pick-releases:
     name: Pick release tags
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       tags: ${{ steps.pick.outputs.tags }}

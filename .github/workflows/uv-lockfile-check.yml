@@ -60,7 +60,7 @@ concurrency:
 jobs:
   check:
     name: uv lock --check
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       review_status: ${{ steps.verify.outputs.review_status }}

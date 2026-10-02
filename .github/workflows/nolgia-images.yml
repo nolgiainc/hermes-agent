@@ -61,7 +61,7 @@ jobs:
     # github.event_name == 'release'`. This workflow was the one that did not.
     if: github.repository == 'nolgiainc/hermes-agent' && github.ref == 'refs/heads/main'
     # stays hosted: needs docker daemon
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     strategy:
       # Envs are independent: prod auth failing must not cancel stg.
       fail-fast: false
