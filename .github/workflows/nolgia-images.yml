@@ -105,7 +105,12 @@ jobs:
         if: env.skip != '1'
         run: echo "sha_tag=nolgia-${GITHUB_SHA::10}" >> "$GITHUB_ENV"
 
+      # Only the immutable tag is pushed here. The moving `main` tag, which the
+      # agent-provisioner reconciler tracks, is promoted below and only after
+      # the vulnerability scan passes, so a CRITICAL with a fix never reaches
+      # the fleet.
       - name: Build & push agent image
+        id: build
         if: env.skip != '1'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
@@ -120,8 +125,34 @@ jobs:
             org.opencontainers.image.source=https://github.com/nolgiainc/hermes-agent
           tags: |
             ${{ env.REGION }}-docker.pkg.dev/${{ matrix.project }}/${{ env.AR_REPO }}/${{ env.IMAGE_NAME }}:${{ env.sha_tag }}
-            ${{ env.REGION }}-docker.pkg.dev/${{ matrix.project }}/${{ env.AR_REPO }}/${{ env.IMAGE_NAME }}:main
           # Per-env scopes so the two matrix legs keep independent warm
           # caches instead of racing one scope.
           cache-from: type=gha,scope=nolgia-hermes-${{ matrix.env }}
           cache-to: type=gha,mode=max,scope=nolgia-hermes-${{ matrix.env }}
+
+      # Free container vulnerability gate (Trivy, pinned by digest): fails on a
+      # CRITICAL with a fixed version available, reports HIGH to the job
+      # summary. Scans the exact digest just pushed. Accepted risks:
+      # .trivyignore.yaml (each entry expires within 90 days).
+      - name: Scan image for vulnerabilities
+        if: env.skip != '1'
+        env:
+          IMAGE: ${{ env.REGION }}-docker.pkg.dev/${{ matrix.project }}/${{ env.AR_REPO }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        run: .github/scripts/image-scan.sh "$IMAGE" "hermes-agent (${{ matrix.env }})"
+
+      # Promote the scanned digest to the moving tag. imagetools copies the
+      # manifest as is, so `main` resolves to the very digest that was scanned.
+      - name: Promote scanned image to the main tag
+        if: env.skip != '1'
+        env:
+          REPO: ${{ env.REGION }}-docker.pkg.dev/${{ matrix.project }}/${{ env.AR_REPO }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "$REPO:main" "$REPO@$DIGEST"
+          moved=$(docker buildx imagetools inspect "$REPO:main" --format '{{json .Manifest}}' | jq -r .digest)
+          if [ "$moved" != "$DIGEST" ]; then
+            echo "::error::main resolves to $moved, expected the scanned digest $DIGEST"
+            exit 1
+          fi
+          echo "main -> $REPO@$DIGEST"
