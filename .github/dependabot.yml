@@ -1,6 +1,6 @@
 # Dependabot configuration for hermes-agent.
 #
-# Deliberately scoped to github-actions only.
+# Deliberately scoped to github-actions and docker (base images) only.
 #
 # We do NOT enable Dependabot for pip / npm / any source-dependency ecosystem
 # because we pin source dependencies exactly (uv.lock, package-lock.json) as
@@ -12,6 +12,11 @@
 # supply-chain policy) must be updated when upstream actions publish
 # patches — usually themselves security fixes. Dependabot opens a PR with
 # the new SHA and release notes; we review and merge like any other PR.
+#
+# docker is the second exception (added 2026-10-03, sec-platform): the
+# Dockerfiles pin base images by tag AND digest (debian:13.4@sha256:...), and a
+# digest only moves when someone moves it. Dependabot proposes the new digest
+# (OS security patches land there) as a reviewable PR, same as an action SHA.
 #
 # Security-update PRs for source dependencies (opened ONLY when a CVE is
 # published affecting a currently-pinned version) are enabled separately
@@ -39,6 +44,28 @@ updates:
       # Batch routine action bumps into one PR per week to reduce noise.
       # Security updates still open individually and bypass grouping.
       actions-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "docker"
+    directories:
+      - "/"
+      - "/docker"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "chore(docker)"
+      include: "scope"
+    groups:
+      # Batch routine base-image bumps into one PR per week. Majors (e.g. a
+      # Debian release) still open individually.
+      docker-minor-patch:
         update-types:
           - "minor"
           - "patch"
