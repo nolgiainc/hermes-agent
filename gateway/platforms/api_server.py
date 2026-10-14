@@ -1023,6 +1023,35 @@ class ResponseStore:
             )
             self._conn.commit()
 
+    def journal_workspace_id(self, session_id: str) -> str:
+        """The journaled ``workspace_id`` of the newest run in *session_id*, or ``""``.
+
+        A relay run's session IS its run id, so the run-id row answers first; a run submitted
+        with an explicit session id is found through the journaled ``session_id``. Used by the
+        Nolgia background-results hand-off (gateway.platforms.nolgia_background_results) to
+        name the platform chat session a finished background job belongs to (NOL-414 makes the
+        workspace id that session's id). Settled rows count: the job finishes after its run.
+        """
+        if not session_id:
+            return ""
+        with self._run_status_lock:
+            row = self._conn.execute(
+                "SELECT data FROM run_journal WHERE run_id = ?", (session_id,)).fetchone()
+            if row is None:
+                try:
+                    row = self._conn.execute(
+                        """SELECT data FROM run_journal WHERE json_extract(data, '$.session_id') = ?
+                           ORDER BY created_at DESC LIMIT 1""", (session_id,)).fetchone()
+                except sqlite3.Error:
+                    row = None
+        if row is None:
+            return ""
+        try:
+            data = json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            return ""
+        return str(data.get("workspace_id") or "").strip() if isinstance(data, dict) else ""
+
     def settle_run_status(
         self, run_id: str, data: Dict[str, Any], owner_scope: Optional[str] = None,
     ) -> None:
