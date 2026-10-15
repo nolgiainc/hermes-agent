@@ -1194,7 +1194,19 @@ class GatewayNotificationsMixin:
         Async-delegation completions are persisted as a durable delivery row — after the parent
         turn's event.complete the CLIENT owns the next turn on this stateless surface, so never
         self-post them as a new role=user prompt. Other watch events wake the session via self-post.
+
+        On a Nolgia platform pod a final result (a delegation's completion, a process's exit) is
+        first handed to the platform, which files it in the customer's chat and runs the turn
+        that reports it (gateway.platforms.nolgia_background_results); neither path above ever
+        reaches that customer. A transient platform failure is retried; a refusal falls through.
         """
+        from gateway.platforms import nolgia_background_results as platform_results
+        if platform_results.enabled():
+            outcome = await asyncio.to_thread(platform_results.file_result, adapter, synth_text, raw_sid, evt)
+            if outcome == platform_results.FILED:
+                return True
+            if outcome == platform_results.RETRY:
+                return False
         from gateway.wake import deliver_wake, persist_delegation_delivery
         scope = contextlib.nullcontext()
         if evt.get("type") == "async_delegation":
