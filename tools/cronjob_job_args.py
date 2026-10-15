@@ -19,6 +19,15 @@ logger = logging.getLogger("tools.cronjob_tools")
 _THREAD_HORIZON_MINUTES = 60
 
 
+
+def _nolgia_completion_only() -> bool:
+    """A Nolgia relay run (gateway.platforms.nolgia_background_results.completion_only_session)."""
+    try:
+        from gateway.platforms.nolgia_background_results import completion_only_session
+        return completion_only_session()
+    except Exception:
+        return False
+
 def _first_fire_within_thread_horizon(
     schedule: Union[str, Dict[str, Any], None],
 ) -> bool:
@@ -67,7 +76,8 @@ def _origin_from_env(
     # A non-push surface (api_server: request/response, ``send()`` is a stub) cannot receive a
     # fire-time report, so an origin stamp would make ``deliver=origin`` fail silently on every
     # fire (#69304). No origin => the home-channel fallback + creation-time notice apply.
-    if not async_delivery_supported():
+    # A Nolgia relay run has async delivery for a process's exit only, never cron fires.
+    if not async_delivery_supported() or _nolgia_completion_only():
         return None
     thread_id = get_session_env("HERMES_SESSION_THREAD_ID") or None
     # Slack stamps every TOP-LEVEL message's own id as the session thread (a per-message
@@ -129,7 +139,8 @@ def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> 
             # home channel: tell the creating client where the report goes (#69304).
             from gateway.session_context import async_delivery_supported, get_session_env
             fallback = [t for t in targets if t.get("_resolved_from") == "origin_fallback"]
-            if fallback and get_session_env("HERMES_SESSION_PLATFORM") and not async_delivery_supported():
+            if fallback and get_session_env("HERMES_SESSION_PLATFORM") and (
+                    not async_delivery_supported() or _nolgia_completion_only()):
                 return ("Note: this stateless HTTP API session cannot receive cron delivery, so this "
                         f"job will report to the home channel {fallback[0]['platform']}:"
                         f"{fallback[0]['chat_id']} instead of back here.")

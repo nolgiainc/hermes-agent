@@ -536,9 +536,16 @@ def _try_dispatch_background_run(
     _reap_stale_executions(job_name)
 
     # Finite sessions cannot route a detached result back after the turn ends (delegate_task's gate).
+    # A Nolgia relay run has async delivery for a process's exit only, so cron stays inline there too.
     try:
         from gateway.session_context import async_delivery_supported
         if not async_delivery_supported():
+            return None
+    except Exception:
+        pass
+    try:
+        from gateway.platforms.nolgia_background_results import completion_only_session
+        if completion_only_session():
             return None
     except Exception:
         pass

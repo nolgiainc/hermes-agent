@@ -551,6 +551,9 @@ class _RunLaunch:
     # identity (NOL-414) carried into the executor-thread session binding.
     nolgia_token: str = ""
     workspace_id: str = ""
+    # The platform files this run's finished background work in its chat (nolgia-api
+    # AGENT_BACKGROUND_RESULTS); see _bind_api_server_session.
+    background_results: bool = False
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
 
     @property
@@ -833,6 +836,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
         nolgia_token=nolgia_token, workspace_id=workspace_id,
+        background_results=_api_server._request_background_results(body),
         turn_author=turn_author)
     self._activate_admitted_request()
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
@@ -961,6 +965,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 browser_control_principal=run.browser_control_principal,
                 browser_control_transport_family=run.browser_control_transport_family,
                 nolgia_token=run.nolgia_token, workspace_id=run.workspace_id,
+                background_results=run.background_results,
                 # #98619 audited opt-in: the /v1/runs session id is wake-capable only when its
                 # own continuation path reloads session history — an explicit body/chained
                 # session id or a declared X-Hermes-Session-Key conversation (both load

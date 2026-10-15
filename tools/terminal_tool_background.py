@@ -111,12 +111,29 @@ def _apply_async_support(proc_session, result_data, notify_on_complete, watch_pa
 
     if async_delivery_supported():
         _stamp_gateway_routing(proc_session, get_session_env)
+        from gateway.platforms.nolgia_background_results import COMPLETION_NOTE, completion_only_session
+        if completion_only_session():
+            # Nolgia relay run: only the exit reaches the customer (filed by the platform).
+            if watch_patterns:
+                result_data["watch_patterns_ignored"] = (
+                    "watch patterns are not available in this session; only the exit is delivered")
+                watch_patterns = None
+            if notify_on_complete:
+                result_data["notify_note"] = COMPLETION_NOTE
         return notify_on_complete, watch_patterns
     result_data["notify_on_complete"] = False
     result_data["notify_unsupported"] = _ASYNC_UNSUPPORTED_NOTE
     logger.info("background proc %s: async delivery unsupported on this "
                 "session; notify_on_complete/watch_patterns disabled", proc_session.id)
     return False, None
+
+
+def _completion_only() -> bool:
+    try:
+        from gateway.platforms.nolgia_background_results import completion_only_session
+        return completion_only_session()
+    except Exception:
+        return False
 
 
 def _register_completion_watcher(process_registry, proc_session, session_key) -> None:
@@ -208,6 +225,10 @@ def spawn_background_process(
             if is_delegated_child_context():
                 result_data["notify_on_complete"] = False
                 result_data["subagent_note"] = _SUBAGENT_NOTIFY_NOTE
+            elif heartbeat_seconds and _completion_only():
+                # A Nolgia relay run delivers the exit only: a heartbeat would be a billed turn
+                # every N seconds.
+                result_data["heartbeat_ignored"] = "heartbeats are not available in this session; only the exit is delivered"
             elif heartbeat_seconds:
                 # Heartbeats ride the same delivery path as the completion notice, so they are
                 # only armed where that notice can actually reach the agent.

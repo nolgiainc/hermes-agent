@@ -77,6 +77,40 @@ def enabled() -> bool:
     )
 
 
+def relay_async_delivery(workspace_id: str) -> bool:
+    """Whether a relay run may bind async delivery: on a platform pod (``enabled``) and for a run
+    that names its platform chat session (the relay's ``workspace_id``, a UUID, NOL-414). The
+    caller has already checked that the platform said it takes this run's background results
+    (the run body's ``background_results``), so a process that exits after the turn reaches the
+    customer through ``file_result`` rather than a self-posted wake nobody reads."""
+    if not enabled():
+        return False
+    try:
+        uuid.UUID(str(workspace_id or "").strip())
+    except ValueError:
+        return False
+    return True
+
+
+def completion_only_session() -> bool:
+    """True on a relay run that has async delivery only for the platform hand-off: the API
+    server binds async delivery for nothing else (``_bind_api_server_session``). Such a session
+    takes a process's exit and nothing more: watch-pattern matches, heartbeats and detached cron
+    runs would each become a billed platform turn, or a silent wake when the platform declines
+    them, so they stay off exactly as on any other stateless HTTP session."""
+    try:
+        from gateway.session_context import async_delivery_supported, get_session_env
+    except Exception:
+        return False
+    return get_session_env("HERMES_SESSION_PLATFORM", "") == "api_server" and async_delivery_supported()
+
+
+COMPLETION_NOTE = (
+    "When this process exits, NOLGIA files its result in this chat and runs a new turn in which you "
+    "report it to the creator, so you may end this reply now and say the result will follow."
+)
+
+
 def _api_base() -> str:
     """Platform API base with the ``/v1`` suffix (as ``nolgia_assets`` builds it)."""
     url = os.environ.get("NOLGIA_API_URL", "").strip().rstrip("/")
