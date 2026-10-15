@@ -21,4 +21,20 @@
 #         binary never parses untrusted input. Re-check when bookworm ships one.
 #       expired_at: 2027-01-01
 
-vulnerabilities: []
+vulnerabilities:
+  # Not a CRITICAL and not an accepted risk: a version-metadata false positive.
+  # Trivy matches GHSA-4pqm-j46f-795x ("< 0.16.0") against this fork's own
+  # package, whose pyproject declares version 0.0.0. The fix is in the image:
+  # upstream PR #31685 (commits 2e66eefbc3 and d9ec90585c, released in
+  # v2026.6.5) has been an ancestor of this fork's main since the 2026-09-29
+  # upstream sync, and its guard (_ws_host_origin_reason /
+  # _ws_request_is_allowed in hermes_cli/web_server_chat.py) runs before the
+  # upgrade on every dashboard WebSocket. Checked 2026-10-15.
+  - id: CVE-2026-53869
+    statement: >-
+      False positive: the fork's package reports version 0.0.0, but the
+      upstream fix (PR #31685, v2026.6.5) is in this image and guards every
+      dashboard WebSocket upgrade (hermes_cli/web_server_chat.py).
+    purls:
+      - pkg:pypi/hermes-agent
+    expired_at: 2027-01-12

@@ -1473,13 +1473,33 @@ def _request_nolgia_token(body: Dict[str, Any]) -> tuple:
     return token, ""
 
 
+def _nolgia_relay_async_delivery(background_results: bool, workspace_id: str) -> bool:
+    """Async delivery for a relay run the Nolgia platform takes background results for
+    (gateway.platforms.nolgia_background_results.relay_async_delivery); False everywhere else."""
+    if not background_results:
+        return False
+    try:
+        from gateway.platforms.nolgia_background_results import relay_async_delivery
+        return relay_async_delivery(workspace_id)
+    except Exception:
+        return False
+
+
+def _request_background_results(body: Dict[str, Any]) -> bool:
+    """The Nolgia platform's ``background_results`` run flag (nolgia-api AGENT_BACKGROUND_RESULTS):
+    true when the platform will file this run's finished background work in its chat session
+    (POST /v1/agent/background-results) and run the turn that reports it. Only a literal JSON
+    true counts; anything else keeps the run's async delivery off, as before."""
+    return isinstance(body, dict) and body.get("background_results") is True
+
+
 # Body fields EXCLUDED from the POST /v1/runs Idempotency-Key fingerprint. ``nolgia_token`` is a
 # short-lived per-attempt credential a supervisor may re-mint on retry, and a rotated token must
 # still match the original submission — a fingerprint miss would 409 the retry (or, before the
 # durable store, re-execute the run): exactly the double-billing this header exists to prevent.
 # Everything else in the body (input, history, session_id, workspace_id, model, ...) is a stable
 # identity and stays in the fingerprint.
-_RUNS_IDEMPOTENCY_FINGERPRINT_EXCLUDED_KEYS = frozenset({"nolgia_token"})
+_RUNS_IDEMPOTENCY_FINGERPRINT_EXCLUDED_KEYS = frozenset({"nolgia_token", "background_results"})
 
 
 def _names_launch_profile(profile: str) -> bool:
@@ -4683,7 +4703,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         *, chat_id: str = "", session_key: str = "", session_id: str = "", profile: str = "",
         browser_control_principal: str = "", browser_control_transport_family: str = "",
         nolgia_token: str = "", workspace_id: str = "",
-        session_history_delivery: str = "") -> list:
+        session_history_delivery: str = "", background_results: bool = False) -> list:
         """Bind session contextvars for an API-server agent run — the SINGLE chokepoint for every
         agent-entry path. Hardwires ``platform="api_server"`` + ``async_delivery=False`` (HTTP
         can never wake the agent after the turn) so no route reintroduces the silent no-op bug.
@@ -4725,6 +4745,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``session_history_delivery`` declares #98619 session-id provenance and default-denies:
         only routes whose continuation reads SessionDB may pass "1". An omitted declaration or a
         fingerprint-derived identity keeps delegation synchronous.
+
+        ``background_results`` (Nolgia fork): the platform said it files this run's finished
+        background work in its chat (the run body's ``background_results``). Only then, on a
+        Nolgia pod and for a run naming its platform session (``workspace_id``), is async
+        delivery bound on: a process started with ``notify`` reports its exit through
+        gateway.platforms.nolgia_background_results instead of the silent self-post this
+        hardwiring exists to prevent (nolgia_background_results.relay_async_delivery). Watch
+        patterns, heartbeats and detached cron stay off on such a session (completion only).
 
         The persistent-Docker container key is derived from ``profile`` (#96370), so an unbound
         profile collapses every profile's turns onto the default sandbox.
@@ -4770,7 +4798,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             platform="api_server", chat_id=chat_id, session_key=session_key, session_id=session_id,
             profile=profile, browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family,
-            cwd=session_cwd, scratch_dir=scratch_dir or "", async_delivery=False,
+            cwd=session_cwd, scratch_dir=scratch_dir or "",
+            async_delivery=_nolgia_relay_async_delivery(background_results, workspace_id),
             nolgia_token=nolgia_token, cron_session="",
             session_history_delivery=session_history_delivery)
 
