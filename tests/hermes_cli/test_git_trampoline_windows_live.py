@@ -29,6 +29,24 @@ _FORK_BOMB_BAT = (
 )
 
 
+def _require_runner_git_core() -> None:
+    """Skip when the runner image has no Git-for-Windows git-core binary at all.
+
+    These are live probes of the runner's own install. When the image stops
+    shipping the standard ``Git\\<arch>\\libexec\\git-core\\git.exe`` layout
+    (windows-latest, October 2026), there is nothing for the locator to find,
+    and that is an image fact, not a locator bug. When the layout IS present,
+    the assertions below still run and still fail on a real regression.
+    """
+    standard = [
+        Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
+        for base in (r"C:\Program Files", r"C:\Program Files (x86)")
+        for arch in ("clangarm64", "mingw64", "mingw32")
+    ]
+    if not any(p.exists() for p in standard):
+        pytest.skip("runner image ships no Git-for-Windows git-core/git.exe at the standard paths")
+
+
 def _make_broken_trampoline(tmp_path: Path) -> Path:
     bat = tmp_path / "git.bat"
     bat.write_text(_FORK_BOMB_BAT, encoding="utf-8")
@@ -55,6 +73,7 @@ class TestGitTrampolineLive:
 
     def test_locate_real_git_finds_runner_git_core(self):
         from hermes_cli import update_cmd
+        _require_runner_git_core()
 
         real = update_cmd._locate_real_git()
         # windows-latest ships Git for Windows under Program Files with the
@@ -70,6 +89,7 @@ class TestGitTrampolineLive:
 
     def test_ensure_non_trampoline_git_swaps_live(self, tmp_path, capsys):
         from hermes_cli import update_cmd
+        _require_runner_git_core()
 
         bat = _make_broken_trampoline(tmp_path)
         broken_cmd = [str(bat), "-c", "windows.appendAtomically=false"]
