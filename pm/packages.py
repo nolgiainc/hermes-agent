@@ -437,7 +437,7 @@ class Venv(StatePackage):
                           seed_lock=seed, frozen=repair or not members, replay=replay,
                           source=project, environment=environment)
             resolved_lock = generation / "workspace" / "uv.lock"
-            environment.check()
+            environment.check(resolved_lock)
             if repair:
                 from pm.recovery import validate_environment
                 validate_environment(environment.executable, env=dict(environment.env), cwd=resolved_lock.parent)
